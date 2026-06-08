@@ -71,7 +71,7 @@ class ProComic : HttpSource() {
         }
     }
 
-    // إضافة معترض ذكي (Interceptor) لتحويل نصوص الـ Base64 القادمة من السيرفر إلى صور حقيقية يفهمها التطبيق
+    // المعترض المطور والآمن الذي يدعم الطريقتين القديمة والجديدة دون تداخل
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
@@ -80,25 +80,32 @@ class ProComic : HttpSource() {
             val response = chain.proceed(chain.request())
             val urlStr = response.request.url.toString()
             
-            // إذا كانت الاستجابة قادمة من روابط قطع الصور المشفرة
             if (urlStr.contains("/i/eyJ")) {
                 val body = response.body
-                val contentType = body.contentType()
-                val bodyString = body.string() // قراءة الاستجابة النصية
-                
-                // إذا كانت الاستجابة نص Base64 مدمج داخل كود السيرفر
-                if (bodyString.startsWith("data:image/") && bodyString.contains("base64,")) {
-                    val base64Data = bodyString.substringAfter("base64,")
-                    val decodedBytes = Base64.decode(base64Data, Base64.DEFAULT)
-                    // نقوم باستبدال النص بملف باينري حقيقي للصورة ليقوم التطبيق بقراءته فوراً
-                    return@addInterceptor response.newBuilder()
-                        .body(decodedBytes.toResponseBody(contentType))
-                        .build()
+                if (body != null) {
+                    val contentType = body.contentType()
+                    val bytes = body.bytes() // قراءة كـ بايتات خام لحماية الصور الحقيقية من التلف
+                    
+                    // التحقق مما إذا كانت الاستجابة تبدأ بنص الطريقة القديمة data:image/
+                    val prefix = "data:image/".toByteArray(Charsets.US_ASCII)
+                    val isBase64Text = bytes.size > prefix.size && 
+                        bytes.take(prefix.size).toByteArray().contentEquals(prefix)
+                    
+                    if (isBase64Text) {
+                        // الطريقة القديمة: تفكيك الـ Base64 وتحويله لصورة
+                        val bodyString = String(bytes, Charsets.UTF_8)
+                        val base64Data = bodyString.substringAfter("base64,")
+                        val decodedBytes = Base64.decode(base64Data, Base64.DEFAULT)
+                        return@addInterceptor response.newBuilder()
+                            .body(decodedBytes.toResponseBody(contentType))
+                            .build()
+                    } else {
+                        // الطريقة الجديدة: الصورة جاهزة ونقية، نمرر البايتات كما هي للتطبيق فوراً
+                        return@addInterceptor response.newBuilder()
+                            .body(bytes.toResponseBody(contentType))
+                            .build()
+                    }
                 }
-                // إعادة بناء الاستجابة في حال لم تكن نص Base64 لمنع حدوث مشاكل
-                return@addInterceptor response.newBuilder()
-                    .body(bodyString.toResponseBody(contentType))
-                    .build()
             }
             response
         }
@@ -362,7 +369,7 @@ class ProComic : HttpSource() {
             val srcIdx = if (order.size == pieces.size) order[targetIdx] else targetIdx
             val basePieceUrl = pieces.getOrNull(srcIdx) ?: continue
 
-            // تم إزالة إضافة التوكين تماماً لأن روابط الـ CDN نقية ومباشرة بدون علامات استفهام
+            // الروابط تستخرج خام تماماً بدون إضافات لتتوافق مع الطريقة الجديدة
             val finalUrl = basePieceUrl
             
             if (seenUrls.add(finalUrl)) {
@@ -476,4 +483,3 @@ class ProComic : HttpSource() {
 @Serializable data class DeferredPageMap(val dim: List<Int> = emptyList(), val mode: String = "", val pieces: List<String> = emptyList(), val order: List<Int> = emptyList(), val token: String = "", val method: String = "")
 @Serializable data class ProxyPlanResponse(val success: Boolean = false, val data: ProxyPlanData? = null)
 @Serializable data class ProxyPlanData(val map: DeferredPageMap? = null)
-@Serializable data class StitchedPageData(val pieces: List<String>, val order: List<Int>, val token: String, val dim: List<Int>, val mode: String)
