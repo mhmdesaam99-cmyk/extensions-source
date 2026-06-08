@@ -52,7 +52,6 @@ class ProComic : HttpSource() {
         private const val CHROME_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
-    // بناء الرابط بالطريقة الجديدة (روابط خام بدون توكينات إضافية)
     private fun String.toAbsoluteUrl(cdnBase: String): String {
         val cleanPiece = this.trim()
         if (cleanPiece.startsWith("http")) return cleanPiece
@@ -67,16 +66,37 @@ class ProComic : HttpSource() {
         }
     }
 
-    // المعترض (Interceptor) الجديد: مبسط ومركز فقط على فك نصوص الـ Base64 وتحويلها لصور
+    // المُعترض الذكي لتجاوز 404 وفك تشفير الصور
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .rateLimit(2, 1)
         .addInterceptor { chain ->
-            val response = chain.proceed(chain.request())
-            val urlStr = response.request.url.toString()
+            val request = chain.request()
+            val urlStr = request.url.toString()
+            var response = chain.proceed(request)
             
+            // إذا كان الرابط يخص قطع الصور المشفرة
             if (urlStr.contains("/i/")) {
+                // 1. نظام الطوارئ (Auto-Retry) لخطأ 404 أو 403
+                if (response.code == 404 || response.code == 403) {
+                    val currentDomain = request.url.host
+                    val cdns = listOf(
+                        "img4.procomic.pro", "img1.procomic.pro", "img2.procomic.pro", 
+                        "img3.procomic.pro", "img5.procomic.pro", "cdn1.procomic.pro", 
+                        "cdn2.procomic.pro", "procomic.pro"
+                    )
+                    for (cdn in cdns) {
+                        if (cdn == currentDomain) continue
+                        response.close() // إغلاق الاستجابة الفاشلة
+                        val newUrl = request.url.newBuilder().host(cdn).build()
+                        val newReq = request.newBuilder().url(newUrl).build()
+                        response = chain.proceed(newReq)
+                        if (response.isSuccessful) break // التوقف فور إيجاد السيرفر الصحيح
+                    }
+                }
+
+                // 2. معالجة وتفكيك البايتات للصورة
                 val body = response.body
                 if (body != null && response.isSuccessful) {
                     val contentType = body.contentType()
@@ -215,7 +235,6 @@ class ProComic : HttpSource() {
         var cachedSessionKey: String? = null
         var sessionKeyAttempted = false
         
-        // استخراج الـ Session Key بالطريقة المعتمدة حالياً فقط
         val getSessionKey = {
             if (!sessionKeyAttempted) {
                 sessionKeyAttempted = true
@@ -302,7 +321,7 @@ class ProComic : HttpSource() {
         return null
     }
 
-    // استخراج القطع وإضافتها بتسلسل حسب مصفوفة الـ Order دون محاولة دمجها
+    // استخراج القطع دون دمج وإضافتها كصفحات
     private fun processMap(
         map: DeferredPageMap, cdnBase: String, pages: MutableList<Page>, seenUrls: MutableSet<String>
     ) {
