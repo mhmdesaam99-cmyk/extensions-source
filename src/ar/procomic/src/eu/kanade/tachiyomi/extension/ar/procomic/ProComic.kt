@@ -1,8 +1,5 @@
 package eu.kanade.tachiyomi.extension.ar.procomic
 
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.Canvas
 import android.util.Base64
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
@@ -23,13 +20,10 @@ import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
-import tachiyomi.decoder.ImageDecoder
-import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.TimeUnit
@@ -71,7 +65,6 @@ class ProComic : HttpSource() {
         }
     }
 
-    // المعترض المطور والآمن الذي يدعم الطريقتين القديمة والجديدة دون تداخل
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
@@ -80,19 +73,18 @@ class ProComic : HttpSource() {
             val response = chain.proceed(chain.request())
             val urlStr = response.request.url.toString()
             
-            if (urlStr.contains("/i/eyJ")) {
+            // اعتراض الروابط التي تحتوي على مسار التشفير
+            if (urlStr.contains("/i/")) {
                 val body = response.body
                 if (body != null) {
                     val contentType = body.contentType()
-                    val bytes = body.bytes() // قراءة كـ بايتات خام لحماية الصور الحقيقية من التلف
+                    val bytes = body.bytes() 
                     
-                    // التحقق مما إذا كانت الاستجابة تبدأ بنص الطريقة القديمة data:image/
                     val prefix = "data:image/".toByteArray(Charsets.US_ASCII)
                     val isBase64Text = bytes.size > prefix.size && 
                         bytes.take(prefix.size).toByteArray().contentEquals(prefix)
                     
                     if (isBase64Text) {
-                        // الطريقة القديمة: تفكيك الـ Base64 وتحويله لصورة
                         val bodyString = String(bytes, Charsets.UTF_8)
                         val base64Data = bodyString.substringAfter("base64,")
                         val decodedBytes = Base64.decode(base64Data, Base64.DEFAULT)
@@ -100,7 +92,6 @@ class ProComic : HttpSource() {
                             .body(decodedBytes.toResponseBody(contentType))
                             .build()
                     } else {
-                        // الطريقة الجديدة: الصورة جاهزة ونقية، نمرر البايتات كما هي للتطبيق فوراً
                         return@addInterceptor response.newBuilder()
                             .body(bytes.toResponseBody(contentType))
                             .build()
@@ -369,8 +360,12 @@ class ProComic : HttpSource() {
             val srcIdx = if (order.size == pieces.size) order[targetIdx] else targetIdx
             val basePieceUrl = pieces.getOrNull(srcIdx) ?: continue
 
-            // الروابط تستخرج خام تماماً بدون إضافات لتتوافق مع الطريقة الجديدة
-            val finalUrl = basePieceUrl
+            // 🔴 التعديل الجوهري: إضافة التوكن فقط إذا لم يكن الرابط بالنظام الجديد المشفر (/i/ أو eyJ)
+            val finalUrl = if (signedToken.isNotBlank() && !basePieceUrl.contains("/i/") && !basePieceUrl.contains("eyJ")) {
+                if (basePieceUrl.contains("?")) "$basePieceUrl&token=$signedToken" else "$basePieceUrl?token=$signedToken"
+            } else {
+                basePieceUrl
+            }
             
             if (seenUrls.add(finalUrl)) {
                 pages.add(Page(pages.size, imageUrl = finalUrl))
