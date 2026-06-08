@@ -1,8 +1,5 @@
 package eu.kanade.tachiyomi.extension.ar.procomic
 
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.Canvas
 import android.util.Base64
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
@@ -22,13 +19,12 @@ import kotlinx.serialization.json.decodeFromStream
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
-import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
-import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.TimeUnit
@@ -56,151 +52,26 @@ class ProComic : HttpSource() {
         private const val CHROME_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
-    private fun String.toAbsoluteUrl(cdnBase: String, token: String): String {
+    // بناء الرابط بالطريقة الجديدة (روابط خام بدون توكينات إضافية)
+    private fun String.toAbsoluteUrl(cdnBase: String): String {
         val cleanPiece = this.trim()
         if (cleanPiece.startsWith("http")) return cleanPiece
 
         val base = if (cdnBase.isBlank()) "https://img1.procomic.pro" else cdnBase
 
-        val url = when {
+        return when {
             cleanPiece.startsWith("eyJ") -> "$base/i/$cleanPiece"
             cleanPiece.startsWith("/i/") -> "$base$cleanPiece"
             cleanPiece.startsWith("/") -> "$base$cleanPiece"
             else -> "$base/$cleanPiece"
         }
-
-        if (token.isNotBlank() && !url.contains("/i/") && !url.contains("eyJ")) {
-            return if (url.contains("?")) "$url&token=$token" else "$url?token=$token"
-        }
-        return url
     }
 
+    // المعترض (Interceptor) الجديد: مبسط ومركز فقط على فك نصوص الـ Base64 وتحويلها لصور
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .rateLimit(2, 1)
-        // المُعترض الأول: دمج القوالب مع شبكة أمان تمنع انهيار التطبيق
-        .addInterceptor { chain ->
-            val request = chain.request()
-            val urlStr = request.url.toString()
-
-            if (urlStr.startsWith("procomic-map://")) {
-                val mapJsonBase64 = urlStr.substringAfter("procomic-map://")
-                val mapJsonStr = try {
-                    String(Base64.decode(mapJsonBase64, Base64.URL_SAFE or Base64.DEFAULT))
-                } catch (e: Exception) { "{}" }
-                
-                val mapData = try { json.decodeFromString<StitchInstruction>(mapJsonStr) } catch (e: Exception) { StitchInstruction(emptyList(), emptyList()) }
-
-                val bitmaps = mutableMapOf<Int, Bitmap>()
-                var pieceWidth = 0
-                var pieceHeight = 0
-
-                for (targetIdx in mapData.pieces.indices) {
-                    val pieceUrl = mapData.pieces[targetIdx]
-                    val req = Request.Builder().url(pieceUrl).headers(request.headers).build()
-                    val resp = chain.proceed(req) 
-                    val bytes = resp.body?.bytes() ?: continue
-                    
-                    var bitmap: Bitmap? = try { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) } catch(e: Exception) { null }
-                    
-                    // محاولة استخدام محلل التطبيق بذكاء في حال كانت الصورة AVIF
-                    if (bitmap == null) {
-                        try {
-                            val decoderClass = Class.forName("tachiyomi.decoder.ImageDecoder")
-                            val methods = decoderClass.methods.filter { it.name == "newInstance" }
-                            for (method in methods) {
-                                try {
-                                    val args = method.parameterTypes.map { type ->
-                                        when (type) {
-                                            java.io.InputStream::class.java -> bytes.inputStream()
-                                            Boolean::class.javaPrimitiveType -> false
-                                            Int::class.javaPrimitiveType -> 0
-                                            else -> null
-                                        }
-                                    }.toTypedArray()
-                                    val decoder = method.invoke(null, *args)
-                                    if (decoder != null) {
-                                        val decodeMethod = decoder.javaClass.methods.firstOrNull { it.name == "decode" }
-                                        bitmap = decodeMethod?.invoke(decoder) as? Bitmap
-                                        val recycleMethod = decoder.javaClass.methods.firstOrNull { it.name == "recycle" }
-                                        recycleMethod?.invoke(decoder)
-                                        if (bitmap != null) break
-                                    }
-                                } catch (e: Exception) {}
-                            }
-                        } catch (e: Exception) {}
-                    }
-                    
-                    if (bitmap != null) {
-                        bitmaps[targetIdx] = bitmap
-                        if (pieceWidth == 0) pieceWidth = bitmap.width
-                        if (pieceHeight == 0) pieceHeight = bitmap.height
-                    }
-                }
-
-                // شبكة الأمان: إذا فشل دمج الصور، نعرض صفحة تنبيه بدلاً من تحطيم التطبيق
-                if (bitmaps.isEmpty() || pieceWidth == 0 || pieceHeight == 0) {
-                    val errorBmp = Bitmap.createBitmap(800, 1000, Bitmap.Config.ARGB_8888)
-                    val canvas = Canvas(errorBmp)
-                    canvas.drawColor(android.graphics.Color.DKGRAY)
-                    val paint = android.graphics.Paint().apply {
-                        color = android.graphics.Color.WHITE
-                        textSize = 30f
-                        textAlign = android.graphics.Paint.Align.CENTER
-                    }
-                    canvas.drawText("عذراً، فشل فك تشفير الصور (AVIF/Base64)", 400f, 450f, paint)
-                    canvas.drawText("قد لا يدعم هاتفك أو القارئ هذه الصيغة", 400f, 500f, paint)
-                    val os = ByteArrayOutputStream()
-                    errorBmp.compress(Bitmap.CompressFormat.JPEG, 90, os)
-                    return@addInterceptor Response.Builder()
-                        .request(request).code(200).protocol(Protocol.HTTP_1_1).message("OK")
-                        .body(os.toByteArray().toResponseBody("image/jpeg".toMediaType()))
-                        .build()
-                }
-
-                val totalWidth = mapData.dim.getOrElse(0) { pieceWidth }
-                val totalHeight = mapData.dim.getOrElse(1) { pieceHeight }
-
-                return@addInterceptor try {
-                    val cols = Math.max(1, Math.round(totalWidth.toFloat() / pieceWidth))
-                    val resultBitmap = Bitmap.createBitmap(totalWidth, totalHeight, Bitmap.Config.ARGB_8888)
-                    val canvas = Canvas(resultBitmap)
-
-                    for ((targetIdx, bitmap) in bitmaps) {
-                        val x = (targetIdx % cols) * pieceWidth
-                        val y = (targetIdx / cols) * pieceHeight
-                        canvas.drawBitmap(bitmap, x.toFloat(), y.toFloat(), null)
-                        bitmap.recycle()
-                    }
-
-                    val outputStream = ByteArrayOutputStream()
-                    resultBitmap.compress(Bitmap.CompressFormat.JPEG, 90, outputStream)
-                    val finalBytes = outputStream.toByteArray()
-                    resultBitmap.recycle()
-
-                    Response.Builder()
-                        .request(request)
-                        .code(200)
-                        .protocol(Protocol.HTTP_1_1)
-                        .message("OK")
-                        .body(finalBytes.toResponseBody("image/jpeg".toMediaType()))
-                        .build()
-                } catch (e: Throwable) { // حماية إضافية للذاكرة
-                    val errorBmp = Bitmap.createBitmap(800, 1000, Bitmap.Config.ARGB_8888)
-                    val canvas = Canvas(errorBmp)
-                    canvas.drawColor(android.graphics.Color.DKGRAY)
-                    val paint = android.graphics.Paint().apply { color = android.graphics.Color.WHITE; textSize = 35f; textAlign = android.graphics.Paint.Align.CENTER }
-                    canvas.drawText("حجم الصورة كبير جداً على الذاكرة", 400f, 500f, paint)
-                    val os = ByteArrayOutputStream()
-                    errorBmp.compress(Bitmap.CompressFormat.JPEG, 90, os)
-                    Response.Builder().request(request).code(200).protocol(Protocol.HTTP_1_1).message("OK")
-                        .body(os.toByteArray().toResponseBody("image/jpeg".toMediaType())).build()
-                }
-            }
-            chain.proceed(request)
-        }
-        // المُعترض الثاني: فك تشفير نصوص Base64 بأمان تام
         .addInterceptor { chain ->
             val response = chain.proceed(chain.request())
             val urlStr = response.request.url.toString()
@@ -211,14 +82,20 @@ class ProComic : HttpSource() {
                     val contentType = body.contentType()
                     val bytes = body.bytes() 
                     
-                    val headStr = String(bytes.take(100).toByteArray(), Charsets.US_ASCII).trim()
-                    if (headStr.startsWith("data:image/")) {
+                    val prefix = "data:image/".toByteArray(Charsets.US_ASCII)
+                    val isBase64Text = bytes.size > prefix.size && 
+                        bytes.take(prefix.size).toByteArray().contentEquals(prefix)
+                    
+                    if (isBase64Text) {
                         val bodyString = String(bytes, Charsets.UTF_8).trim()
                         val base64Data = bodyString.substringAfter("base64,").trim()
                         try {
                             val decodedBytes = Base64.decode(base64Data, Base64.DEFAULT)
+                            val mimeTypeStr = bodyString.substringAfter("data:").substringBefore(";")
+                            val mimeType = mimeTypeStr.toMediaTypeOrNull() ?: "image/avif".toMediaType()
+                            
                             return@addInterceptor response.newBuilder()
-                                .body(decodedBytes.toResponseBody(contentType))
+                                .body(decodedBytes.toResponseBody(mimeType))
                                 .build()
                         } catch (e: Exception) {
                             return@addInterceptor response.newBuilder()
@@ -338,19 +215,14 @@ class ProComic : HttpSource() {
         var cachedSessionKey: String? = null
         var sessionKeyAttempted = false
         
+        // استخراج الـ Session Key بالطريقة المعتمدة حالياً فقط
         val getSessionKey = {
             if (!sessionKeyAttempted) {
                 sessionKeyAttempted = true
                 try {
-                    val req1 = client.newCall(GET("$baseUrl/chapter-map-session-key/$chapterId", apiHeaders)).execute()
-                    if (req1.isSuccessful) cachedSessionKey = req1.parseAs<SessionKeyResponse>().data?.key
+                    val req = client.newCall(GET("$baseUrl/chapter-map-session-key/$chapterId", apiHeaders)).execute()
+                    if (req.isSuccessful) cachedSessionKey = req.parseAs<SessionKeyResponse>().data?.key
                 } catch (e: Exception) {}
-                if (cachedSessionKey.isNullOrBlank()) {
-                    try {
-                        val req2 = client.newCall(GET("$baseUrl/chapter-map-session-key/$chapterId?legacy=1", apiHeaders)).execute()
-                        if (req2.isSuccessful) cachedSessionKey = req2.parseAs<SessionKeyResponse>().data?.key
-                    } catch (e: Exception) {}
-                }
             }
             cachedSessionKey
         }
@@ -374,7 +246,7 @@ class ProComic : HttpSource() {
         val mapTokens = mutableListOf<String>()
 
         metadataImages.forEach { imgPath ->
-            val fullUrl = imgPath.toAbsoluteUrl(cdnBase, "")
+            val fullUrl = imgPath.toAbsoluteUrl(cdnBase)
             if (seenUrls.add(fullUrl)) pages.add(Page(pages.size, imageUrl = fullUrl))
         }
 
@@ -430,33 +302,18 @@ class ProComic : HttpSource() {
         return null
     }
 
+    // استخراج القطع وإضافتها بتسلسل حسب مصفوفة الـ Order دون محاولة دمجها
     private fun processMap(
         map: DeferredPageMap, cdnBase: String, pages: MutableList<Page>, seenUrls: MutableSet<String>
     ) {
         if (map.pieces.isEmpty()) return
 
-        val absolutePieces = map.pieces.map { it.toAbsoluteUrl(cdnBase, map.token) }
-
-        if (map.dim.size >= 2 && map.pieces.size > 1 && map.order.isNotEmpty()) {
-            val instructionPieces = mutableListOf<String>()
-            for (targetIdx in map.pieces.indices) {
-                val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
-                instructionPieces.add(absolutePieces[srcIdx])
-            }
+        for (targetIdx in map.pieces.indices) {
+            val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
+            val pieceUrl = map.pieces[srcIdx].toAbsoluteUrl(cdnBase)
             
-            val instruction = StitchInstruction(map.dim, instructionPieces)
-            val jsonStr = json.encodeToString(instruction)
-            val base64Str = Base64.encodeToString(jsonStr.toByteArray(), Base64.URL_SAFE or Base64.NO_WRAP)
-            
-            val finalUrl = "procomic-map://$base64Str"
-            if (seenUrls.add(finalUrl)) {
-                pages.add(Page(pages.size, imageUrl = finalUrl))
-            }
-        } else {
-            for (targetIdx in absolutePieces.indices) {
-                val srcIdx = if (map.order.size == absolutePieces.size) map.order[targetIdx] else targetIdx
-                val pieceUrl = absolutePieces[srcIdx]
-                if (seenUrls.add(pieceUrl)) pages.add(Page(pages.size, imageUrl = pieceUrl))
+            if (seenUrls.add(pieceUrl)) {
+                pages.add(Page(pages.size, imageUrl = pieceUrl))
             }
         }
     }
@@ -490,12 +347,12 @@ class ProComic : HttpSource() {
                     val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
                     if (resolved != null && resolved.pieces.isNotEmpty()) {
                         decryptedMaps.add(resolved)
-                        absolutePieceUrls.addAll(resolved.pieces.map { it.toAbsoluteUrl(cdnBase, resolved.token) })
+                        absolutePieceUrls.addAll(resolved.pieces.map { it.toAbsoluteUrl(cdnBase) })
                     }
                 }
 
                 split.images.forEach { url ->
-                    val fullUrl = url.toAbsoluteUrl(cdnBase, "")
+                    val fullUrl = url.toAbsoluteUrl(cdnBase)
                     if (fullUrl !in absolutePieceUrls && seenUrls.add(fullUrl)) {
                         pages.add(Page(pages.size, imageUrl = fullUrl))
                     }
@@ -542,7 +399,6 @@ class ProComic : HttpSource() {
         json.decodeFromStream(body.byteStream())
 }
 
-@Serializable data class StitchInstruction(val dim: List<Int>, val pieces: List<String>)
 @Serializable data class SessionKeyResponse(val success: Boolean = false, val data: SessionKeyData? = null)
 @Serializable data class SessionKeyData(val key: String = "")
 @Serializable data class EncryptedToken(val v: Int = 3, val m: String = "", val cid: Int = 0, val iv: String = "", val tag: String = "", val data: String = "")
