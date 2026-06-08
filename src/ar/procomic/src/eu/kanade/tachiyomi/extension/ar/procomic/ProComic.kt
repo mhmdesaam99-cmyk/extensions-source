@@ -57,7 +57,6 @@ class ProComic : HttpSource() {
         private const val CHROME_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
-    // تعديل ذكي لبناء الرابط بناءً على السيرفر القادم من الـ API (مثل img2 أو img1) دون فرض سيرفر خاطئ
     private fun String.toAbsoluteUrl(cdnBase: String): String {
         val cleanPiece = this.trim()
         if (cleanPiece.startsWith("http")) return cleanPiece
@@ -72,11 +71,37 @@ class ProComic : HttpSource() {
         }
     }
 
-    // تم إزالة الـ Interceptor الخاص بالدمج تماماً لكي يقوم التطبيق بطلب القطع بشكل مباشر وصريح
+    // إضافة معترض ذكي (Interceptor) لتحويل نصوص الـ Base64 القادمة من السيرفر إلى صور حقيقية يفهمها التطبيق
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .rateLimit(2, 1)
+        .addInterceptor { chain ->
+            val response = chain.proceed(chain.request())
+            val urlStr = response.request.url.toString()
+            
+            // إذا كانت الاستجابة قادمة من روابط قطع الصور المشفرة
+            if (urlStr.contains("/i/eyJ")) {
+                val body = response.body
+                val contentType = body.contentType()
+                val bodyString = body.string() // قراءة الاستجابة النصية
+                
+                // إذا كانت الاستجابة نص Base64 مدمج داخل كود السيرفر
+                if (bodyString.startsWith("data:image/") && bodyString.contains("base64,")) {
+                    val base64Data = bodyString.substringAfter("base64,")
+                    val decodedBytes = Base64.decode(base64Data, Base64.DEFAULT)
+                    // نقوم باستبدال النص بملف باينري حقيقي للصورة ليقوم التطبيق بقراءته فوراً
+                    return@addInterceptor response.newBuilder()
+                        .body(decodedBytes.toResponseBody(contentType))
+                        .build()
+                }
+                // إعادة بناء الاستجابة في حال لم تكن نص Base64 لمنع حدوث مشاكل
+                return@addInterceptor response.newBuilder()
+                    .body(bodyString.toResponseBody(contentType))
+                    .build()
+            }
+            response
+        }
         .build()
 
     override fun headersBuilder() = super.headersBuilder()
@@ -322,7 +347,6 @@ class ProComic : HttpSource() {
         return null
     }
 
-    // الدالة المسؤولة عن تفكيك الخريطة واستخراج القطع كصفحات مستقلة دون دمج لغرض الفحص والتصحيح
     private fun processMap(
         pieces: List<String>,
         order: List<Int>,
@@ -334,16 +358,12 @@ class ProComic : HttpSource() {
     ) {
         if (pieces.isEmpty()) return
 
-        // نقوم بالمرور على كل قطعة وإضافتها كصفحة مستقلة بذاتها في القارئ لنرى إن كانت ستفتح أم ستعطي 404
         for (targetIdx in pieces.indices) {
             val srcIdx = if (order.size == pieces.size) order[targetIdx] else targetIdx
             val basePieceUrl = pieces.getOrNull(srcIdx) ?: continue
 
-            val finalUrl = if (signedToken.isNotBlank() && !basePieceUrl.contains("token=")) {
-                if (basePieceUrl.contains("?")) "$basePieceUrl&token=$signedToken" else "$basePieceUrl?token=$signedToken"
-            } else {
-                basePieceUrl
-            }
+            // تم إزالة إضافة التوكين تماماً لأن روابط الـ CDN نقية ومباشرة بدون علامات استفهام
+            val finalUrl = basePieceUrl
             
             if (seenUrls.add(finalUrl)) {
                 pages.add(Page(pages.size, imageUrl = finalUrl))
