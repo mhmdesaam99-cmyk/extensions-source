@@ -32,25 +32,23 @@ jobs:
           java-version: 17
           distribution: temurin
 
-      # تفعيل الكاش لتسريع عملية البناء في المرات القادمة بشكل هائل
+      # تفعيل ميزة الكاش لتسريع البناء بشكل ملحوظ
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
-        with:
-          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }} # اختياري
 
       - name: Run Spotless Apply
         run: |
           ./gradlew spotlessApply
 
-      # بناء الإضافة مباشرة بدون خطوات التحضير المعقدة
+      # بناء الإضافة كنسخة مخصصة للمطورين (بدون توقيع)
       - name: Build ProChan
         run: |
           ./gradlew :src:ar:procomic:assembleDebug
 
-      # رفع ملف الـ APK الناتج كـ Artifact
+      # رفع ملف الـ APK لتتمكن من تحميله مباشرة من GitHub Actions
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: "ProChan-APK"
           path: "**/*.apk"
-          retention-days: 5
+          retention-days: 3
