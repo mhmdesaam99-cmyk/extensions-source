@@ -61,7 +61,6 @@ class ProComic : HttpSource() {
         private const val MAX_SAFE_HEIGHT = 6000
     }
 
-    // [الإصلاح الأول]: توجيه مسارات التشفير Base64 إلى خادم Proxy الصور الصحيح img2
     private fun String.toAbsoluteUrl(cdnBase: String): String {
         return when {
             this.startsWith("http") -> this
@@ -71,18 +70,18 @@ class ProComic : HttpSource() {
         }
     }
 
+    // إضافة الحماية السليمة ضد 520 ومعالجة البازل هنا
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
-        .rateLimit(2, 1)
+        .rateLimit(2, 1) // تجنب الحظر السريع
         .addInterceptor { chain ->
             val request = chain.request()
             val url = request.url.toString()
 
-            // [الإصلاح الثالث]: الاعتماد فقط على البادئة الصارمة لتجنب اصطياد روابط القطع العادية بالخطأ
+            // معالجة روابط التجميع للبازل
             if (url.startsWith(SCRAMBLED_SCHEME)) {
                 val encoded = url.substringAfter("?map=")
-                // فك ترميز الرابط (URL Decode) لتجنب أخطاء Base64 بسبب رموز مثل %3D
                 val decodedUrlStr = URLDecoder.decode(encoded, "UTF-8")
                 val mapJson = String(Base64.decode(decodedUrlStr, Base64.URL_SAFE or Base64.NO_WRAP))
                 val pageMap = json.decodeFromString<ScrambledMap>(mapJson)
@@ -95,13 +94,18 @@ class ProComic : HttpSource() {
 
                 return@addInterceptor Response.Builder()
                     .request(request).protocol(Protocol.HTTP_1_1)
-                        .code(200).message("OK")
-                        .body(mergedBytes.toResponseBody("image/jpeg".toMediaType()))
-                        .build()
+                    .code(200).message("OK")
+                    .body(mergedBytes.toResponseBody("image/jpeg".toMediaType()))
+                    .build()
             }
 
             val response = chain.proceed(request)
             
+            // فحص رد Cloudflare 520 وتجنب Crash
+            if (response.code == 520) {
+                throw Exception("الموقع يحجب الطلب (خطأ 520). يرجى فتح الموقع بالمتصفح (WebView) وحل الكابتشا.")
+            }
+
             val isPotentialBase64Image = response.isSuccessful && request.method == "GET" && 
                                          url.contains("/i/") && url.contains("procomic")
                                          
@@ -135,11 +139,26 @@ class ProComic : HttpSource() {
         }
         .build()
 
+    // تحديث الترويسات (Headers) لإقناع الحماية
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
         .add("Origin", baseUrl)
+        .add("Accept", "application/json, text/plain, */*")
         .add("Accept-Language", "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7")
+        .add("Cookie", "language=ar; calendar=gregorian; theme=dark;")
         .add("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
+
+    // دوال الفحص الآمن لمنع خطأ 500
+    private inline fun <reified T> Response.parseAsSafe(): T {
+        if (!isSuccessful) {
+            throw Exception("فشل الاتصال: HTTP ${code}. قد يكون حظر Cloudflare.")
+        }
+        val bodyStr = body.string()
+        if (bodyStr.contains("cloudflare", ignoreCase = true) || bodyStr.trim().startsWith("<")) {
+            throw Exception("تم حظر الطلب. يرجى فتح المتصفح وحل اختبار Cloudflare.")
+        }
+        return json.decodeFromString(bodyStr)
+    }
 
     override fun popularMangaRequest(page: Int) = GET(
         "$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page",
@@ -147,7 +166,7 @@ class ProComic : HttpSource() {
     )
 
     override fun popularMangaParse(response: Response): MangasPage {
-        val data = response.parseAs<LatestUpdatesResponse>()
+        val data = response.parseAsSafe<LatestUpdatesResponse>()
         val mangas = data.data.filter { it.type != "novel" }.map { it.toSManga() }
         return MangasPage(mangas, mangas.size >= 30)
     }
@@ -169,25 +188,23 @@ class ProComic : HttpSource() {
     }
 
     override fun mangaDetailsParse(response: Response): SManga {
-        return try {
-            val data = response.parseAs<SeriesDetailResponse>()
-            val parts = response.request.url.pathSegments
-            val idx = parts.indexOf("public")
-            SManga.create().apply {
-                url = "${parts.getOrElse(idx + 1) { "manga" }}/${parts.getOrElse(idx + 2) { "0" }}/${data.slug ?: ""}"
-                title = data.title ?: ""
-                thumbnail_url = data.coverImageApp?.card?.mobile ?: data.coverImageApp?.desktop ?: data.coverImage
-                author = data.author
-                artist = data.artist
-                description = data.synopsis ?: data.description
-                status = when (data.status?.lowercase()) {
-                    "ongoing", "مستمر" -> SManga.ONGOING
-                    "completed", "مكتمل" -> SManga.COMPLETED
-                    "hiatus" -> SManga.ON_HIATUS
-                    else -> SManga.UNKNOWN
-                }
+        val data = response.parseAsSafe<SeriesDetailResponse>()
+        val parts = response.request.url.pathSegments
+        val idx = parts.indexOf("public")
+        return SManga.create().apply {
+            url = "${parts.getOrElse(idx + 1) { "manga" }}/${parts.getOrElse(idx + 2) { "0" }}/${data.slug ?: ""}"
+            title = data.title ?: ""
+            thumbnail_url = data.coverImageApp?.card?.mobile ?: data.coverImageApp?.desktop ?: data.coverImage
+            author = data.author
+            artist = data.artist
+            description = data.synopsis ?: data.description
+            status = when (data.status?.lowercase()) {
+                "ongoing", "مستمر" -> SManga.ONGOING
+                "completed", "مكتمل" -> SManga.COMPLETED
+                "hiatus" -> SManga.ON_HIATUS
+                else -> SManga.UNKNOWN
             }
-        } catch (e: Exception) { SManga.create() }
+        }
     }
 
     override fun chapterListRequest(manga: SManga): Request {
@@ -204,7 +221,8 @@ class ProComic : HttpSource() {
         val seriesType = parts.getOrElse(idx + 1) { "manga" }
         val seriesId = parts.getOrElse(idx + 2) { "0" }
 
-        return response.parseAs<ChaptersResponse>().data.map { ch ->
+        val data = response.parseAsSafe<ChaptersResponse>()
+        return data.data.map { ch ->
             SChapter.create().apply {
                 url = "$seriesType/$seriesId/${ch.id}/${ch.chapterNumber}"
                 name = "الفصل ${ch.chapterNumber}" + (if (!ch.title.isNullOrBlank()) " - ${ch.title}" else "")
@@ -260,15 +278,14 @@ class ProComic : HttpSource() {
                 try {
                     val req = client.newCall(GET("$baseUrl/chapter-map-session-key/$chapterId?legacy=1", apiHeaders)).execute()
                     if (req.isSuccessful) {
-                        cachedSessionKey = req.parseAs<SessionKeyResponse>().data?.key
+                        cachedSessionKey = json.decodeFromString<SessionKeyResponse>(req.body.string()).data?.key
                     }
-                } catch (e: Exception) {
-                }
+                } catch (e: Exception) { }
             }
             cachedSessionKey
         }
 
-        val currentData = try { response.parseAs<ChaptersResponse>() } catch (e: Exception) { ChaptersResponse() }
+        val currentData = response.parseAsSafe<ChaptersResponse>()
         for (ch in currentData.data) {
             if (ch.id.toString() == chapterId) {
                 cdnPath = ch.cdnPath ?: "cdn1"
@@ -287,7 +304,7 @@ class ProComic : HttpSource() {
                         GET("$baseUrl/api/public/$seriesType/$seriesId/chapters?limit=500&page=$pg&order=desc", apiHeaders),
                     ).execute()
                     if (!resp.isSuccessful) break
-                    val data = resp.parseAs<ChaptersResponse>()
+                    val data = json.decodeFromString<ChaptersResponse>(resp.body.string())
                     if (data.data.isEmpty()) break
                     for (ch in data.data) {
                         if (ch.id.toString() == chapterId) {
@@ -297,9 +314,7 @@ class ProComic : HttpSource() {
                             break@outer
                         }
                     }
-                } catch (e: Exception) {
-                    break
-                }
+                } catch (e: Exception) { break }
                 pg++
             }
         }
@@ -333,8 +348,7 @@ class ProComic : HttpSource() {
             try {
                 val newPages = fetchDeferredPages(chapterId, jwtToken, apiHeaders, seenUrls, cdnBase, getSessionKey)
                 pages.addAll(newPages)
-            } catch (e: Exception) {
-            }
+            } catch (e: Exception) { }
         }
 
         return pages
@@ -369,7 +383,7 @@ class ProComic : HttpSource() {
                     )
                     val proxyResp = client.newCall(proxyReq).execute()
                     if (proxyResp.isSuccessful) {
-                        dec = proxyResp.parseAs<ProxyPlanResponse>().data?.map
+                        dec = json.decodeFromString<ProxyPlanResponse>(proxyResp.body.string()).data?.map
                     }
                 } catch (e: Exception) {}
             }
@@ -430,7 +444,7 @@ class ProComic : HttpSource() {
         ).execute()
         if (!first.isSuccessful) return pages
 
-        val firstData = first.parseAs<ChapterDeferredResponse>()
+        val firstData = json.decodeFromString<ChapterDeferredResponse>(first.body.string())
         if (!firstData.success || firstData.data == null) return pages
 
         val splits = mutableListOf(firstData.data)
@@ -440,11 +454,9 @@ class ProComic : HttpSource() {
                     GET("$baseUrl/chapter-deferred-media/$chapterId?token=$jwtToken&split=$s", apiHeaders),
                 ).execute()
                 if (!r.isSuccessful) break
-                val d = r.parseAs<ChapterDeferredResponse>()
+                val d = json.decodeFromString<ChapterDeferredResponse>(r.body.string())
                 if (d.success && d.data != null) splits.add(d.data)
-            } catch (e: Exception) {
-                break
-            }
+            } catch (e: Exception) { break }
         }
 
         for (split in splits) {
@@ -498,9 +510,7 @@ class ProComic : HttpSource() {
 
             val decryptedBytes = cipher.doFinal(cipherTextBytes + tagBytes)
             json.decodeFromString<DeferredPageMap>(String(decryptedBytes))
-        } catch (e: Exception) {
-            null
-        }
+        } catch (e: Exception) { null }
     }
 
     private fun reconstructPage(map: ScrambledMap): ByteArray? {
@@ -513,8 +523,6 @@ class ProComic : HttpSource() {
             val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
             val basePieceUrl = map.pieces.getOrNull(srcIdx) ?: continue
 
-            // [الإصلاح الثاني]: بناء الرابط بطريقة تضمن ترميز المتغيرات (URL Encode) للتوكن بأمان 
-            // وعدم كسر بنية الرابط مما يمنع الـ 520 و 404
             val pieceUrl = if (map.signedToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ")) {
                 val parsedUrl = basePieceUrl.toHttpUrlOrNull()
                 if (parsedUrl != null) {
@@ -554,9 +562,7 @@ class ProComic : HttpSource() {
                         bitmaps[targetIdx] = decodeAvif(finalBytes)
                     }
                 }
-            } catch (e: Exception) {
-                // تجاهل القطعة المعطوبة للسماح برسم ما يمكن رسمه من بقية القطع بدل توقف الفصل بالكامل
-            }
+            } catch (e: Exception) { }
         }
 
         try {
@@ -629,9 +635,7 @@ class ProComic : HttpSource() {
             result.compress(Bitmap.CompressFormat.JPEG, 85, out)
             result.recycle()
             return out.toByteArray()
-        } catch (e: Exception) {
-            return null
-        }
+        } catch (e: Exception) { return null }
     }
 
     private fun decodeAvif(bytes: ByteArray): Bitmap? {
@@ -661,136 +665,64 @@ class ProComic : HttpSource() {
         else -> Pair(1, pieceCount)
     }
 
-    private inline fun <reified T> Response.parseAs(): T =
-        json.decodeFromStream(body.byteStream())
-}
+    // ===================================
+    // Data Classes
+    // ===================================
 
-@Serializable
-data class SessionKeyResponse(
-    val success: Boolean = false,
-    val data: SessionKeyData? = null,
-)
+    @Serializable
+    data class SessionKeyResponse(val success: Boolean = false, val data: SessionKeyData? = null)
 
-@Serializable
-data class SessionKeyData(val key: String = "")
+    @Serializable
+    data class SessionKeyData(val key: String = "")
 
-@Serializable
-data class EncryptedToken(
-    val v: Int = 3,
-    val m: String = "",
-    val cid: Int = 0,
-    val iv: String = "",
-    val tag: String = "",
-    val data: String = "",
-)
+    @Serializable
+    data class EncryptedToken(val v: Int = 3, val m: String = "", val cid: Int = 0, val iv: String = "", val tag: String = "", val data: String = "")
 
-@Serializable
-data class ScrambledMap(
-    val dim: List<Int> = emptyList(),
-    val mode: String = "",
-    val pieces: List<String> = emptyList(),
-    val order: List<Int> = emptyList(),
-    val signedToken: String = "",
-    val splitPart: Int? = null,
-    val totalParts: Int? = null,
-)
+    @Serializable
+    data class ScrambledMap(val dim: List<Int> = emptyList(), val mode: String = "", val pieces: List<String> = emptyList(), val order: List<Int> = emptyList(), val signedToken: String = "", val splitPart: Int? = null, val totalParts: Int? = null)
 
-@Serializable
-data class LatestUpdatesResponse(
-    val success: Boolean = false,
-    val data: List<SeriesDto> = emptyList(),
-)
+    @Serializable
+    data class LatestUpdatesResponse(val success: Boolean = false, val data: List<SeriesDto> = emptyList())
 
-@Serializable
-data class SeriesDto(
-    @SerialName("mangaId") val id: Int = 0,
-    @SerialName("mangaSlug") val slug: String = "",
-    @SerialName("mangaTitle") val title: String = "",
-    val coverImage: String? = null,
-    val type: String = "manga",
-    val coverImageApp: CoverImageApp? = null,
-) {
-    fun toSManga() = SManga.create().apply {
-        url = "$type/$id/$slug"
-        title = this@SeriesDto.title
-        thumbnail_url = coverImageApp?.card?.mobile ?: coverImageApp?.desktop ?: coverImage
+    @Serializable
+    data class SeriesDto(@SerialName("mangaId") val id: Int = 0, @SerialName("mangaSlug") val slug: String = "", @SerialName("mangaTitle") val title: String = "", val coverImage: String? = null, val type: String = "manga", val coverImageApp: CoverImageApp? = null) {
+        fun toSManga() = SManga.create().apply {
+            url = "$type/$id/$slug"
+            title = this@SeriesDto.title
+            thumbnail_url = coverImageApp?.card?.mobile ?: coverImageApp?.desktop ?: coverImage
+        }
     }
+
+    @Serializable
+    data class CoverImageApp(val desktop: String? = null, val card: CardImages? = null)
+
+    @Serializable
+    data class CardImages(val mobile: String? = null, val desktop: String? = null)
+
+    @Serializable
+    data class SeriesDetailResponse(val id: Int = 0, val title: String? = null, val slug: String? = null, val coverImage: String? = null, val coverImageApp: CoverImageApp? = null, val author: String? = null, val artist: String? = null, val description: String? = null, val synopsis: String? = null, val status: String? = null)
+
+    @Serializable
+    data class ChaptersResponse(val data: List<ChapterDto> = emptyList(), val total: Int = 0)
+
+    @Serializable
+    data class ChapterDto(val id: Int = 0, @SerialName("chapter_number") val chapterNumber: String = "0", val title: String? = null, @SerialName("published_at") val publishedAt: String? = null, val lockedByCoins: Boolean? = null, @SerialName("cdn_path") val cdnPath: String? = null, val metadata: ChapterMetadataDto? = null)
+
+    @Serializable
+    data class ChapterMetadataDto(val images: List<String> = emptyList(), val maps: List<DeferredPageMap> = emptyList())
+
+    @Serializable
+    data class ChapterDeferredResponse(val success: Boolean = false, val data: ChapterDeferredData? = null)
+
+    @Serializable
+    data class ChapterDeferredData(val chapterId: Int = 0, val splitIndex: Int = 0, val images: List<String> = emptyList(), val maps: List<DeferredPageMap> = emptyList())
+
+    @Serializable
+    data class DeferredPageMap(val dim: List<Int> = emptyList(), val mode: String = "", val pieces: List<String> = emptyList(), val order: List<Int> = emptyList(), val token: String = "", val method: String = "")
+
+    @Serializable
+    data class ProxyPlanResponse(val success: Boolean = false, val data: ProxyPlanData? = null)
+
+    @Serializable
+    data class ProxyPlanData(val map: DeferredPageMap? = null)
 }
-
-@Serializable
-data class CoverImageApp(val desktop: String? = null, val card: CardImages? = null)
-
-@Serializable
-data class CardImages(val mobile: String? = null, val desktop: String? = null)
-
-@Serializable
-data class SeriesDetailResponse(
-    val id: Int = 0,
-    val title: String? = null,
-    val slug: String? = null,
-    val coverImage: String? = null,
-    val coverImageApp: CoverImageApp? = null,
-    val author: String? = null,
-    val artist: String? = null,
-    val description: String? = null,
-    val synopsis: String? = null,
-    val status: String? = null,
-)
-
-@Serializable
-data class ChaptersResponse(
-    val data: List<ChapterDto> = emptyList(),
-    val total: Int = 0,
-)
-
-@Serializable
-data class ChapterDto(
-    val id: Int = 0,
-    @SerialName("chapter_number") val chapterNumber: String = "0",
-    val title: String? = null,
-    @SerialName("published_at") val publishedAt: String? = null,
-    val lockedByCoins: Boolean? = null,
-    @SerialName("cdn_path") val cdnPath: String? = null,
-    val metadata: ChapterMetadataDto? = null,
-)
-
-@Serializable
-data class ChapterMetadataDto(
-    val images: List<String> = emptyList(),
-    val maps: List<DeferredPageMap> = emptyList(),
-)
-
-@Serializable
-data class ChapterDeferredResponse(
-    val success: Boolean = false,
-    val data: ChapterDeferredData? = null,
-)
-
-@Serializable
-data class ChapterDeferredData(
-    val chapterId: Int = 0,
-    val splitIndex: Int = 0,
-    val images: List<String> = emptyList(),
-    val maps: List<DeferredPageMap> = emptyList(),
-)
-
-@Serializable
-data class DeferredPageMap(
-    val dim: List<Int> = emptyList(),
-    val mode: String = "",
-    val pieces: List<String> = emptyList(),
-    val order: List<Int> = emptyList(),
-    val token: String = "",
-    val method: String = "",
-)
-
-@Serializable
-data class ProxyPlanResponse(
-    val success: Boolean = false,
-    val data: ProxyPlanData? = null,
-)
-
-@Serializable
-data class ProxyPlanData(
-    val map: DeferredPageMap? = null,
-)
