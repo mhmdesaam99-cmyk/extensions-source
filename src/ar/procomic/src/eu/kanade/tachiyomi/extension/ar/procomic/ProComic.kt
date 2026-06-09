@@ -82,14 +82,70 @@ class ProComic : HttpSource() {
                 val pageMap = json.decodeFromString<ScrambledMap>(mapJson)
 
                 val mergedBytes = reconstructPage(pageMap)
-                    ?: throw Exception("فشل تجميع قطع الصورة. قد يكون الموقع قام بحظر الطلبات (خطأ 520). يرجى فتح الموقع في المتصفح وحل الكابتشا.")
+                    ?: return@addInterceptor Response.Builder()
+                        .request(request).protocol(Protocol.HTTP_1_1)
+                        .code(500).message("Error")
+                        .body("".toResponseBody(null)).build()
 
                 return@addInterceptor Response.Builder()
                     .request(request).protocol(Protocol.HTTP_1_1)
-                    .code(200).message("OK")
-                    .body(mergedBytes.toResponseBody("image/jpeg".toMediaType()))
-                    .build()
+                        .code(200).message("OK")
+                        .body(mergedBytes.toResponseBody("image/jpeg".toMediaType()))
+                        .build()
             }
+
+            // 🛠️ حل خطأ 520: استخراج الـ _cid وحذفه من الطلب المتوجه للسيرفر لتجنب انهياره
+            val cid = request.url.queryParameter("_cid")
+            val networkRequest = if (cid != null) {
+                request.newBuilder()
+                    .url(request.url.newBuilder().removeAllQueryParameters("_cid").build())
+                    .build()
+            } else {
+                request
+            }
+
+            val response = chain.proceed(networkRequest)
+
+            // 🛠️ إعادة الـ _cid وهمياً إلى الاستجابة لكي تقرأه دالة pageListParse بنجاح
+            val finalResponse = if (cid != null) {
+                val restoredUrl = response.request.url.newBuilder().addQueryParameter("_cid", cid).build()
+                response.newBuilder().request(response.request.newBuilder().url(restoredUrl).build()).build()
+            } else {
+                response
+            }
+            
+            val isPotentialBase64Image = finalResponse.isSuccessful && networkRequest.method == "GET" && 
+                                         finalResponse.request.url.toString().contains("/i/") && finalResponse.request.url.toString().contains("procomic")
+                                         
+            if (isPotentialBase64Image) {
+                val responseBody = finalResponse.body
+                if (responseBody != null) {
+                    val bytes = responseBody.bytes()
+                    val isBase64Text = bytes.size > 20 &&
+                            bytes[0] == 'd'.code.toByte() &&
+                            bytes[1] == 'a'.code.toByte() &&
+                            bytes[2] == 't'.code.toByte() &&
+                            bytes[3] == 'a'.code.toByte() &&
+                            bytes[4] == ':'.code.toByte()
+
+                    if (isBase64Text) {
+                        val bodyString = String(bytes)
+                        val base64Data = bodyString.substringAfter("base64,")
+                        val decodedBytes = Base64.decode(base64Data, Base64.DEFAULT)
+                        val mimeType = bodyString.substringAfter("data:").substringBefore(";").toMediaType()
+                        return@addInterceptor finalResponse.newBuilder()
+                            .body(decodedBytes.toResponseBody(mimeType))
+                            .build()
+                    } else {
+                        return@addInterceptor finalResponse.newBuilder()
+                            .body(bytes.toResponseBody(responseBody.contentType()))
+                            .build()
+                    }
+                }
+            }
+            finalResponse
+        }
+        .build()
 
             val response = chain.proceed(request)
             
