@@ -217,21 +217,25 @@ class ProComic : HttpSource() {
     }
 
     override fun pageListRequest(chapter: SChapter): Request {
-    // تقسيم الرابط للحصول على معرف الفصل (Chapter ID)
     val parts = chapter.url.split("/")
-    val seriesType = parts.getOrElse(0) { "comics" }
+    val seriesType = parts.getOrElse(0) { "manga" }
     val seriesId = parts.getOrElse(1) { "0" }
     val chapterId = parts.getOrElse(2) { "0" }
 
-    // الحل الصحيح: الاتصال بالـ API المباشر للفصل بدلاً من طلب قائمة بـ limit=500
-    // الرابط القياسي في السيرفر يكون عادةً على هذا النحو:
-    val url = "$baseUrl/api/public/chapters/$chapterId".toHttpUrl()
+    // العودة إلى الرابط الأصلي الخاص بك تماماً لضمان عمل الـ Parse بدون مشاكل
+    val url = "$baseUrl/api/public/$seriesType/$seriesId/chapters".toHttpUrl()
+        .newBuilder()
+        .addQueryParameter("page", "1")
+        .addQueryParameter("limit", "500")
+        .addQueryParameter("order", "desc")
+        .addQueryParameter("_cid", chapterId)
+        .build()
 
-    // بناء الـ Headers بشكل يحاكي المتصفح تماماً لتخطي حظر الـ 520
+    // إضافة الـ Headers الاحترافية هنا لمنع ظهور خطأ 520 وتخطي الحماية
     val requestHeaders = headers.newBuilder()
         .set("Accept", "application/json, text/plain, */*")
         .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        .set("Referer", "$baseUrl/$seriesType/$seriesId") // إرسال الصفحة المصدرية لتمرير الحماية
+        .set("Referer", "$baseUrl/$seriesType/$seriesId") // إيهام السيرفر أنك تتصفح المانجا من الموقع
         .set("Origin", baseUrl)
         .build()
 
