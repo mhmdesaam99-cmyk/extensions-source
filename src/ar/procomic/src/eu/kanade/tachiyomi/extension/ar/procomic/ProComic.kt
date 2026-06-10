@@ -6,7 +6,6 @@ import android.graphics.Canvas
 import android.util.Base64
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
-import eu.kanade.tachiyomi.network.interceptor.rateLimit
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -22,7 +21,6 @@ import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
@@ -67,16 +65,14 @@ class ProComic : HttpSource() {
         }
     }
 
-    // 🔴 الحل الجذري: إجبار الإضافة بالكامل على HTTP/1.1 لمنع OkHttp من إعادة استخدام اتصالات HTTP/2
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
-        .protocols(listOf(Protocol.HTTP_1_1)) 
-        .connectTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(60, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
-        .rateLimit(3, 1) // 3 طلبات في الثانية للحفاظ على استقرار الاتصال
         .addInterceptor { chain ->
             val request = chain.request()
             val url = request.url.toString()
 
+            // اعتراض طلبات الصور المجمعة وبناؤها محلياً
             if (url.startsWith(SCRAMBLED_SCHEME) || url.contains("?map=")) {
                 val encoded = url.substringAfter("?map=")
                 val mapJson = String(Base64.decode(encoded, Base64.URL_SAFE or Base64.NO_WRAP))
@@ -85,8 +81,10 @@ class ProComic : HttpSource() {
                 val mergedBytes = reconstructPage(pageMap)
 
                 return@addInterceptor Response.Builder()
-                    .request(request).protocol(Protocol.HTTP_1_1)
-                    .code(200).message("OK")
+                    .request(request)
+                    .protocol(okhttp3.Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
                     .body(mergedBytes.toResponseBody("image/jpeg".toMediaType()))
                     .build()
             }
@@ -116,6 +114,7 @@ class ProComic : HttpSource() {
                 }
             }
             
+            // معالجة صور Base64
             val isPotentialBase64Image = finalResponse.isSuccessful && networkRequest.method == "GET" && 
                                          finalResponse.request.url.toString().contains("/i/") && finalResponse.request.url.toString().contains("procomic")
                                          
@@ -155,8 +154,7 @@ class ProComic : HttpSource() {
         .add("Origin", baseUrl)
         .add("Accept", "application/json, text/plain, */*")
         .add("Accept-Language", "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7")
-        .add("Cookie", "language=ar; calendar=gregorian; theme=dark;")
-        .add("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
+        .add("User-Agent", network.defaultUserAgentProvider()) // استخدام البصمة الأصلية للتطبيق لتجنب الحظر
 
     override fun popularMangaRequest(page: Int) = GET(
         "$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page",
@@ -179,9 +177,12 @@ class ProComic : HttpSource() {
 
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
 
+    // تصحيح دالة بناء الروابط لمنع خطأ 404
     override fun mangaDetailsRequest(manga: SManga): Request {
         val p = manga.url.split("/")
-        return GET("$baseUrl/api/public/${p[0]}/${p[1]}", headers)
+        val type = p.getOrElse(0) { "manga" }
+        val id = p.getOrElse(1) { "0" }
+        return GET("$baseUrl/api/public/$type/$id", headers)
     }
 
     override fun mangaDetailsParse(response: Response): SManga {
@@ -206,10 +207,13 @@ class ProComic : HttpSource() {
         } catch (e: Exception) { SManga.create() }
     }
 
+    // تصحيح طلب الفصول لمنع خطأ 404
     override fun chapterListRequest(manga: SManga): Request {
         val p = manga.url.split("/")
+        val type = p.getOrElse(0) { "manga" }
+        val id = p.getOrElse(1) { "0" }
         return GET(
-            "$baseUrl/api/public/${p[0]}/${p[1]}/chapters?page=1&limit=500&order=desc",
+            "$baseUrl/api/public/$type/$id/chapters?page=1&limit=500&order=desc",
             headers,
         )
     }
@@ -247,7 +251,6 @@ class ProComic : HttpSource() {
 
         val requestHeaders = headers.newBuilder()
             .set("Accept", "application/json, text/plain, */*")
-            .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .set("Referer", "$baseUrl/$seriesType/$seriesId") 
             .set("Origin", baseUrl)
             .build()
@@ -533,6 +536,8 @@ class ProComic : HttpSource() {
         val bitmaps = arrayOfNulls<Bitmap>(map.pieces.size)
         var lastErrorCode = -1
 
+        val imageClient = network.client.newBuilder().build() // استخدام عميل نظيف للصور
+
         for (targetIdx in 0 until map.pieces.size) {
             val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
             val basePieceUrl = map.pieces.getOrNull(srcIdx) ?: continue
@@ -550,37 +555,47 @@ class ProComic : HttpSource() {
                 .header("Origin", baseUrl)
                 .build()
 
-            try {
-                // نستخدم العميل الأساسي الذي تم إجباره على HTTP/1.1
-                client.newCall(req).execute().use { resp ->
-                    if (resp.isSuccessful) {
-                        val bodyBytes = resp.body.bytes()
-                        val isBase64Text = bodyBytes.size > 20 &&
-                                bodyBytes[0] == 'd'.code.toByte() &&
-                                bodyBytes[1] == 'a'.code.toByte() &&
-                                bodyBytes[2] == 't'.code.toByte() &&
-                                bodyBytes[3] == 'a'.code.toByte() &&
-                                bodyBytes[4] == ':'.code.toByte()
+            // نظام المحاولات الذكي لمنع حظر 520 (تأخير زمني بسيط لتجنب إغضاب Cloudflare)
+            var success = false
+            var attempts = 0
+            while (!success && attempts < 3) {
+                try {
+                    imageClient.newCall(req).execute().use { resp ->
+                        if (resp.isSuccessful) {
+                            val bodyBytes = resp.body.bytes()
+                            val isBase64Text = bodyBytes.size > 20 &&
+                                    bodyBytes[0] == 'd'.code.toByte() &&
+                                    bodyBytes[1] == 'a'.code.toByte() &&
+                                    bodyBytes[2] == 't'.code.toByte() &&
+                                    bodyBytes[3] == 'a'.code.toByte() &&
+                                    bodyBytes[4] == ':'.code.toByte()
 
-                        val finalBytes = if (isBase64Text) {
-                            val bodyString = String(bodyBytes)
-                            val base64Data = bodyString.substringAfter("base64,")
-                            Base64.decode(base64Data, Base64.DEFAULT)
+                            val finalBytes = if (isBase64Text) {
+                                val bodyString = String(bodyBytes)
+                                val base64Data = bodyString.substringAfter("base64,")
+                                Base64.decode(base64Data, Base64.DEFAULT)
+                            } else {
+                                bodyBytes
+                            }
+                            bitmaps[targetIdx] = decodeAvif(finalBytes)
+                            success = true
+                            Thread.sleep(100) // تأخير 100 ملي ثانية بين كل قطعة والأخرى كتمويه
                         } else {
-                            bodyBytes
+                            lastErrorCode = resp.code
+                            attempts++
+                            Thread.sleep(300) // انتظار عند الفشل قبل المحاولة مجدداً
                         }
-                        bitmaps[targetIdx] = decodeAvif(finalBytes)
-                    } else {
-                        lastErrorCode = resp.code
                     }
+                } catch (e: Exception) {
+                    attempts++
+                    Thread.sleep(300)
                 }
-            } catch (e: Exception) {
             }
         }
 
         val validBitmaps = bitmaps.filterNotNull()
         if (validBitmaps.isEmpty()) {
-            throw Exception("حماية Cloudflare منعت تحميل الأجزاء. (الخطأ الأخير من السيرفر: $lastErrorCode). حاول تحديث الصفحة.")
+            throw Exception("حماية الموقع منعت تحميل الصور. (الخطأ الأخير: $lastErrorCode). يرجى المحاولة لاحقاً.")
         }
 
         try {
@@ -686,10 +701,10 @@ class ProComic : HttpSource() {
         val responseCode = this.code
         val bodyStr = this.body.string()
         if (!this.isSuccessful) {
-            throw Exception("فشل الاتصال بالموقع الأصلي: خطأ HTTP $responseCode")
+            throw Exception("فشل الاتصال بالموقع: خطأ HTTP $responseCode")
         }
         if (bodyStr.contains("cloudflare", ignoreCase = true) || bodyStr.trim().startsWith("<")) {
-            throw Exception("حماية Cloudflare نشطة (خطأ $responseCode). يرجى فتح المتصفح الداخلي وتخطي الحماية.")
+            throw Exception("حماية Cloudflare نشطة. يرجى فتح المتصفح الداخلي.")
         }
         return json.decodeFromString(bodyStr)
     }
