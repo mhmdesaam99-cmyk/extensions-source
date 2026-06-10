@@ -92,18 +92,20 @@ class ProComic : HttpSource() {
 
             val cid = request.url.queryParameter("_cid")
             
-            // تخصيص الترويسات لروابط img1 المباشرة لمنع الـ 520
             val networkRequest = when {
                 url.contains("img1.procomic.pro") -> {
-                    request.newBuilder()
+                    val reqBuilder = request.newBuilder()
                         .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
                         .header("Referer", "https://procomic.pro/")
                         .header("Origin", "https://procomic.pro")
                         .header("Sec-Fetch-Dest", "image")
                         .header("Sec-Fetch-Mode", "cors")
                         .header("Sec-Fetch-Site", "same-site")
-                        .apply { if (cid != null) removeAllQueryParameters("_cid") }
-                        .build()
+                    
+                    if (cid != null) {
+                        reqBuilder.url(request.url.newBuilder().removeAllQueryParameters("_cid").build())
+                    }
+                    reqBuilder.build()
                 }
                 cid != null -> {
                     request.newBuilder()
@@ -548,7 +550,6 @@ class ProComic : HttpSource() {
         val (cols, rows) = parseMode(map.mode, map.pieces.size)
         val bitmaps = arrayOfNulls<Bitmap>(map.pieces.size)
 
-        // 🔴 التعديل الأساسي: استخدام التصفية والمعدل الآمن مع توريث ملفات الكوكيز للحماية من الـ 520
         val imageClient = network.cloudflareClient.newBuilder()
             .rateLimit(4, 1, TimeUnit.SECONDS)
             .build()
