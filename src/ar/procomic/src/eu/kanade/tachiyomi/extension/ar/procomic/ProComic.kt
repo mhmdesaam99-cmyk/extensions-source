@@ -154,7 +154,8 @@ class ProComic : HttpSource() {
         .add("Origin", baseUrl)
         .add("Accept", "application/json, text/plain, */*")
         .add("Accept-Language", "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7")
-        .add("User-Agent", network.defaultUserAgentProvider()) // استخدام البصمة الأصلية للتطبيق لتجنب الحظر
+        .add("Cookie", "language=ar; calendar=gregorian; theme=dark;")
+        .add("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
 
     override fun popularMangaRequest(page: Int) = GET(
         "$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page",
