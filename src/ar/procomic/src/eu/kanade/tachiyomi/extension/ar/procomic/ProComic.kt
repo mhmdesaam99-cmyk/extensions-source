@@ -22,6 +22,7 @@ import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
@@ -42,6 +43,8 @@ class ProComic : HttpSource() {
     override val baseUrl = "https://procomic.pro"
     override val lang = "ar"
     override val supportsLatest = true
+
+    private var isSessionInitialized = false
 
     private val json = Json { 
         ignoreUnknownKeys = true
@@ -67,13 +70,17 @@ class ProComic : HttpSource() {
         }
     }
 
+    // 1️⃣ تحديث بروتوكولات الاتصال وترتيب الـ Headers لتخطي بصمة Cloudflare
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
+        .rateLimit(2) // الحفاظ على معدل الطلبات منعاً للحظر
+        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1)) // إجبار تفعيل HTTP/2
         .connectTimeout(60, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .addInterceptor { chain ->
-            val request = chain.request()
-            val url = request.url.toString()
+            val originalRequest = chain.request()
+            val url = originalRequest.url.toString()
 
+            // اعتراض الصور المجمعة داخلياً
             if (url.startsWith(SCRAMBLED_SCHEME) || url.contains("?map=")) {
                 val encoded = url.substringAfter("?map=")
                 val mapJson = String(Base64.decode(encoded, Base64.URL_SAFE or Base64.NO_WRAP))
@@ -82,41 +89,39 @@ class ProComic : HttpSource() {
                 val mergedBytes = reconstructPage(pageMap)
 
                 return@addInterceptor Response.Builder()
-                    .request(request)
-                    .protocol(okhttp3.Protocol.HTTP_1_1)
+                    .request(originalRequest)
+                    .protocol(Protocol.HTTP_1_1)
                     .code(200)
                     .message("OK")
                     .body(mergedBytes.toResponseBody("image/jpeg".toMediaType()))
                     .build()
             }
 
-            val cid = request.url.queryParameter("_cid")
-            
-            val networkRequest = when {
-                url.contains("img1.procomic.pro") -> {
-                    val reqBuilder = request.newBuilder()
-                        .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
-                        .header("Referer", "https://procomic.pro/")
-                        .header("Origin", "https://procomic.pro")
-                        .header("Sec-Fetch-Dest", "image")
-                        .header("Sec-Fetch-Mode", "cors")
-                        .header("Sec-Fetch-Site", "same-site")
-                    
-                    if (cid != null) {
-                        reqBuilder.url(request.url.newBuilder().removeAllQueryParameters("_cid").build())
-                    }
-                    reqBuilder.build()
-                }
-                cid != null -> {
-                    request.newBuilder()
-                        .url(request.url.newBuilder().removeAllQueryParameters("_cid").build())
-                        .build()
-                }
-                else -> request
+            val cid = originalRequest.url.queryParameter("_cid")
+
+            // بناء طلب جديد فارغ من الهيدرز الافتراضية لمنع كشف البصمة (JA3 Fingerprint)
+            val newRequestBuilder = originalRequest.newBuilder()
+                .removeHeader("User-Agent")
+                .removeHeader("Accept")
+                .removeHeader("Referer")
+                .removeHeader("Connection")
+                .removeHeader("Accept-Language")
+                // إضافة الهيدرز بالترتيب والمحاكاة الدقيقة للمتصفح
+                .addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .addHeader("Accept", "application/json, text/plain, */*")
+                .addHeader("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
+                .addHeader("Referer", "https://procomic.pro/")
+                .addHeader("Origin", "https://procomic.pro")
+                .addHeader("Connection", "keep-alive")
+
+            if (cid != null) {
+                newRequestBuilder.url(originalRequest.url.newBuilder().removeAllQueryParameters("_cid").build())
             }
 
+            val networkRequest = newRequestBuilder.build()
             val response = chain.proceed(networkRequest)
 
+            // إعادة الـ CID الوهمي للمسار لكي يقرأه الكود
             val finalResponse = if (cid != null) {
                 val restoredUrl = response.request.url.newBuilder().addQueryParameter("_cid", cid).build()
                 response.newBuilder().request(response.request.newBuilder().url(restoredUrl).build()).build()
@@ -127,10 +132,11 @@ class ProComic : HttpSource() {
             if (finalResponse.code == 520 || finalResponse.code == 403 || finalResponse.code == 429) {
                 val bodyPreview = runCatching { finalResponse.peekBody(1024).string() }.getOrNull().orEmpty()
                 if (bodyPreview.contains("cloudflare", ignoreCase = true) || bodyPreview.trim().startsWith("<")) {
-                    throw Exception("تم حظر الطلب بواسطة Cloudflare (خطأ ${finalResponse.code}). يرجى فتح الموقع بالمتصفح.")
+                    throw Exception("تم حظر الطلب بواسطة Cloudflare (خطأ ${finalResponse.code}). يرجى فتح الموقع بالمتصفح الداخلي.")
                 }
             }
             
+            // معالجة صور Base64 العادية
             val isPotentialBase64Image = finalResponse.isSuccessful && networkRequest.method == "GET" && 
                                          finalResponse.request.url.toString().contains("/i/") && finalResponse.request.url.toString().contains("procomic")
                                          
@@ -165,13 +171,35 @@ class ProComic : HttpSource() {
         }
         .build()
 
+    // 2️⃣ آلية تهيئة الجلسة وجلب الكوكيز المبدئية (Session Initialization)
+    @Synchronized
+    private fun initializeSession() {
+        if (isSessionInitialized) return // منع التكرار إذا تم التهيئ مسبقاً
+        try {
+            val homeRequest = Request.Builder()
+                .url("https://procomic.pro/")
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+                .get()
+                .build()
+            
+            // تشغيل الطلب بشكل متزامن لإجبار الـ CookieJar على تخزين الكوكيز
+            client.newCall(homeRequest).execute().use { response ->
+                if (response.isSuccessful) {
+                    isSessionInitialized = true
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
         .add("Origin", baseUrl)
         .add("Accept", "application/json, text/plain, */*")
         .add("Accept-Language", "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7")
-        .add("Cookie", "language=ar; calendar=gregorian; theme=dark;")
-        .add("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
+        .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
     override fun popularMangaRequest(page: Int) = GET(
         "$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page",
@@ -264,16 +292,13 @@ class ProComic : HttpSource() {
             .addQueryParameter("_cid", chapterId)
             .build()
 
-        val requestHeaders = headers.newBuilder()
-            .set("Accept", "application/json, text/plain, */*")
-            .set("Referer", "$baseUrl/$seriesType/$seriesId") 
-            .set("Origin", baseUrl)
-            .build()
-
-        return GET(url, requestHeaders)
+        return GET(url, headers)
     }
 
     override fun pageListParse(response: Response): List<Page> {
+        // 🎯 الاستدعاء الأول: تهيئة الجلسة وجلب الكوكيز قبل البدء في مسار الفصول
+        initializeSession()
+
         val chapterId = response.request.url.queryParameter("_cid") ?: return emptyList()
         val seriesType = response.request.url.pathSegments.let { parts ->
             val idx = parts.indexOf("public")
@@ -398,6 +423,9 @@ class ProComic : HttpSource() {
             }
             
             if (dec == null || dec.pieces.isEmpty()) {
+                // 🎯 الاستدعاء الثاني (حسب طلبك): قبل إرسال الـ POST لفك التشفير
+                initializeSession()
+                
                 try {
                     val bodyStr = json.encodeToString(map)
                     val body = bodyStr.toRequestBody("application/json".toMediaType())
@@ -550,8 +578,9 @@ class ProComic : HttpSource() {
         val (cols, rows) = parseMode(map.mode, map.pieces.size)
         val bitmaps = arrayOfNulls<Bitmap>(map.pieces.size)
 
-        val imageClient = network.cloudflareClient.newBuilder()
-            .rateLimit(4, 1, TimeUnit.SECONDS)
+        // تطبيق rateLimit معتدل لتجنب حظر الـ 520 عند تحميل القطع
+        val imageClient = client.newBuilder()
+            .rateLimit(3)
             .build()
 
         for (targetIdx in 0 until map.pieces.size) {
@@ -624,7 +653,7 @@ class ProComic : HttpSource() {
 
         val validBitmaps = bitmaps.filterNotNull()
         if (validBitmaps.isEmpty()) {
-            throw Exception("فشل تحميل قطع الصورة (خطأ 520). يرجى فتح الموقع في المتصفح وتحديث الحماية أولاً.")
+            throw Exception("فشل تحميل قطع الصورة. الرجاء فتح الفصل مجدداً.")
         }
 
         try {
@@ -733,7 +762,7 @@ class ProComic : HttpSource() {
             throw Exception("فشل الاتصال: خطأ $responseCode")
         }
         if (bodyStr.contains("cloudflare", ignoreCase = true) || bodyStr.trim().startsWith("<")) {
-            throw Exception("حماية Cloudflare نشطة.")
+            throw Exception("حماية Cloudflare نشطة. يرجى فتح المتصفح وتخطي الحماية.")
         }
         return json.decodeFromString(bodyStr)
     }
