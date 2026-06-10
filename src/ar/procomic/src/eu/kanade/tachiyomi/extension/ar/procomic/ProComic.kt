@@ -70,17 +70,16 @@ class ProComic : HttpSource() {
         }
     }
 
-    // 1️⃣ تحديث بروتوكولات الاتصال وترتيب الـ Headers لتخطي بصمة Cloudflare
+    // 1️⃣ تحديث بناء العميل لمنع تعارض الهيدرز وتجنب خطأ 500
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .rateLimit(2) // الحفاظ على معدل الطلبات منعاً للحظر
-        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1)) // إجبار تفعيل HTTP/2
         .connectTimeout(60, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .addInterceptor { chain ->
             val originalRequest = chain.request()
             val url = originalRequest.url.toString()
 
-            // اعتراض الصور المجمعة داخلياً
+            // اعتراض الصور المجمعة داخلياً وتجميعها
             if (url.startsWith(SCRAMBLED_SCHEME) || url.contains("?map=")) {
                 val encoded = url.substringAfter("?map=")
                 val mapJson = String(Base64.decode(encoded, Base64.URL_SAFE or Base64.NO_WRAP))
@@ -99,20 +98,23 @@ class ProComic : HttpSource() {
 
             val cid = originalRequest.url.queryParameter("_cid")
 
-            // بناء طلب جديد فارغ من الهيدرز الافتراضية لمنع كشف البصمة (JA3 Fingerprint)
+            // الحفاظ على نوع الاستجابة الأصلي (JSON للـ API، و HTML للموقع، و Image للصور) لمنع خطأ 500
+            val originalAccept = originalRequest.header("Accept")
+            val originalAcceptLang = originalRequest.header("Accept-Language")
+            val originalReferer = originalRequest.header("Referer")
+
+            // بناء طلب نظيف تماماً ومطابق للمتصفح دون إرسال Connection الهيدر الممنوع في HTTP/2
             val newRequestBuilder = originalRequest.newBuilder()
                 .removeHeader("User-Agent")
                 .removeHeader("Accept")
                 .removeHeader("Referer")
                 .removeHeader("Connection")
                 .removeHeader("Accept-Language")
-                // إضافة الهيدرز بالترتيب والمحاكاة الدقيقة للمتصفح
                 .addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                .addHeader("Accept", "application/json, text/plain, */*")
-                .addHeader("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
-                .addHeader("Referer", "https://procomic.pro/")
+                .addHeader("Accept", originalAccept ?: "application/json, text/plain, */*")
+                .addHeader("Accept-Language", originalAcceptLang ?: "ar,en-US;q=0.9,en;q=0.8")
+                .addHeader("Referer", originalReferer ?: "https://procomic.pro/")
                 .addHeader("Origin", "https://procomic.pro")
-                .addHeader("Connection", "keep-alive")
 
             if (cid != null) {
                 newRequestBuilder.url(originalRequest.url.newBuilder().removeAllQueryParameters("_cid").build())
@@ -121,7 +123,6 @@ class ProComic : HttpSource() {
             val networkRequest = newRequestBuilder.build()
             val response = chain.proceed(networkRequest)
 
-            // إعادة الـ CID الوهمي للمسار لكي يقرأه الكود
             val finalResponse = if (cid != null) {
                 val restoredUrl = response.request.url.newBuilder().addQueryParameter("_cid", cid).build()
                 response.newBuilder().request(response.request.newBuilder().url(restoredUrl).build()).build()
@@ -136,7 +137,6 @@ class ProComic : HttpSource() {
                 }
             }
             
-            // معالجة صور Base64 العادية
             val isPotentialBase64Image = finalResponse.isSuccessful && networkRequest.method == "GET" && 
                                          finalResponse.request.url.toString().contains("/i/") && finalResponse.request.url.toString().contains("procomic")
                                          
@@ -171,10 +171,10 @@ class ProComic : HttpSource() {
         }
         .build()
 
-    // 2️⃣ آلية تهيئة الجلسة وجلب الكوكيز المبدئية (Session Initialization)
+    // 2️⃣ تهيئة الجلسة بشكل متوافق تماماً مع المتصفحات
     @Synchronized
     private fun initializeSession() {
-        if (isSessionInitialized) return // منع التكرار إذا تم التهيئ مسبقاً
+        if (isSessionInitialized) return 
         try {
             val homeRequest = Request.Builder()
                 .url("https://procomic.pro/")
@@ -183,7 +183,6 @@ class ProComic : HttpSource() {
                 .get()
                 .build()
             
-            // تشغيل الطلب بشكل متزامن لإجبار الـ CookieJar على تخزين الكوكيز
             client.newCall(homeRequest).execute().use { response ->
                 if (response.isSuccessful) {
                     isSessionInitialized = true
@@ -296,7 +295,6 @@ class ProComic : HttpSource() {
     }
 
     override fun pageListParse(response: Response): List<Page> {
-        // 🎯 الاستدعاء الأول: تهيئة الجلسة وجلب الكوكيز قبل البدء في مسار الفصول
         initializeSession()
 
         val chapterId = response.request.url.queryParameter("_cid") ?: return emptyList()
@@ -423,7 +421,6 @@ class ProComic : HttpSource() {
             }
             
             if (dec == null || dec.pieces.isEmpty()) {
-                // 🎯 الاستدعاء الثاني (حسب طلبك): قبل إرسال الـ POST لفك التشفير
                 initializeSession()
                 
                 try {
@@ -578,7 +575,6 @@ class ProComic : HttpSource() {
         val (cols, rows) = parseMode(map.mode, map.pieces.size)
         val bitmaps = arrayOfNulls<Bitmap>(map.pieces.size)
 
-        // تطبيق rateLimit معتدل لتجنب حظر الـ 520 عند تحميل القطع
         val imageClient = client.newBuilder()
             .rateLimit(3)
             .build()
@@ -595,7 +591,6 @@ class ProComic : HttpSource() {
 
             val req = Request.Builder()
                 .url(pieceUrl)
-                .headers(headers)
                 .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
                 .header("Referer", "https://procomic.pro/")
                 .header("Origin", "https://procomic.pro")
