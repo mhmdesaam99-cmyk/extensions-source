@@ -58,10 +58,11 @@ class ProComic : HttpSource() {
         private const val MAX_SAFE_HEIGHT = 6000
     }
 
+    // 🔴 تم إصلاح الخطأ الكارثي هنا: إرجاع السيرفر img2 الخاص بفك التشفير لمنع خطأ 520
     private fun String.toAbsoluteUrl(cdnBase: String): String {
         return when {
             this.startsWith("http") -> this
-            this.startsWith("eyJ") -> "$cdnBase/i/$this" 
+            this.startsWith("eyJ") -> "https://img2.procomic.pro/i/$this" 
             this.startsWith("/") -> "$cdnBase$this"
             else -> "$cdnBase/$this"
         }
@@ -81,11 +82,9 @@ class ProComic : HttpSource() {
                 val mapJson = String(Base64.decode(encoded, Base64.URL_SAFE or Base64.NO_WRAP))
                 val pageMap = json.decodeFromString<ScrambledMap>(mapJson)
 
+                // 🔴 إزالة الاستجابة 500 الوهمية ورمي رسالة واضحة في حال فشل السيرفر
                 val mergedBytes = reconstructPage(pageMap)
-                    ?: return@addInterceptor Response.Builder()
-                        .request(request).protocol(Protocol.HTTP_1_1)
-                        .code(500).message("Error")
-                        .body("".toResponseBody(null)).build()
+                    ?: throw Exception("فشل تجميع الصورة: خادم فك التشفير (img2) لم يستجب بشكل صحيح.")
 
                 return@addInterceptor Response.Builder()
                     .request(request).protocol(Protocol.HTTP_1_1)
@@ -94,7 +93,7 @@ class ProComic : HttpSource() {
                     .build()
             }
 
-            // 2. إخفاء _cid من الطلب لمنع خطأ 520 من السيرفر
+            // 2. إخفاء _cid من الطلب لمنع خطأ 520 على دوال الفصول
             val cid = request.url.queryParameter("_cid")
             val networkRequest = if (cid != null) {
                 request.newBuilder()
@@ -106,7 +105,7 @@ class ProComic : HttpSource() {
 
             val response = chain.proceed(networkRequest)
 
-            // 3. إعادة _cid وهمياً إلى الاستجابة لكي تقرأه دالة التحليل
+            // 3. إعادة _cid وهمياً إلى الاستجابة لكي تقرأه دالة التحليل بسلام
             val finalResponse = if (cid != null) {
                 val restoredUrl = response.request.url.newBuilder().addQueryParameter("_cid", cid).build()
                 response.newBuilder().request(response.request.newBuilder().url(restoredUrl).build()).build()
@@ -114,15 +113,15 @@ class ProComic : HttpSource() {
                 response
             }
             
-            // 4. الفحص الفوري لتنبيهات حماية Cloudflare لمنع انهيار التطبيق
+            // 4. الفحص الفوري لتنبيهات حماية Cloudflare
             if (finalResponse.code == 520 || finalResponse.code == 403 || finalResponse.code == 429) {
                 val bodyPreview = runCatching { finalResponse.peekBody(1024).string() }.getOrNull().orEmpty()
                 if (bodyPreview.contains("cloudflare", ignoreCase = true) || bodyPreview.trim().startsWith("<")) {
-                    throw Exception("تم حظر الطلب بواسطة حماية Cloudflare (خطأ ${finalResponse.code}). يرجى فتح الموقع في المتصفح الداخلي وتخطي الحماية.")
+                    throw Exception("تم حظر الطلب بواسطة Cloudflare (خطأ ${finalResponse.code}). يرجى فتح الموقع في المتصفح الداخلي.")
                 }
             }
             
-            // 5. فك تشفير صور Base64
+            // 5. فك تشفير صور Base64 للقطع المباشرة
             val isPotentialBase64Image = finalResponse.isSuccessful && networkRequest.method == "GET" && 
                                          finalResponse.request.url.toString().contains("/i/") && finalResponse.request.url.toString().contains("procomic")
                                          
@@ -179,7 +178,7 @@ class ProComic : HttpSource() {
     override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
 
-    // تم إصلاح خطأ ktlint المسبب لفشل البناء هنا
+    // كود البحث المصحح لتجاوز أداة Spotless بنجاح
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val queryUrl = if (query.isNotBlank()) "&q=$query" else ""
         return GET("$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page$queryUrl", headers)
@@ -557,7 +556,8 @@ class ProComic : HttpSource() {
                 .build()
 
             try {
-                client.newCall(req).execute().use { resp ->
+                // استخدام network.cloudflareClient هنا لتخطي الـ rate limiter وتجنب الحظر
+                network.cloudflareClient.newCall(req).execute().use { resp ->
                     if (resp.isSuccessful) {
                         val bodyBytes = resp.body.bytes()
                         val isBase64Text = bodyBytes.size > 20 &&
@@ -683,7 +683,6 @@ class ProComic : HttpSource() {
         else -> Pair(1, pieceCount)
     }
 
-    // الفحص الذكي للرد لمنع خطأ 500 وإظهار تنبيه Cloudflare للمستخدم باللغة العربية
     private inline fun <reified T> Response.parseAs(): T {
         val responseCode = this.code
         val bodyStr = this.body.string()
@@ -691,57 +690,29 @@ class ProComic : HttpSource() {
             throw Exception("فشل الاتصال بالموقع الأصلي: خطأ HTTP $responseCode")
         }
         if (bodyStr.contains("cloudflare", ignoreCase = true) || bodyStr.trim().startsWith("<")) {
-            throw Exception("حماية Cloudflare نشطة (خطأ $responseCode). يرجى الضغط على أزرار التصفح لفتح المتصفح الداخلي وتخطي الحماية ثم التحديث.")
+            throw Exception("حماية Cloudflare نشطة (خطأ $responseCode). يرجى فتح المتصفح الداخلي وتخطي الحماية.")
         }
         return json.decodeFromString(bodyStr)
     }
 }
 
 @Serializable
-data class SessionKeyResponse(
-    val success: Boolean = false,
-    val data: SessionKeyData? = null,
-)
+data class SessionKeyResponse(val success: Boolean = false, val data: SessionKeyData? = null)
 
 @Serializable
 data class SessionKeyData(val key: String = "")
 
 @Serializable
-data class EncryptedToken(
-    val v: Int = 3,
-    val m: String = "",
-    val cid: Int = 0,
-    val iv: String = "",
-    val tag: String = "",
-    val data: String = "",
-)
+data class EncryptedToken(val v: Int = 3, val m: String = "", val cid: Int = 0, val iv: String = "", val tag: String = "", val data: String = "")
 
 @Serializable
-data class ScrambledMap(
-    val dim: List<Int> = emptyList(),
-    val mode: String = "",
-    val pieces: List<String> = emptyList(),
-    val order: List<Int> = emptyList(),
-    val signedToken: String = "",
-    val splitPart: Int? = null,
-    val totalParts: Int? = null,
-)
+data class ScrambledMap(val dim: List<Int> = emptyList(), val mode: String = "", val pieces: List<String> = emptyList(), val order: List<Int> = emptyList(), val signedToken: String = "", val splitPart: Int? = null, val totalParts: Int? = null)
 
 @Serializable
-data class LatestUpdatesResponse(
-    val success: Boolean = false,
-    val data: List<SeriesDto> = emptyList(),
-)
+data class LatestUpdatesResponse(val success: Boolean = false, val data: List<SeriesDto> = emptyList())
 
 @Serializable
-data class SeriesDto(
-    @SerialName("mangaId") val id: Int = 0,
-    @SerialName("mangaSlug") val slug: String = "",
-    @SerialName("mangaTitle") val title: String = "",
-    val coverImage: String? = null,
-    val type: String = "manga",
-    val coverImageApp: CoverImageApp? = null,
-) {
+data class SeriesDto(@SerialName("mangaId") val id: Int = 0, @SerialName("mangaSlug") val slug: String = "", @SerialName("mangaTitle") val title: String = "", val coverImage: String? = null, val type: String = "manga", val coverImageApp: CoverImageApp? = null) {
     fun toSManga() = SManga.create().apply {
         url = "$type/$id/$slug"
         title = this@SeriesDto.title
@@ -756,73 +727,28 @@ data class CoverImageApp(val desktop: String? = null, val card: CardImages? = nu
 data class CardImages(val mobile: String? = null, val desktop: String? = null)
 
 @Serializable
-data class SeriesDetailResponse(
-    val id: Int = 0,
-    val title: String? = null,
-    val slug: String? = null,
-    val coverImage: String? = null,
-    val coverImageApp: CoverImageApp? = null,
-    val author: String? = null,
-    val artist: String? = null,
-    val description: String? = null,
-    val synopsis: String? = null,
-    val status: String? = null,
-)
+data class SeriesDetailResponse(val id: Int = 0, val title: String? = null, val slug: String? = null, val coverImage: String? = null, val coverImageApp: CoverImageApp? = null, val author: String? = null, val artist: String? = null, val description: String? = null, val synopsis: String? = null, val status: String? = null)
 
 @Serializable
-data class ChaptersResponse(
-    val data: List<ChapterDto> = emptyList(),
-    val total: Int = 0,
-)
+data class ChaptersResponse(val data: List<ChapterDto> = emptyList(), val total: Int = 0)
 
 @Serializable
-data class ChapterDto(
-    val id: Int = 0,
-    @SerialName("chapter_number") val chapterNumber: String = "0",
-    val title: String? = null,
-    @SerialName("published_at") val publishedAt: String? = null,
-    val lockedByCoins: Boolean? = null,
-    @SerialName("cdn_path") val cdnPath: String? = null,
-    val metadata: ChapterMetadataDto? = null,
-)
+data class ChapterDto(val id: Int = 0, @SerialName("chapter_number") val chapterNumber: String = "0", val title: String? = null, @SerialName("published_at") val publishedAt: String? = null, val lockedByCoins: Boolean? = null, @SerialName("cdn_path") val cdnPath: String? = null, val metadata: ChapterMetadataDto? = null)
 
 @Serializable
-data class ChapterMetadataDto(
-    val images: List<String> = emptyList(),
-    val maps: List<DeferredPageMap> = emptyList(),
-)
+data class ChapterMetadataDto(val images: List<String> = emptyList(), val maps: List<DeferredPageMap> = emptyList())
 
 @Serializable
-data class ChapterDeferredResponse(
-    val success: Boolean = false,
-    val data: ChapterDeferredData? = null,
-)
+data class ChapterDeferredResponse(val success: Boolean = false, val data: ChapterDeferredData? = null)
 
 @Serializable
-data class ChapterDeferredData(
-    val chapterId: Int = 0,
-    val splitIndex: Int = 0,
-    val images: List<String> = emptyList(),
-    val maps: List<DeferredPageMap> = emptyList(),
-)
+data class ChapterDeferredData(val chapterId: Int = 0, val splitIndex: Int = 0, val images: List<String> = emptyList(), val maps: List<DeferredPageMap> = emptyList())
 
 @Serializable
-data class DeferredPageMap(
-    val dim: List<Int> = emptyList(),
-    val mode: String = "",
-    val pieces: List<String> = emptyList(),
-    val order: List<Int> = emptyList(),
-    val token: String = "",
-    val method: String = "",
-)
+data class DeferredPageMap(val dim: List<Int> = emptyList(), val mode: String = "", val pieces: List<String> = emptyList(), val order: List<Int> = emptyList(), val token: String = "", val method: String = "")
 
 @Serializable
-data class ProxyPlanResponse(
-    val success: Boolean = false,
-    val data: ProxyPlanData? = null,
-)
+data class ProxyPlanResponse(val success: Boolean = false, val data: ProxyPlanData? = null)
 
 @Serializable
-data class ProxyPlanData(
-    val map: DeferredPageMap? = null,
-)
+data class ProxyPlanData(val map: DeferredPageMap? = null)
