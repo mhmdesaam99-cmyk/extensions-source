@@ -6,7 +6,6 @@ import android.graphics.Canvas
 import android.util.Base64
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
-import eu.kanade.tachiyomi.network.interceptor.rateLimit
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -57,11 +56,12 @@ class ProComic : HttpSource() {
         private const val MAX_SAFE_HEIGHT = 6000
     }
 
+    // 🔴 التعديل السحري بفضلك: توجيه الروابط المشفرة لسيرفر img1 حصراً لمنع 404
     private fun String.toAbsoluteUrl(cdnBase: String): String {
         val cleanCdn = cdnBase.trimEnd('/')
         return when {
             this.startsWith("http") -> this
-            this.startsWith("eyJ") -> "$cleanCdn/i/$this" 
+            this.startsWith("eyJ") -> "https://img1.procomic.pro/i/$this" // تم توجيهها للسيرفر الصحيح
             this.startsWith("/") -> "$cleanCdn$this"
             else -> "$cleanCdn/$this"
         }
@@ -533,11 +533,8 @@ class ProComic : HttpSource() {
 
         val (cols, rows) = parseMode(map.mode, map.pieces.size)
         val bitmaps = arrayOfNulls<Bitmap>(map.pieces.size)
-        var lastErrorCode = -1
 
-        // إضافة Rate Limiter ذكي: يسمح بـ 4 طلبات فقط في الثانية كحد أقصى لتجنب 520
         val imageClient = network.client.newBuilder()
-            .rateLimit(permits = 4, period = 1, unit = TimeUnit.SECONDS)
             .build()
 
         for (targetIdx in 0 until map.pieces.size) {
@@ -565,30 +562,36 @@ class ProComic : HttpSource() {
                     imageClient.newCall(req).execute().use { resp ->
                         if (resp.isSuccessful) {
                             val bodyBytes = resp.body.bytes()
-                            val isBase64Text = bodyBytes.size > 20 &&
-                                    bodyBytes[0] == 'd'.code.toByte() &&
-                                    bodyBytes[1] == 'a'.code.toByte() &&
-                                    bodyBytes[2] == 't'.code.toByte() &&
-                                    bodyBytes[3] == 'a'.code.toByte() &&
-                                    bodyBytes[4] == ':'.code.toByte()
+                            
+                            val isHtmlOrText = bodyBytes.size > 5 && (
+                                (bodyBytes[0] == '<'.code.toByte() && bodyBytes[1] == '!'.code.toByte()) || 
+                                (bodyBytes[0] == '{'.code.toByte())
+                            )
+                            
+                            if (!isHtmlOrText) {
+                                val isBase64Text = bodyBytes.size > 20 &&
+                                        bodyBytes[0] == 'd'.code.toByte() &&
+                                        bodyBytes[1] == 'a'.code.toByte() &&
+                                        bodyBytes[2] == 't'.code.toByte() &&
+                                        bodyBytes[3] == 'a'.code.toByte() &&
+                                        bodyBytes[4] == ':'.code.toByte()
 
-                            val finalBytes = if (isBase64Text) {
-                                val bodyString = String(bodyBytes)
-                                val base64Data = bodyString.substringAfter("base64,")
-                                Base64.decode(base64Data, Base64.DEFAULT)
-                            } else {
-                                bodyBytes
+                                val finalBytes = if (isBase64Text) {
+                                    val bodyString = String(bodyBytes)
+                                    val base64Data = bodyString.substringAfter("base64,")
+                                    Base64.decode(base64Data, Base64.DEFAULT)
+                                } else {
+                                    bodyBytes
+                                }
+                                bitmaps[targetIdx] = decodeAvif(finalBytes)
                             }
-                            bitmaps[targetIdx] = decodeAvif(finalBytes)
                             success = true
                         } else {
-                            lastErrorCode = resp.code
                             if (resp.code == 404) {
-                                // لا جدوى من المحاولة إذا كانت القطعة محذوفة أو الرابط خطأ، انتقل للتالية فوراً!
                                 break 
                             }
                             attempts++
-                            Thread.sleep(400) // انتظار عند الفشل قبل المحاولة
+                            Thread.sleep(400)
                         }
                     }
                 } catch (e: Exception) {
@@ -600,7 +603,7 @@ class ProComic : HttpSource() {
 
         val validBitmaps = bitmaps.filterNotNull()
         if (validBitmaps.isEmpty()) {
-            throw Exception("فشل تحميل أجزاء الصورة (الخطأ الأخير: $lastErrorCode). قد يكون الرابط مكسوراً 404.")
+            throw Exception("فشل تحميل أجزاء الصورة (قد تكون الروابط منتهية).")
         }
 
         try {
