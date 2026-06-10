@@ -58,7 +58,6 @@ class ProComic : HttpSource() {
         private const val MAX_SAFE_HEIGHT = 6000
     }
 
-    // 🔴 تم التراجع عن النطاق الوهمي والعودة لاستخدام السيرفر الأصلي بشكل ديناميكي
     private fun String.toAbsoluteUrl(cdnBase: String): String {
         return when {
             this.startsWith("http") -> this
@@ -68,10 +67,12 @@ class ProComic : HttpSource() {
         }
     }
 
+    // 🔴 الحل الجذري: إجبار الإضافة بالكامل على HTTP/1.1 لمنع OkHttp من إعادة استخدام اتصالات HTTP/2
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
+        .protocols(listOf(Protocol.HTTP_1_1)) 
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
-        .rateLimit(2, 1)
+        .rateLimit(3, 1) // 3 طلبات في الثانية للحفاظ على استقرار الاتصال
         .addInterceptor { chain ->
             val request = chain.request()
             val url = request.url.toString()
@@ -82,7 +83,6 @@ class ProComic : HttpSource() {
                 val pageMap = json.decodeFromString<ScrambledMap>(mapJson)
 
                 val mergedBytes = reconstructPage(pageMap)
-                    ?: throw Exception("فشل تحميل الصورة: حماية Cloudflare أسقطت الاتصال (خطأ 520). أعد تحميل الصفحة.")
 
                 return@addInterceptor Response.Builder()
                     .request(request).protocol(Protocol.HTTP_1_1)
@@ -526,19 +526,12 @@ class ProComic : HttpSource() {
         }
     }
 
-    private fun reconstructPage(map: ScrambledMap): ByteArray? {
-        if (map.pieces.isEmpty()) return null
+    private fun reconstructPage(map: ScrambledMap): ByteArray {
+        if (map.pieces.isEmpty()) throw Exception("خريطة التجميع فارغة.")
 
         val (cols, rows) = parseMode(map.mode, map.pieces.size)
         val bitmaps = arrayOfNulls<Bitmap>(map.pieces.size)
-
-        // 🛡️ الحل الجذري لمشكلة Cloudflare 520 أثناء تنزيل القطع:
-        // 1. بروتوكول HTTP/1.1 يمنع حظر الـ Multiplexing
-        // 2. محدد السرعة يمنع حظر الـ Rate Limit
-        val chunkClient = network.cloudflareClient.newBuilder()
-            .protocols(listOf(Protocol.HTTP_1_1))
-            .rateLimit(4, 1) // 4 طلبات كحد أقصى في الثانية لتفادي إسقاط الاتصال
-            .build()
+        var lastErrorCode = -1
 
         for (targetIdx in 0 until map.pieces.size) {
             val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
@@ -558,7 +551,8 @@ class ProComic : HttpSource() {
                 .build()
 
             try {
-                chunkClient.newCall(req).execute().use { resp ->
+                // نستخدم العميل الأساسي الذي تم إجباره على HTTP/1.1
+                client.newCall(req).execute().use { resp ->
                     if (resp.isSuccessful) {
                         val bodyBytes = resp.body.bytes()
                         val isBase64Text = bodyBytes.size > 20 &&
@@ -576,16 +570,20 @@ class ProComic : HttpSource() {
                             bodyBytes
                         }
                         bitmaps[targetIdx] = decodeAvif(finalBytes)
+                    } else {
+                        lastErrorCode = resp.code
                     }
                 }
             } catch (e: Exception) {
             }
         }
 
-        try {
-            val validBitmaps = bitmaps.filterNotNull()
-            if (validBitmaps.isEmpty()) return null
+        val validBitmaps = bitmaps.filterNotNull()
+        if (validBitmaps.isEmpty()) {
+            throw Exception("حماية Cloudflare منعت تحميل الأجزاء. (الخطأ الأخير من السيرفر: $lastErrorCode). حاول تحديث الصفحة.")
+        }
 
+        try {
             var calcTotalW = 0
             var calcTotalH = 0
 
@@ -606,7 +604,7 @@ class ProComic : HttpSource() {
             val partH = calcTotalH / totalParts
             val actualPartH = if (splitPart == totalParts - 1) calcTotalH - (partH * splitPart) else partH
 
-            if (calcTotalW <= 0 || actualPartH <= 0) return null
+            if (calcTotalW <= 0 || actualPartH <= 0) throw Exception("أبعاد الصورة غير صالحة.")
 
             val result = try {
                 Bitmap.createBitmap(calcTotalW, actualPartH, Bitmap.Config.ARGB_8888)
@@ -653,7 +651,7 @@ class ProComic : HttpSource() {
             result.recycle()
             return out.toByteArray()
         } catch (e: Exception) {
-            return null
+            throw Exception("حدث خطأ أثناء تجميع الصورة: ${e.message}")
         }
     }
 
