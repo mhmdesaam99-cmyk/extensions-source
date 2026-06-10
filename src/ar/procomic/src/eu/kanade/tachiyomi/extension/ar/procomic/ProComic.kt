@@ -6,6 +6,7 @@ import android.graphics.Canvas
 import android.util.Base64
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
+import eu.kanade.tachiyomi.network.interceptor.rateLimit
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -56,12 +57,11 @@ class ProComic : HttpSource() {
         private const val MAX_SAFE_HEIGHT = 6000
     }
 
-    // 🔴 التعديل السحري بفضلك: توجيه الروابط المشفرة لسيرفر img1 حصراً لمنع 404
     private fun String.toAbsoluteUrl(cdnBase: String): String {
         val cleanCdn = cdnBase.trimEnd('/')
         return when {
             this.startsWith("http") -> this
-            this.startsWith("eyJ") -> "https://img1.procomic.pro/i/$this" // تم توجيهها للسيرفر الصحيح
+            this.startsWith("eyJ") -> "https://img1.procomic.pro/i/$this" 
             this.startsWith("/") -> "$cleanCdn$this"
             else -> "$cleanCdn/$this"
         }
@@ -91,12 +91,26 @@ class ProComic : HttpSource() {
             }
 
             val cid = request.url.queryParameter("_cid")
-            val networkRequest = if (cid != null) {
-                request.newBuilder()
-                    .url(request.url.newBuilder().removeAllQueryParameters("_cid").build())
-                    .build()
-            } else {
-                request
+            
+            // تخصيص الترويسات لروابط img1 المباشرة لمنع الـ 520
+            val networkRequest = when {
+                url.contains("img1.procomic.pro") -> {
+                    request.newBuilder()
+                        .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+                        .header("Referer", "https://procomic.pro/")
+                        .header("Origin", "https://procomic.pro")
+                        .header("Sec-Fetch-Dest", "image")
+                        .header("Sec-Fetch-Mode", "cors")
+                        .header("Sec-Fetch-Site", "same-site")
+                        .apply { if (cid != null) removeAllQueryParameters("_cid") }
+                        .build()
+                }
+                cid != null -> {
+                    request.newBuilder()
+                        .url(request.url.newBuilder().removeAllQueryParameters("_cid").build())
+                        .build()
+                }
+                else -> request
             }
 
             val response = chain.proceed(networkRequest)
@@ -111,7 +125,7 @@ class ProComic : HttpSource() {
             if (finalResponse.code == 520 || finalResponse.code == 403 || finalResponse.code == 429) {
                 val bodyPreview = runCatching { finalResponse.peekBody(1024).string() }.getOrNull().orEmpty()
                 if (bodyPreview.contains("cloudflare", ignoreCase = true) || bodyPreview.trim().startsWith("<")) {
-                    throw Exception("تم حظر الطلب بواسطة Cloudflare (خطأ ${finalResponse.code}).")
+                    throw Exception("تم حظر الطلب بواسطة Cloudflare (خطأ ${finalResponse.code}). يرجى فتح الموقع بالمتصفح.")
                 }
             }
             
@@ -534,7 +548,9 @@ class ProComic : HttpSource() {
         val (cols, rows) = parseMode(map.mode, map.pieces.size)
         val bitmaps = arrayOfNulls<Bitmap>(map.pieces.size)
 
-        val imageClient = network.client.newBuilder()
+        // 🔴 التعديل الأساسي: استخدام التصفية والمعدل الآمن مع توريث ملفات الكوكيز للحماية من الـ 520
+        val imageClient = network.cloudflareClient.newBuilder()
+            .rateLimit(4, 1, TimeUnit.SECONDS)
             .build()
 
         for (targetIdx in 0 until map.pieces.size) {
@@ -550,8 +566,12 @@ class ProComic : HttpSource() {
             val req = Request.Builder()
                 .url(pieceUrl)
                 .headers(headers)
-                .header("Accept", "image/avif,image/webp,image/jpeg,*/*")
-                .header("Origin", baseUrl)
+                .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+                .header("Referer", "https://procomic.pro/")
+                .header("Origin", "https://procomic.pro")
+                .header("Sec-Fetch-Dest", "image")
+                .header("Sec-Fetch-Mode", "cors")
+                .header("Sec-Fetch-Site", "same-site")
                 .build()
 
             var success = false
@@ -591,19 +611,19 @@ class ProComic : HttpSource() {
                                 break 
                             }
                             attempts++
-                            Thread.sleep(400)
+                            Thread.sleep(300)
                         }
                     }
                 } catch (e: Exception) {
                     attempts++
-                    Thread.sleep(400)
+                    Thread.sleep(300)
                 }
             }
         }
 
         val validBitmaps = bitmaps.filterNotNull()
         if (validBitmaps.isEmpty()) {
-            throw Exception("فشل تحميل أجزاء الصورة (قد تكون الروابط منتهية).")
+            throw Exception("فشل تحميل قطع الصورة (خطأ 520). يرجى فتح الموقع في المتصفح وتحديث الحماية أولاً.")
         }
 
         try {
