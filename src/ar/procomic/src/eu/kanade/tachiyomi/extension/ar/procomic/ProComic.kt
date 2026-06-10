@@ -6,6 +6,7 @@ import android.graphics.Canvas
 import android.util.Base64
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
+import eu.kanade.tachiyomi.network.interceptor.rateLimit
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -57,11 +58,12 @@ class ProComic : HttpSource() {
     }
 
     private fun String.toAbsoluteUrl(cdnBase: String): String {
+        val cleanCdn = cdnBase.trimEnd('/')
         return when {
             this.startsWith("http") -> this
-            this.startsWith("eyJ") -> "$cdnBase/i/$this" 
-            this.startsWith("/") -> "$cdnBase$this"
-            else -> "$cdnBase/$this"
+            this.startsWith("eyJ") -> "$cleanCdn/i/$this" 
+            this.startsWith("/") -> "$cleanCdn$this"
+            else -> "$cleanCdn/$this"
         }
     }
 
@@ -72,7 +74,6 @@ class ProComic : HttpSource() {
             val request = chain.request()
             val url = request.url.toString()
 
-            // اعتراض طلبات الصور المجمعة وبناؤها محلياً
             if (url.startsWith(SCRAMBLED_SCHEME) || url.contains("?map=")) {
                 val encoded = url.substringAfter("?map=")
                 val mapJson = String(Base64.decode(encoded, Base64.URL_SAFE or Base64.NO_WRAP))
@@ -110,11 +111,10 @@ class ProComic : HttpSource() {
             if (finalResponse.code == 520 || finalResponse.code == 403 || finalResponse.code == 429) {
                 val bodyPreview = runCatching { finalResponse.peekBody(1024).string() }.getOrNull().orEmpty()
                 if (bodyPreview.contains("cloudflare", ignoreCase = true) || bodyPreview.trim().startsWith("<")) {
-                    throw Exception("تم حظر الطلب بواسطة Cloudflare (خطأ ${finalResponse.code}). يرجى فتح الموقع في المتصفح الداخلي.")
+                    throw Exception("تم حظر الطلب بواسطة Cloudflare (خطأ ${finalResponse.code}).")
                 }
             }
             
-            // معالجة صور Base64
             val isPotentialBase64Image = finalResponse.isSuccessful && networkRequest.method == "GET" && 
                                          finalResponse.request.url.toString().contains("/i/") && finalResponse.request.url.toString().contains("procomic")
                                          
@@ -178,7 +178,6 @@ class ProComic : HttpSource() {
 
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
 
-    // تصحيح دالة بناء الروابط لمنع خطأ 404
     override fun mangaDetailsRequest(manga: SManga): Request {
         val p = manga.url.split("/")
         val type = p.getOrElse(0) { "manga" }
@@ -208,7 +207,6 @@ class ProComic : HttpSource() {
         } catch (e: Exception) { SManga.create() }
     }
 
-    // تصحيح طلب الفصول لمنع خطأ 404
     override fun chapterListRequest(manga: SManga): Request {
         val p = manga.url.split("/")
         val type = p.getOrElse(0) { "manga" }
@@ -331,7 +329,7 @@ class ProComic : HttpSource() {
             }
         }
 
-        val cdnBase = "https://$cdnPath.procomic.pro"
+        val cdnBase = if (cdnPath.startsWith("http")) cdnPath else "https://$cdnPath.procomic.pro"
         val mapTokens = mutableListOf<String>()
 
         metadataImages.forEach { imgPath ->
@@ -537,7 +535,10 @@ class ProComic : HttpSource() {
         val bitmaps = arrayOfNulls<Bitmap>(map.pieces.size)
         var lastErrorCode = -1
 
-        val imageClient = network.client.newBuilder().build() // استخدام عميل نظيف للصور
+        // إضافة Rate Limiter ذكي: يسمح بـ 4 طلبات فقط في الثانية كحد أقصى لتجنب 520
+        val imageClient = network.client.newBuilder()
+            .rateLimit(permits = 4, period = 1, unit = TimeUnit.SECONDS)
+            .build()
 
         for (targetIdx in 0 until map.pieces.size) {
             val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
@@ -556,9 +557,9 @@ class ProComic : HttpSource() {
                 .header("Origin", baseUrl)
                 .build()
 
-            // نظام المحاولات الذكي لمنع حظر 520 (تأخير زمني بسيط لتجنب إغضاب Cloudflare)
             var success = false
             var attempts = 0
+            
             while (!success && attempts < 3) {
                 try {
                     imageClient.newCall(req).execute().use { resp ->
@@ -580,23 +581,26 @@ class ProComic : HttpSource() {
                             }
                             bitmaps[targetIdx] = decodeAvif(finalBytes)
                             success = true
-                            Thread.sleep(100) // تأخير 100 ملي ثانية بين كل قطعة والأخرى كتمويه
                         } else {
                             lastErrorCode = resp.code
+                            if (resp.code == 404) {
+                                // لا جدوى من المحاولة إذا كانت القطعة محذوفة أو الرابط خطأ، انتقل للتالية فوراً!
+                                break 
+                            }
                             attempts++
-                            Thread.sleep(300) // انتظار عند الفشل قبل المحاولة مجدداً
+                            Thread.sleep(400) // انتظار عند الفشل قبل المحاولة
                         }
                     }
                 } catch (e: Exception) {
                     attempts++
-                    Thread.sleep(300)
+                    Thread.sleep(400)
                 }
             }
         }
 
         val validBitmaps = bitmaps.filterNotNull()
         if (validBitmaps.isEmpty()) {
-            throw Exception("حماية الموقع منعت تحميل الصور. (الخطأ الأخير: $lastErrorCode). يرجى المحاولة لاحقاً.")
+            throw Exception("فشل تحميل أجزاء الصورة (الخطأ الأخير: $lastErrorCode). قد يكون الرابط مكسوراً 404.")
         }
 
         try {
@@ -702,10 +706,10 @@ class ProComic : HttpSource() {
         val responseCode = this.code
         val bodyStr = this.body.string()
         if (!this.isSuccessful) {
-            throw Exception("فشل الاتصال بالموقع: خطأ HTTP $responseCode")
+            throw Exception("فشل الاتصال: خطأ $responseCode")
         }
         if (bodyStr.contains("cloudflare", ignoreCase = true) || bodyStr.trim().startsWith("<")) {
-            throw Exception("حماية Cloudflare نشطة. يرجى فتح المتصفح الداخلي.")
+            throw Exception("حماية Cloudflare نشطة.")
         }
         return json.decodeFromString(bodyStr)
     }
