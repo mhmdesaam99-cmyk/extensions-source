@@ -18,7 +18,6 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.decodeFromStream
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
@@ -76,6 +75,7 @@ class ProComic : HttpSource() {
             val request = chain.request()
             val url = request.url.toString()
 
+            // 1. تجميع الصور المقطعة (Scrambled)
             if (url.startsWith(SCRAMBLED_SCHEME) || url.contains("?map=")) {
                 val encoded = url.substringAfter("?map=")
                 val mapJson = String(Base64.decode(encoded, Base64.URL_SAFE or Base64.NO_WRAP))
@@ -89,12 +89,12 @@ class ProComic : HttpSource() {
 
                 return@addInterceptor Response.Builder()
                     .request(request).protocol(Protocol.HTTP_1_1)
-                        .code(200).message("OK")
-                        .body(mergedBytes.toResponseBody("image/jpeg".toMediaType()))
-                        .build()
+                    .code(200).message("OK")
+                    .body(mergedBytes.toResponseBody("image/jpeg".toMediaType()))
+                    .build()
             }
 
-            // 🛠️ حل خطأ 520: استخراج الـ _cid وحذفه من الطلب المتوجه للسيرفر لتجنب انهياره
+            // 2. إخفاء _cid من الطلب لمنع خطأ 520 من السيرفر
             val cid = request.url.queryParameter("_cid")
             val networkRequest = if (cid != null) {
                 request.newBuilder()
@@ -106,7 +106,7 @@ class ProComic : HttpSource() {
 
             val response = chain.proceed(networkRequest)
 
-            // 🛠️ إعادة الـ _cid وهمياً إلى الاستجابة لكي تقرأه دالة pageListParse بنجاح
+            // 3. إعادة _cid وهمياً إلى الاستجابة لكي تقرأه دالة التحليل
             val finalResponse = if (cid != null) {
                 val restoredUrl = response.request.url.newBuilder().addQueryParameter("_cid", cid).build()
                 response.newBuilder().request(response.request.newBuilder().url(restoredUrl).build()).build()
@@ -114,6 +114,15 @@ class ProComic : HttpSource() {
                 response
             }
             
+            // 4. الفحص الفوري لتنبيهات حماية Cloudflare لمنع انهيار التطبيق
+            if (finalResponse.code == 520 || finalResponse.code == 403 || finalResponse.code == 429) {
+                val bodyPreview = runCatching { finalResponse.peekBody(1024).string() }.getOrNull().orEmpty()
+                if (bodyPreview.contains("cloudflare", ignoreCase = true) || bodyPreview.trim().startsWith("<")) {
+                    throw Exception("تم حظر الطلب بواسطة حماية Cloudflare (خطأ ${finalResponse.code}). يرجى فتح الموقع في المتصفح الداخلي وتخطي الحماية.")
+                }
+            }
+            
+            // 5. فك تشفير صور Base64
             val isPotentialBase64Image = finalResponse.isSuccessful && networkRequest.method == "GET" && 
                                          finalResponse.request.url.toString().contains("/i/") && finalResponse.request.url.toString().contains("procomic")
                                          
@@ -143,50 +152,8 @@ class ProComic : HttpSource() {
                     }
                 }
             }
+            
             finalResponse
-        }
-        .build()
-
-            val response = chain.proceed(request)
-            
-            // التحقق الفوري مما إذا كانت الاستجابة العامة حظراً من حماية Cloudflare لمنع خطأ 500
-            if (response.code == 520 || response.code == 403 || response.code == 429) {
-                val bodyPreview = runCatching { response.peekBody(1024).string() }.getOrNull().orEmpty()
-                if (bodyPreview.contains("cloudflare", ignoreCase = true) || bodyPreview.trim().startsWith("<")) {
-                    throw Exception("تم حظر الطلب بواسطة حماية Cloudflare (خطأ ${response.code}). يرجى فتح الموقع في المتصفح الداخلي وتحديث الصفحة.")
-                }
-            }
-            
-            val isPotentialBase64Image = response.isSuccessful && request.method == "GET" && 
-                                         url.contains("/i/") && url.contains("procomic")
-                                         
-            if (isPotentialBase64Image) {
-                val responseBody = response.body
-                if (responseBody != null) {
-                    val bytes = responseBody.bytes()
-                    val isBase64Text = bytes.size > 20 &&
-                            bytes[0] == 'd'.code.toByte() &&
-                            bytes[1] == 'a'.code.toByte() &&
-                            bytes[2] == 't'.code.toByte() &&
-                            bytes[3] == 'a'.code.toByte() &&
-                            bytes[4] == ':'.code.toByte()
-
-                    if (isBase64Text) {
-                        val bodyString = String(bytes)
-                        val base64Data = bodyString.substringAfter("base64,")
-                        val decodedBytes = Base64.decode(base64Data, Base64.DEFAULT)
-                        val mimeType = bodyString.substringAfter("data:").substringBefore(";").toMediaType()
-                        return@addInterceptor response.newBuilder()
-                            .body(decodedBytes.toResponseBody(mimeType))
-                            .build()
-                    } else {
-                        return@addInterceptor response.newBuilder()
-                            .body(bytes.toResponseBody(responseBody.contentType()))
-                            .build()
-                    }
-                }
-            }
-            response
         }
         .build()
 
@@ -212,11 +179,11 @@ class ProComic : HttpSource() {
     override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList) = GET(
-        "$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page" +
-            (if (query.isNotBlank()) "&q=$query" else ""),
-        headers,
-    )
+    // تم إصلاح خطأ ktlint المسبب لفشل البناء هنا
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+        val queryUrl = if (query.isNotBlank()) "&q=$query" else ""
+        return GET("$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page$queryUrl", headers)
+    }
 
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
 
@@ -273,30 +240,28 @@ class ProComic : HttpSource() {
     }
 
     override fun pageListRequest(chapter: SChapter): Request {
-    val parts = chapter.url.split("/")
-    val seriesType = parts.getOrElse(0) { "manga" }
-    val seriesId = parts.getOrElse(1) { "0" }
-    val chapterId = parts.getOrElse(2) { "0" }
+        val parts = chapter.url.split("/")
+        val seriesType = parts.getOrElse(0) { "manga" }
+        val seriesId = parts.getOrElse(1) { "0" }
+        val chapterId = parts.getOrElse(2) { "0" }
 
-    // العودة إلى الرابط الأصلي الخاص بك تماماً لضمان عمل الـ Parse بدون مشاكل
-    val url = "$baseUrl/api/public/$seriesType/$seriesId/chapters".toHttpUrl()
-        .newBuilder()
-        .addQueryParameter("page", "1")
-        .addQueryParameter("limit", "500")
-        .addQueryParameter("order", "desc")
-        .addQueryParameter("_cid", chapterId)
-        .build()
+        val url = "$baseUrl/api/public/$seriesType/$seriesId/chapters".toHttpUrl()
+            .newBuilder()
+            .addQueryParameter("page", "1")
+            .addQueryParameter("limit", "500")
+            .addQueryParameter("order", "desc")
+            .addQueryParameter("_cid", chapterId)
+            .build()
 
-    // إضافة الـ Headers الاحترافية هنا لمنع ظهور خطأ 520 وتخطي الحماية
-    val requestHeaders = headers.newBuilder()
-        .set("Accept", "application/json, text/plain, */*")
-        .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        .set("Referer", "$baseUrl/$seriesType/$seriesId") // إيهام السيرفر أنك تتصفح المانجا من الموقع
-        .set("Origin", baseUrl)
-        .build()
+        val requestHeaders = headers.newBuilder()
+            .set("Accept", "application/json, text/plain, */*")
+            .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .set("Referer", "$baseUrl/$seriesType/$seriesId") 
+            .set("Origin", baseUrl)
+            .build()
 
-    return GET(url, requestHeaders)
-}
+        return GET(url, requestHeaders)
+    }
 
     override fun pageListParse(response: Response): List<Page> {
         val chapterId = response.request.url.queryParameter("_cid") ?: return emptyList()
@@ -585,7 +550,6 @@ class ProComic : HttpSource() {
                 basePieceUrl
             }
 
-            // تم التعديل هنا لتمرير المتغير headers الأصلي بالكامل لحل مشكلة 520 وتخطي الحجب على مستوى القطع الصغيرة
             val req = Request.Builder()
                 .url(pieceUrl)
                 .headers(headers)
