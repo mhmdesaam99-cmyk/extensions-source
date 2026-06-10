@@ -58,11 +58,11 @@ class ProComic : HttpSource() {
         private const val MAX_SAFE_HEIGHT = 6000
     }
 
-    // 🔴 تم إصلاح الخطأ الكارثي هنا: إرجاع السيرفر img2 الخاص بفك التشفير لمنع خطأ 520
+    // 🔴 تم التراجع عن النطاق الوهمي والعودة لاستخدام السيرفر الأصلي بشكل ديناميكي
     private fun String.toAbsoluteUrl(cdnBase: String): String {
         return when {
             this.startsWith("http") -> this
-            this.startsWith("eyJ") -> "https://img2.procomic.pro/i/$this" 
+            this.startsWith("eyJ") -> "$cdnBase/i/$this" 
             this.startsWith("/") -> "$cdnBase$this"
             else -> "$cdnBase/$this"
         }
@@ -76,15 +76,13 @@ class ProComic : HttpSource() {
             val request = chain.request()
             val url = request.url.toString()
 
-            // 1. تجميع الصور المقطعة (Scrambled)
             if (url.startsWith(SCRAMBLED_SCHEME) || url.contains("?map=")) {
                 val encoded = url.substringAfter("?map=")
                 val mapJson = String(Base64.decode(encoded, Base64.URL_SAFE or Base64.NO_WRAP))
                 val pageMap = json.decodeFromString<ScrambledMap>(mapJson)
 
-                // 🔴 إزالة الاستجابة 500 الوهمية ورمي رسالة واضحة في حال فشل السيرفر
                 val mergedBytes = reconstructPage(pageMap)
-                    ?: throw Exception("فشل تجميع الصورة: خادم فك التشفير (img2) لم يستجب بشكل صحيح.")
+                    ?: throw Exception("فشل تحميل الصورة: حماية Cloudflare أسقطت الاتصال (خطأ 520). أعد تحميل الصفحة.")
 
                 return@addInterceptor Response.Builder()
                     .request(request).protocol(Protocol.HTTP_1_1)
@@ -93,7 +91,6 @@ class ProComic : HttpSource() {
                     .build()
             }
 
-            // 2. إخفاء _cid من الطلب لمنع خطأ 520 على دوال الفصول
             val cid = request.url.queryParameter("_cid")
             val networkRequest = if (cid != null) {
                 request.newBuilder()
@@ -105,7 +102,6 @@ class ProComic : HttpSource() {
 
             val response = chain.proceed(networkRequest)
 
-            // 3. إعادة _cid وهمياً إلى الاستجابة لكي تقرأه دالة التحليل بسلام
             val finalResponse = if (cid != null) {
                 val restoredUrl = response.request.url.newBuilder().addQueryParameter("_cid", cid).build()
                 response.newBuilder().request(response.request.newBuilder().url(restoredUrl).build()).build()
@@ -113,7 +109,6 @@ class ProComic : HttpSource() {
                 response
             }
             
-            // 4. الفحص الفوري لتنبيهات حماية Cloudflare
             if (finalResponse.code == 520 || finalResponse.code == 403 || finalResponse.code == 429) {
                 val bodyPreview = runCatching { finalResponse.peekBody(1024).string() }.getOrNull().orEmpty()
                 if (bodyPreview.contains("cloudflare", ignoreCase = true) || bodyPreview.trim().startsWith("<")) {
@@ -121,7 +116,6 @@ class ProComic : HttpSource() {
                 }
             }
             
-            // 5. فك تشفير صور Base64 للقطع المباشرة
             val isPotentialBase64Image = finalResponse.isSuccessful && networkRequest.method == "GET" && 
                                          finalResponse.request.url.toString().contains("/i/") && finalResponse.request.url.toString().contains("procomic")
                                          
@@ -178,7 +172,6 @@ class ProComic : HttpSource() {
     override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
 
-    // كود البحث المصحح لتجاوز أداة Spotless بنجاح
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val queryUrl = if (query.isNotBlank()) "&q=$query" else ""
         return GET("$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page$queryUrl", headers)
@@ -483,7 +476,7 @@ class ProComic : HttpSource() {
 
             split.maps.forEach { map ->
                 if (map.token.isNotBlank() && map.pieces.isEmpty() && map.token.startsWith("eyJhbGci")) {
-                    // Ignore nested deferred
+                    // Ignore
                 } else {
                     val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
                     if (resolved != null && resolved.pieces.isNotEmpty()) {
@@ -539,6 +532,14 @@ class ProComic : HttpSource() {
         val (cols, rows) = parseMode(map.mode, map.pieces.size)
         val bitmaps = arrayOfNulls<Bitmap>(map.pieces.size)
 
+        // 🛡️ الحل الجذري لمشكلة Cloudflare 520 أثناء تنزيل القطع:
+        // 1. بروتوكول HTTP/1.1 يمنع حظر الـ Multiplexing
+        // 2. محدد السرعة يمنع حظر الـ Rate Limit
+        val chunkClient = network.cloudflareClient.newBuilder()
+            .protocols(listOf(Protocol.HTTP_1_1))
+            .rateLimit(4, 1) // 4 طلبات كحد أقصى في الثانية لتفادي إسقاط الاتصال
+            .build()
+
         for (targetIdx in 0 until map.pieces.size) {
             val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
             val basePieceUrl = map.pieces.getOrNull(srcIdx) ?: continue
@@ -553,11 +554,11 @@ class ProComic : HttpSource() {
                 .url(pieceUrl)
                 .headers(headers)
                 .header("Accept", "image/avif,image/webp,image/jpeg,*/*")
+                .header("Origin", baseUrl)
                 .build()
 
             try {
-                // استخدام network.cloudflareClient هنا لتخطي الـ rate limiter وتجنب الحظر
-                network.cloudflareClient.newCall(req).execute().use { resp ->
+                chunkClient.newCall(req).execute().use { resp ->
                     if (resp.isSuccessful) {
                         val bodyBytes = resp.body.bytes()
                         val isBase64Text = bodyBytes.size > 20 &&
