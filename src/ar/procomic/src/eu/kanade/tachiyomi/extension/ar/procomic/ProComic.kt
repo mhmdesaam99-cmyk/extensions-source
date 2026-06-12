@@ -159,12 +159,6 @@ class ProComic : HttpSource() {
 
     override fun mangaDetailsRequest(manga: SManga): Request {
         val p = manga.url.split("/")
-        return GET("$baseUrl/api/public/${p[0]}/${p[1]}", headers)
-    }
-
-    override fun mangaDetailsRequest(manga: SManga): Request {
-        val p = manga.url.split("/")
-        // توجيه الطلب إلى مسار manga مع الاحتفاظ بالنوع الأصلي
         val apiType = if (p[0] == "manhwa" || p[0] == "manhua") "manga" else p[0]
         return GET("$baseUrl/api/public/$apiType/${p[1]}?realType=${p[0]}", headers)
     }
@@ -174,9 +168,7 @@ class ProComic : HttpSource() {
             val data = response.parseAs<SeriesDetailResponse>()
             val parts = response.request.url.pathSegments
             val idx = parts.indexOf("public")
-            // استرجاع النوع الأصلي المخفي من الرابط
             val originalType = response.request.url.queryParameter("realType") ?: parts.getOrElse(idx + 1) { "manga" }
-            
             SManga.create().apply {
                 url = "$originalType/${parts.getOrElse(idx + 2) { "0" }}/${data.slug ?: ""}"
                 title = data.title ?: ""
@@ -220,27 +212,9 @@ class ProComic : HttpSource() {
         }
     }
 
-    override fun chapterListParse(response: Response): List<SChapter> {
-        val parts = response.request.url.pathSegments
-        val idx = parts.indexOf("public")
-        val seriesType = parts.getOrElse(idx + 1) { "manga" }
-        val seriesId = parts.getOrElse(idx + 2) { "0" }
-
-        return response.parseAs<ChaptersResponse>().data.map { ch ->
-            SChapter.create().apply {
-                url = "$seriesType/$seriesId/${ch.id}/${ch.chapterNumber}"
-                name = "الفصل ${ch.chapterNumber}" + (if (!ch.title.isNullOrBlank()) " - ${ch.title}" else "")
-                date_upload = runCatching { dateFormat.parse(ch.publishedAt ?: "")?.time }.getOrNull() ?: 0L
-                chapter_number = ch.chapterNumber.toFloatOrNull() ?: 0f
-                scanlator = if (ch.lockedByCoins == true) "🔒 مدفوع" else null
-            }
-        }
-    }
-
     override fun pageListRequest(chapter: SChapter): Request {
         val parts = chapter.url.split("/")
         val seriesType = parts.getOrElse(0) { "manga" }
-        // تحويل مسار الـ API إلى manga لمنع الخطأ 404 أو 520
         val apiType = if (seriesType == "manhwa" || seriesType == "manhua") "manga" else seriesType
         val seriesId = parts.getOrElse(1) { "0" }
         val chapterId = parts.getOrElse(2) { "0" }
@@ -377,22 +351,9 @@ class ProComic : HttpSource() {
     //  JWT helpers
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * يتحقق إذا كانت السلسلة JWT حقيقي (ثلاثة أجزاء base64url مفصولة بنقطة،
-     * والهيدر يبدأ بـ eyJhbGci).
-     */
     private fun String.isJwt(): Boolean =
         startsWith("eyJhbGci") && count { it == '.' } == 2
 
-    /**
-     * يفك ترميز الـ JWT payload ويستخرج قيمة `split`.
-     *
-     * السيرفر يتحقق من أن `?split=N` في الـ URL يطابق تماماً قيمة `split`
-     * المُوقَّعة داخل الـ JWT. إرسال قيمة خاطئة يُعيد 500.
-     *
-     * من تحليل الحركة المُلتقطة: كلا الفصلين يحتويان `"split": 3` في الـ JWT
-     * والمتصفح يرسل دائماً `?split=3`.
-     */
     private fun jwtSplitValue(jwtToken: String): Int {
         return try {
             val payloadSegment = jwtToken.split(".").getOrNull(1) ?: return DEFAULT_SPLIT
@@ -411,15 +372,6 @@ class ProComic : HttpSource() {
     //  الطريقة الجديدة: جلب الصفحات المؤجلة
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * الإصلاح الجوهري:
-     *
-     * الكود القديم كان يرسل `?split=0` دائماً → السيرفر يرفض بـ 500 لأن الـ JWT
-     * يحتوي `"split":3` ويتحقق من التطابق.
-     *
-     * الإصلاح: نستخرج قيمة split من الـ JWT ونستخدمها في الطلب.
-     * نُجرِّب 0..jwtSplit ونتجاهل أي فشل gracefully.
-     */
     private fun fetchDeferredPages(
         chapterId: String,
         jwtToken: String,
@@ -441,7 +393,7 @@ class ProComic : HttpSource() {
                     ),
                 ).execute()
 
-                if (!resp.isSuccessful) continue   // split=0 → 500 للفصول الجديدة، نكمل
+                if (!resp.isSuccessful) continue
 
                 val parsed = resp.parseAs<ChapterDeferredResponse>()
                 if (parsed.success && parsed.data != null) splitResponses.add(parsed.data)
@@ -456,7 +408,6 @@ class ProComic : HttpSource() {
 
             splitData.maps.forEach { map ->
                 when {
-                    // JWT متداخل — تجنب اللا-نهائية
                     map.token.isNotBlank() && map.pieces.isEmpty() && map.token.isJwt() -> { }
                     else -> {
                         val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
@@ -483,10 +434,6 @@ class ProComic : HttpSource() {
 
         return pages
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  الطريقة القديمة: حل الـ map عبر session key أو proxy
-    // ─────────────────────────────────────────────────────────────────────────
 
     private fun resolveMap(
         map: DeferredPageMap,
@@ -522,10 +469,6 @@ class ProComic : HttpSource() {
         }
         return null
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  بناء صفحات الـ scrambled map
-    // ─────────────────────────────────────────────────────────────────────────
 
     private fun processMap(
         dim: List<Int>,
@@ -563,10 +506,6 @@ class ProComic : HttpSource() {
             pages.add(Page(pages.size, imageUrl = "$SCRAMBLED_SCHEME$encoded"))
         }
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  إعادة تجميع الصورة المقطعة
-    // ─────────────────────────────────────────────────────────────────────────
 
     private fun reconstructPage(map: ScrambledMap): ByteArray? {
         if (map.pieces.isEmpty()) return null
@@ -696,10 +635,6 @@ class ProComic : HttpSource() {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  AES-GCM decryption (الطريقة القديمة)
-    // ─────────────────────────────────────────────────────────────────────────
-
     private fun decryptMap(tokenStr: String, sessionKeyBase64: String): DeferredPageMap? {
         return try {
             val tokenJsonStr = String(Base64.decode(tokenStr, Base64.URL_SAFE or Base64.DEFAULT))
@@ -720,10 +655,6 @@ class ProComic : HttpSource() {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  AVIF decoder
-    // ─────────────────────────────────────────────────────────────────────────
-
     private fun decodeAvif(bytes: ByteArray): Bitmap? {
         if (bytes.isEmpty()) return null
         val decoder = ImageDecoder.newInstance(bytes.inputStream())
@@ -735,10 +666,6 @@ class ProComic : HttpSource() {
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
         }
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Grid mode parser
-    // ─────────────────────────────────────────────────────────────────────────
 
     private fun parseMode(mode: String, pieceCount: Int): Pair<Int, Int> = when {
         mode.startsWith("grid_") -> {
@@ -757,30 +684,14 @@ class ProComic : HttpSource() {
         json.decodeFromStream(body.byteStream())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Constants
-// ─────────────────────────────────────────────────────────────────────────────
-
 private const val DEFAULT_SPLIT = 3
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  JWT Payload model
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * نموذج بسيط لاستخراج قيمة `split` من الـ JWT.
- * السيرفر يشترط أن `?split=N` يطابق هذه القيمة.
- */
 @Serializable
 data class JwtPayload(
     val split: Int = DEFAULT_SPLIT,
     val cid: Int = 0,
     val p: String = "",
 )
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Data models
-// ─────────────────────────────────────────────────────────────────────────────
 
 @Serializable
 data class SessionKeyResponse(
