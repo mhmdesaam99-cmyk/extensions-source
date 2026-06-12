@@ -162,13 +162,23 @@ class ProComic : HttpSource() {
         return GET("$baseUrl/api/public/${p[0]}/${p[1]}", headers)
     }
 
+    override fun mangaDetailsRequest(manga: SManga): Request {
+        val p = manga.url.split("/")
+        // توجيه الطلب إلى مسار manga مع الاحتفاظ بالنوع الأصلي
+        val apiType = if (p[0] == "manhwa" || p[0] == "manhua") "manga" else p[0]
+        return GET("$baseUrl/api/public/$apiType/${p[1]}?realType=${p[0]}", headers)
+    }
+
     override fun mangaDetailsParse(response: Response): SManga {
         return try {
             val data = response.parseAs<SeriesDetailResponse>()
             val parts = response.request.url.pathSegments
             val idx = parts.indexOf("public")
+            // استرجاع النوع الأصلي المخفي من الرابط
+            val originalType = response.request.url.queryParameter("realType") ?: parts.getOrElse(idx + 1) { "manga" }
+            
             SManga.create().apply {
-                url = "${parts.getOrElse(idx + 1) { "manga" }}/${parts.getOrElse(idx + 2) { "0" }}/${data.slug ?: ""}"
+                url = "$originalType/${parts.getOrElse(idx + 2) { "0" }}/${data.slug ?: ""}"
                 title = data.title ?: ""
                 thumbnail_url = data.coverImageApp?.card?.mobile ?: data.coverImageApp?.desktop ?: data.coverImage
                 author = data.author
@@ -186,10 +196,28 @@ class ProComic : HttpSource() {
 
     override fun chapterListRequest(manga: SManga): Request {
         val p = manga.url.split("/")
+        val apiType = if (p[0] == "manhwa" || p[0] == "manhua") "manga" else p[0]
         return GET(
-            "$baseUrl/api/public/${p[0]}/${p[1]}/chapters?page=1&limit=500&order=desc",
+            "$baseUrl/api/public/$apiType/${p[1]}/chapters?page=1&limit=500&order=desc&realType=${p[0]}",
             headers,
         )
+    }
+
+    override fun chapterListParse(response: Response): List<SChapter> {
+        val parts = response.request.url.pathSegments
+        val idx = parts.indexOf("public")
+        val originalType = response.request.url.queryParameter("realType") ?: parts.getOrElse(idx + 1) { "manga" }
+        val seriesId = parts.getOrElse(idx + 2) { "0" }
+
+        return response.parseAs<ChaptersResponse>().data.map { ch ->
+            SChapter.create().apply {
+                url = "$originalType/$seriesId/${ch.id}/${ch.chapterNumber}"
+                name = "الفصل ${ch.chapterNumber}" + (if (!ch.title.isNullOrBlank()) " - ${ch.title}" else "")
+                date_upload = runCatching { dateFormat.parse(ch.publishedAt ?: "")?.time }.getOrNull() ?: 0L
+                chapter_number = ch.chapterNumber.toFloatOrNull() ?: 0f
+                scanlator = if (ch.lockedByCoins == true) "🔒 مدفوع" else null
+            }
+        }
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
@@ -212,12 +240,10 @@ class ProComic : HttpSource() {
     override fun pageListRequest(chapter: SChapter): Request {
         val parts = chapter.url.split("/")
         val seriesType = parts.getOrElse(0) { "manga" }
+        // تحويل مسار الـ API إلى manga لمنع الخطأ 404 أو 520
+        val apiType = if (seriesType == "manhwa" || seriesType == "manhua") "manga" else seriesType
         val seriesId = parts.getOrElse(1) { "0" }
         val chapterId = parts.getOrElse(2) { "0" }
-
-        // إصلاح خطأ 520: خادم الموقع ينهار عند إرسال _cid مع مسارات manhwa/manhua
-        // تحويل النوع إلى manga هنا يحل المشكلة لأن قاعدة البيانات في الخلفية موحدة وتدعم الفلترة بشكل صحيح
-        val apiType = if (seriesType == "manhwa" || seriesType == "manhua") "manga" else seriesType
 
         val url = "$baseUrl/api/public/$apiType/$seriesId/chapters".toHttpUrl()
             .newBuilder()
