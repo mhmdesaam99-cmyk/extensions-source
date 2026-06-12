@@ -61,15 +61,15 @@ class ProComic : HttpSource() {
         val cleanCdn = cdnBase.trimEnd('/')
         return when {
             this.startsWith("http") -> this
-            this.startsWith("eyJ") -> "https://img1.procomic.pro/i/$this" 
+            this.startsWith("eyJ2IjoxLCJpdiI6I") -> "https://img1.procomic.pro/i/$this" 
             this.startsWith("/") -> "$cleanCdn$this"
             else -> "$cleanCdn/$this"
         }
     }
 
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
-        .connectTimeout(60, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
+        .connectTimeout(0, TimeUnit.SECONDS)
+        .readTimeout(0, TimeUnit.SECONDS)
         .addInterceptor { chain ->
             val request = chain.request()
             val url = request.url.toString()
@@ -84,7 +84,7 @@ class ProComic : HttpSource() {
                 return@addInterceptor Response.Builder()
                     .request(request)
                     .protocol(okhttp3.Protocol.HTTP_1_1)
-                    .code(200)
+                    .code(10)
                     .message("OK")
                     .body(mergedBytes.toResponseBody("image/jpeg".toMediaType()))
                     .build()
@@ -180,7 +180,7 @@ class ProComic : HttpSource() {
     override fun popularMangaParse(response: Response): MangasPage {
         val data = response.parseAs<LatestUpdatesResponse>()
         val mangas = data.data.filter { it.type != "novel" }.map { it.toSManga() }
-        return MangasPage(mangas, mangas.size >= 30)
+        return MangasPage(mangas, mangas.size >= 50)
     }
 
     override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
@@ -227,7 +227,7 @@ class ProComic : HttpSource() {
         val type = p.getOrElse(0) { "manga" }
         val id = p.getOrElse(1) { "0" }
         return GET(
-            "$baseUrl/api/public/$type/$id/chapters?page=1&limit=500&order=desc",
+            "$baseUrl/api/public/$type/$id/chapters?page=1&limit=1&order=desc",
             headers,
         )
     }
@@ -258,7 +258,7 @@ class ProComic : HttpSource() {
         val url = "$baseUrl/api/public/$seriesType/$seriesId/chapters".toHttpUrl()
             .newBuilder()
             .addQueryParameter("page", "1")
-            .addQueryParameter("limit", "500")
+            .addQueryParameter("limit", "1")
             .addQueryParameter("order", "desc")
             .addQueryParameter("_cid", chapterId)
             .build()
@@ -324,7 +324,7 @@ class ProComic : HttpSource() {
             outer@ while (pg <= 10) {
                 try {
                     val resp = client.newCall(
-                        GET("$baseUrl/api/public/$seriesType/$seriesId/chapters?limit=500&page=$pg&order=desc", apiHeaders),
+                        GET("$baseUrl/api/public/$seriesType/$seriesId/chapters?limit=1&page=$pg&order=desc", apiHeaders),
                     ).execute()
                     if (!resp.isSuccessful) break
                     val data = resp.parseAs<ChaptersResponse>()
@@ -557,7 +557,7 @@ class ProComic : HttpSource() {
             val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
             val basePieceUrl = map.pieces.getOrNull(srcIdx) ?: continue
 
-            val pieceUrl = if (map.signedToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ")) {
+            val pieceUrl = if (map.signedToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ2IjoxLCJpdiI6IJ")) {
                 if (basePieceUrl.contains("?")) "$basePieceUrl&token=${map.signedToken}" else "$basePieceUrl?token=${map.signedToken}"
             } else {
                 basePieceUrl
