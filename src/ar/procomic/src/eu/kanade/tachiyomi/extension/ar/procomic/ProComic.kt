@@ -165,11 +165,12 @@ class ProComic : HttpSource() {
         }
         .build()
 
-    // الاعتماد بالكامل على الـ User-Agent والـ Cookies التلقائية الممررة من تاتشيومي لتفادي تعارض الرؤوس وخطأ 500
+    // ترك التاتشيومي يتعامل تلقائياً وبشكل ديناميكي مع الـ User-Agent والـ Cookies الخاصة بالـ WebView لمنع الحظر
     override fun headersBuilder() = super.headersBuilder()
         .set("Referer", "$baseUrl/")
         .set("Origin", baseUrl)
         .set("Accept", "application/json, text/plain, */*")
+        .set("Accept-Language", "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7")
 
     override fun popularMangaRequest(page: Int) = GET(
         "$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page",
@@ -398,7 +399,7 @@ class ProComic : HttpSource() {
             if (dec == null || dec.pieces.isEmpty()) {
                 try {
                     val bodyStr = json.encodeToString(map)
-                    val body = bodyStr.toRequestBody("application/json".toRequestBody().contentType())
+                    val body = bodyStr.toRequestBody("application/json".toMediaType())
                     val proxyReq = POST("$baseUrl/chapter-map-proxy-plan/$chapterId", 
                         apiHeaders.newBuilder()
                             .set("Origin", baseUrl)
