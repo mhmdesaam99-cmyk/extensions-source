@@ -159,8 +159,7 @@ class ProComic : HttpSource() {
 
     override fun mangaDetailsRequest(manga: SManga): Request {
         val p = manga.url.split("/")
-        val apiType = if (p[0] == "manhwa" || p[0] == "manhua") "manga" else p[0]
-        return GET("$baseUrl/api/public/$apiType/${p[1]}?realType=${p[0]}", headers)
+        return GET("$baseUrl/api/public/${p[0]}/${p[1]}", headers)
     }
 
     override fun mangaDetailsParse(response: Response): SManga {
@@ -168,7 +167,7 @@ class ProComic : HttpSource() {
             val data = response.parseAs<SeriesDetailResponse>()
             val parts = response.request.url.pathSegments
             val idx = parts.indexOf("public")
-            val originalType = response.request.url.queryParameter("realType") ?: parts.getOrElse(idx + 1) { "manga" }
+            val originalType = parts.getOrElse(idx + 1) { "manga" }
             SManga.create().apply {
                 url = "$originalType/${parts.getOrElse(idx + 2) { "0" }}/${data.slug ?: ""}"
                 title = data.title ?: ""
@@ -188,9 +187,8 @@ class ProComic : HttpSource() {
 
     override fun chapterListRequest(manga: SManga): Request {
         val p = manga.url.split("/")
-        val apiType = if (p[0] == "manhwa" || p[0] == "manhua") "manga" else p[0]
         return GET(
-            "$baseUrl/api/public/$apiType/${p[1]}/chapters?page=1&limit=500&order=desc&realType=${p[0]}",
+            "$baseUrl/api/public/${p[0]}/${p[1]}/chapters?page=1&limit=500&order=desc",
             headers,
         )
     }
@@ -198,7 +196,7 @@ class ProComic : HttpSource() {
     override fun chapterListParse(response: Response): List<SChapter> {
         val parts = response.request.url.pathSegments
         val idx = parts.indexOf("public")
-        val originalType = response.request.url.queryParameter("realType") ?: parts.getOrElse(idx + 1) { "manga" }
+        val originalType = parts.getOrElse(idx + 1) { "manga" }
         val seriesId = parts.getOrElse(idx + 2) { "0" }
 
         return response.parseAs<ChaptersResponse>().data.map { ch ->
@@ -215,11 +213,10 @@ class ProComic : HttpSource() {
     override fun pageListRequest(chapter: SChapter): Request {
         val parts = chapter.url.split("/")
         val seriesType = parts.getOrElse(0) { "manga" }
-        val apiType = if (seriesType == "manhwa" || seriesType == "manhua") "manga" else seriesType
         val seriesId = parts.getOrElse(1) { "0" }
         val chapterId = parts.getOrElse(2) { "0" }
 
-        val url = "$baseUrl/api/public/$apiType/$seriesId/chapters".toHttpUrl()
+        val url = "$baseUrl/api/public/$seriesType/$seriesId/chapters".toHttpUrl()
             .newBuilder()
             .addQueryParameter("page", "1")
             .addQueryParameter("limit", "500")
