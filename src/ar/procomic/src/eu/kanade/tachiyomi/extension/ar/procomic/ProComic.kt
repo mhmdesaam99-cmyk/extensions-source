@@ -148,7 +148,7 @@ class ProComic : HttpSource() {
     override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+   override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val url = "$baseUrl/api/public/content/latest-updates".toHttpUrl().newBuilder()
             .addQueryParameter("limit", "30")
             .addQueryParameter("category", "comics")
@@ -185,6 +185,7 @@ class ProComic : HttpSource() {
                         url.addQueryParameter("tags", filter.toUriPart())
                     }
                 }
+                else -> {}
             }
         }
 
