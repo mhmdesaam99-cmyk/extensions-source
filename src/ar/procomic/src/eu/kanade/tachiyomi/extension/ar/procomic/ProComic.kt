@@ -148,7 +148,7 @@ class ProComic : HttpSource() {
     override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
 
-   override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val url = "$baseUrl/api/public/content/latest-updates".toHttpUrl().newBuilder()
             .addQueryParameter("limit", "30")
             .addQueryParameter("category", "comics")
@@ -202,8 +202,6 @@ class ProComic : HttpSource() {
         GenreFilter(),
         TagFilter()
     )
-
-    override fun searchMangaParse(response: Response) = popularMangaParse(response)
 
     override fun mangaDetailsRequest(manga: SManga): Request {
         val p = manga.url.split("/")
@@ -267,7 +265,7 @@ class ProComic : HttpSource() {
 
         val referer = "$baseUrl/series/$type/$id/slug-placeholder/$cid/$cnum"
 
-        val url = "$baseUrl/api/public/$type/$id/chapters".toHttpUrl()
+        val url = "$baseUrl/api/public/manga/$id/chapters".toHttpUrl()
             .newBuilder()
             .addQueryParameter("page", "1")
             .addQueryParameter("limit", "500")
@@ -284,10 +282,6 @@ class ProComic : HttpSource() {
 
     override fun pageListParse(response: Response): List<Page> {
         val chapterId = response.request.url.queryParameter("_cid") ?: return emptyList()
-        val seriesType = response.request.url.pathSegments.let { parts ->
-            val idx = parts.indexOf("public")
-            parts.getOrElse(idx + 1) { "manga" }
-        }
         val seriesId = response.request.url.pathSegments.let { parts ->
             val idx = parts.indexOf("public")
             parts.getOrElse(idx + 2) { "0" }
@@ -342,7 +336,7 @@ class ProComic : HttpSource() {
                 try {
                     val resp = client.newCall(
                         GET(
-                            "$baseUrl/api/public/$seriesType/$seriesId/chapters?limit=500&page=$pg&order=desc",
+                            "$baseUrl/api/public/manga/$seriesId/chapters?limit=500&page=$pg&order=desc",
                             apiHeaders,
                         ),
                     ).execute()
