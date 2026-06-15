@@ -304,20 +304,16 @@ class ProComic : HttpSource() {
         val cdnBase = "https://$cdnPath.procomic.pro"
         val mapTokens = mutableListOf<String>()
 
-        // ── الطريقة القديمة: صور عادية مباشرة ────────────────────────────
         metadataImages.forEach { imgPath ->
             val fullUrl = imgPath.toAbsoluteUrl(cdnBase)
             if (seenUrls.add(fullUrl)) pages.add(Page(pages.size, imageUrl = fullUrl))
         }
 
-        // ── معالجة الـ maps من metadata الفصل ────────────────────────────
         mapsList.forEach { map ->
             when {
-                // الطريقة الجديدة: JWT token بدون pieces
                 map.token.isNotBlank() && map.pieces.isEmpty() && map.token.isJwt() -> {
                     mapTokens.add(map.token)
                 }
-                // الطريقة القديمة: token مشفر AES بدون pieces
                 map.token.isNotBlank() && map.pieces.isEmpty() -> {
                     val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
                     if (resolved != null && resolved.pieces.isNotEmpty()) {
@@ -325,7 +321,6 @@ class ProComic : HttpSource() {
                         processMap(resolved.dim, resolved.mode, absolutePieces, resolved.order, resolved.token, pages, seenUrls)
                     }
                 }
-                // pieces موجودة مباشرة
                 map.pieces.isNotEmpty() -> {
                     val absolutePieces = map.pieces.map { it.toAbsoluteUrl(cdnBase) }
                     processMap(map.dim, map.mode, absolutePieces, map.order, map.token, pages, seenUrls)
@@ -333,7 +328,6 @@ class ProComic : HttpSource() {
             }
         }
 
-        // ── الطريقة الجديدة: جلب الصفحات عبر JWT tokens ──────────────────
         for (jwtToken in mapTokens) {
             try {
                 val newPages = fetchDeferredPages(chapterId, jwtToken, apiHeaders, seenUrls, cdnBase, getSessionKey)
@@ -343,10 +337,6 @@ class ProComic : HttpSource() {
 
         return pages
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  JWT helpers
-    // ─────────────────────────────────────────────────────────────────────────
 
     private fun String.isJwt(): Boolean =
         startsWith("eyJhbGci") && count { it == '.' } == 2
@@ -364,10 +354,6 @@ class ProComic : HttpSource() {
             DEFAULT_SPLIT
         }
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  الطريقة الجديدة: جلب الصفحات المؤجلة
-    // ─────────────────────────────────────────────────────────────────────────
 
     private fun fetchDeferredPages(
         chapterId: String,
