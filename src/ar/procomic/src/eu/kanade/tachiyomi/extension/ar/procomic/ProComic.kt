@@ -129,7 +129,6 @@ class ProComic : HttpSource() {
         }
         .build()
 
-    // إزالة الـ User-Agent الثابت لحل مشكلة تطابق الـ JWT uah
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
         .add("Origin", baseUrl)
@@ -149,10 +148,58 @@ class ProComic : HttpSource() {
     override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList) = GET(
-        "$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page" +
-            (if (query.isNotBlank()) "&q=$query" else ""),
-        headers,
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+        val url = "$baseUrl/api/public/content/latest-updates".toHttpUrl().newBuilder()
+            .addQueryParameter("limit", "30")
+            .addQueryParameter("category", "comics")
+            .addQueryParameter("page", page.toString())
+
+        if (query.isNotBlank()) {
+            url.addQueryParameter("q", query)
+        }
+
+        filters.forEach { filter ->
+            when (filter) {
+                is TypeFilter -> {
+                    if (filter.toUriPart().isNotEmpty()) {
+                        url.addQueryParameter("type", filter.toUriPart())
+                    }
+                }
+                is StatusFilter -> {
+                    if (filter.toUriPart().isNotEmpty()) {
+                        url.addQueryParameter("status", filter.toUriPart())
+                    }
+                }
+                is SortFilter -> {
+                    if (filter.toUriPart().isNotEmpty()) {
+                        url.addQueryParameter("order", filter.toUriPart())
+                    }
+                }
+                is GenreFilter -> {
+                    if (filter.toUriPart().isNotEmpty()) {
+                        url.addQueryParameter("genres", filter.toUriPart())
+                    }
+                }
+                is TagFilter -> {
+                    if (filter.toUriPart().isNotEmpty()) {
+                        url.addQueryParameter("tags", filter.toUriPart())
+                    }
+                }
+            }
+        }
+
+        return GET(url.build(), headers)
+    }
+
+    override fun getFilterList() = FilterList(
+        eu.kanade.tachiyomi.source.model.Filter.Header("ملاحظة: بعض الفلاتر قد تتجاهلها المنصة عند البحث بنص"),
+        eu.kanade.tachiyomi.source.model.Filter.Separator(),
+        TypeFilter(),
+        StatusFilter(),
+        SortFilter(),
+        eu.kanade.tachiyomi.source.model.Filter.Separator(),
+        GenreFilter(),
+        TagFilter()
     )
 
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
@@ -201,7 +248,6 @@ class ProComic : HttpSource() {
 
         return response.parseAs<ChaptersResponse>().data.map { ch ->
             SChapter.create().apply {
-                // تمرير رقم الفصل لبناء الـ Referer لاحقاً
                 url = "$type/$id/${ch.id}/${ch.chapterNumber}"
                 name = "الفصل ${ch.chapterNumber}" + (if (!ch.title.isNullOrBlank()) " - ${ch.title}" else "")
                 date_upload = runCatching { dateFormat.parse(ch.publishedAt ?: "")?.time }.getOrNull() ?: 0L
@@ -218,7 +264,6 @@ class ProComic : HttpSource() {
         val cid = parts.getOrElse(2) { "0" }
         val cnum = parts.getOrElse(3) { "1" }
 
-        // بناء Referer مطابق تماماً لطلب السيرفر لتخطي خطأ 502/404 للمانهوا والمانها
         val referer = "$baseUrl/series/$type/$id/slug-placeholder/$cid/$cnum"
 
         val url = "$baseUrl/api/public/$type/$id/chapters".toHttpUrl()
@@ -247,7 +292,6 @@ class ProComic : HttpSource() {
             parts.getOrElse(idx + 2) { "0" }
         }
 
-        // استخراج الـ Referer الدقيق الذي أرسلناه في pageListRequest
         val referer = response.request.header("Referer") ?: "$baseUrl/"
         
         val apiHeaders = headers.newBuilder()
@@ -499,7 +543,7 @@ class ProComic : HttpSource() {
                         signedToken = signedToken,
                         splitPart = p,
                         totalParts = parts,
-                        referer = referer // تمرير الرابط المرجعي للاستخدام في جلب الصور
+                        referer = referer
                     ),
                 ).toByteArray(Charsets.UTF_8),
                 Base64.URL_SAFE or Base64.NO_WRAP,
@@ -514,6 +558,11 @@ class ProComic : HttpSource() {
         val (cols, rows) = parseMode(map.mode, map.pieces.size)
         val bitmaps = arrayOfNulls<Bitmap>(map.pieces.size)
 
+        val imageClient = network.cloudflareClient.newBuilder()
+            .connectTimeout(60, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .build()
+
         for (targetIdx in 0 until map.pieces.size) {
             val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
             val basePieceUrl = map.pieces.getOrNull(srcIdx) ?: continue
@@ -525,35 +574,55 @@ class ProComic : HttpSource() {
                 basePieceUrl
             }
 
-            val reqReferer = map.referer ?: "$baseUrl/"
+            val reqReferer = "https://procomic.pro/"
+            
             val req = Request.Builder()
                 .url(pieceUrl)
                 .header("Referer", reqReferer)
-                .header("Accept", "image/avif,image/webp,image/jpeg,*/*")
-                .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
+                .header("Origin", "https://procomic.pro")
+                .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+                .header("Sec-Fetch-Dest", "image")
+                .header("Sec-Fetch-Mode", "cors")
+                .header("Sec-Fetch-Site", "same-site")
+                .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36")
                 .build()
 
-            try {
-                client.newCall(req).execute().use { resp ->
-                    if (resp.isSuccessful) {
-                        val bodyBytes = resp.body.bytes()
-                        val isBase64Text = bodyBytes.size > 20 &&
-                            bodyBytes[0] == 'd'.code.toByte() &&
-                            bodyBytes[1] == 'a'.code.toByte() &&
-                            bodyBytes[2] == 't'.code.toByte() &&
-                            bodyBytes[3] == 'a'.code.toByte() &&
-                            bodyBytes[4] == ':'.code.toByte()
+            var success = false
+            var attempts = 0
+            
+            while (!success && attempts < 3) {
+                try {
+                    imageClient.newCall(req).execute().use { resp ->
+                        if (resp.isSuccessful) {
+                            val bodyBytes = resp.body.bytes()
+                            val isBase64Text = bodyBytes.size > 20 &&
+                                bodyBytes[0] == 'd'.code.toByte() &&
+                                bodyBytes[1] == 'a'.code.toByte() &&
+                                bodyBytes[2] == 't'.code.toByte() &&
+                                bodyBytes[3] == 'a'.code.toByte() &&
+                                bodyBytes[4] == ':'.code.toByte()
 
-                        val finalBytes = if (isBase64Text) {
-                            val base64Data = String(bodyBytes).substringAfter("base64,")
-                            Base64.decode(base64Data, Base64.DEFAULT)
+                            val finalBytes = if (isBase64Text) {
+                                val base64Data = String(bodyBytes).substringAfter("base64,")
+                                Base64.decode(base64Data, Base64.DEFAULT)
+                            } else {
+                                bodyBytes
+                            }
+                            bitmaps[targetIdx] = decodeAvif(finalBytes)
+                            success = true
                         } else {
-                            bodyBytes
+                            if (resp.code == 404 || resp.code == 403) {
+                                break
+                            }
+                            attempts++
+                            Thread.sleep(500)
                         }
-                        bitmaps[targetIdx] = decodeAvif(finalBytes)
                     }
+                } catch (e: Exception) {
+                    attempts++
+                    Thread.sleep(500)
                 }
-            } catch (e: Exception) { }
+            }
         }
 
         return try {
@@ -723,7 +792,7 @@ data class ScrambledMap(
     val signedToken: String = "",
     val splitPart: Int? = null,
     val totalParts: Int? = null,
-    val referer: String? = null,
+    val referer: String? = null
 )
 
 @Serializable
