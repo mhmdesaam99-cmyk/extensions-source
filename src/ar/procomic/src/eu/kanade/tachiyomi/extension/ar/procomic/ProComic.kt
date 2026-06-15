@@ -131,8 +131,15 @@ class ProComic : HttpSource() {
 
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
-        .add("Origin", baseUrl)
         .add("Accept-Language", "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7")
+
+    override fun imageRequest(page: Page): Request {
+        return GET(page.imageUrl, headers.newBuilder()
+            .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+            .removeAll("Origin")
+            .build()
+        )
+    }
 
     override fun popularMangaRequest(page: Int) = GET(
         "$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page",
@@ -571,17 +578,11 @@ class ProComic : HttpSource() {
                 basePieceUrl
             }
 
-            val reqReferer = "https://procomic.pro/"
-            
             val req = Request.Builder()
                 .url(pieceUrl)
-                .header("Referer", reqReferer)
-                .header("Origin", "https://procomic.pro")
+                .header("Referer", "$baseUrl/")
                 .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
-                .header("Sec-Fetch-Dest", "image")
-                .header("Sec-Fetch-Mode", "cors")
-                .header("Sec-Fetch-Site", "same-site")
-                .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36")
+                .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
                 .build()
 
             var success = false
