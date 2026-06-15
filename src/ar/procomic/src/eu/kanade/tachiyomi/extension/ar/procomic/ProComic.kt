@@ -457,7 +457,7 @@ class ProComic : HttpSource() {
                         "$baseUrl/chapter-map-proxy-plan/$chapterId",
                         apiHeaders.newBuilder()
                             .set("Origin", baseUrl)
-                            .build(), // الآن يحتوي الـ apiHeaders على الـ Referer الصحيح
+                            .build(),
                         body,
                     )
                     val proxyResp = client.newCall(proxyReq).execute()
