@@ -291,10 +291,9 @@ class ProComic : HttpSource() {
 
     override fun pageListParse(response: Response): List<Page> {
         val chapterId = response.request.url.queryParameter("_cid") ?: return emptyList()
-        val seriesId = response.request.url.pathSegments.let { parts ->
-            val idx = parts.indexOf("public")
-            parts.getOrElse(idx + 2) { "0" }
-        }
+        val pathSegments = response.request.url.pathSegments
+        val publicIdx = pathSegments.indexOf("public")
+        val seriesId = pathSegments.getOrElse(publicIdx + 2) { "0" }
 
         val referer = response.request.header("Referer") ?: "$baseUrl/"
         
