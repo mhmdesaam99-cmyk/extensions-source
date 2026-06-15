@@ -134,7 +134,7 @@ class ProComic : HttpSource() {
         .add("Accept-Language", "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7")
 
     override fun imageRequest(page: Page): Request {
-        return GET(page.imageUrl, headers.newBuilder()
+        return GET(page.imageUrl!!, headers.newBuilder()
             .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
             .removeAll("Origin")
             .build()
