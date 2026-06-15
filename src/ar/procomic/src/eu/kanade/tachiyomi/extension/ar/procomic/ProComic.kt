@@ -192,6 +192,8 @@ class ProComic : HttpSource() {
         return GET(url.build(), headers)
     }
 
+    override fun searchMangaParse(response: Response) = popularMangaParse(response)
+
     override fun getFilterList() = FilterList(
         eu.kanade.tachiyomi.source.model.Filter.Header("ملاحظة: بعض الفلاتر قد تتجاهلها المنصة عند البحث بنص"),
         eu.kanade.tachiyomi.source.model.Filter.Separator(),
