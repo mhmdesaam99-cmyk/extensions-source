@@ -723,7 +723,7 @@ data class ScrambledMap(
     val signedToken: String = "",
     val splitPart: Int? = null,
     val totalParts: Int? = null,
-    val referer: String? = null // تمت إضافة حقل لتمرير الرابط المرجعي للصور
+    val referer: String? = null,
 )
 
 @Serializable
