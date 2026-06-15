@@ -274,7 +274,7 @@ class ProComic : HttpSource() {
 
         val referer = "$baseUrl/series/$type/$id/slug-placeholder/$cid/$cnum"
 
-        val url = "$baseUrl/api/public/manga/$id/chapters".toHttpUrl()
+        val url = "$baseUrl/api/public/$type/$id/chapters".toHttpUrl()
             .newBuilder()
             .addQueryParameter("page", "1")
             .addQueryParameter("limit", "500")
@@ -293,6 +293,7 @@ class ProComic : HttpSource() {
         val chapterId = response.request.url.queryParameter("_cid") ?: return emptyList()
         val pathSegments = response.request.url.pathSegments
         val publicIdx = pathSegments.indexOf("public")
+        val seriesType = pathSegments.getOrElse(publicIdx + 1) { "manga" }
         val seriesId = pathSegments.getOrElse(publicIdx + 2) { "0" }
 
         val referer = response.request.header("Referer") ?: "$baseUrl/"
@@ -344,7 +345,7 @@ class ProComic : HttpSource() {
                 try {
                     val resp = client.newCall(
                         GET(
-                            "$baseUrl/api/public/manga/$seriesId/chapters?limit=500&page=$pg&order=desc",
+                            "$baseUrl/api/public/$seriesType/$seriesId/chapters?limit=500&page=$pg&order=desc",
                             apiHeaders,
                         ),
                     ).execute()
