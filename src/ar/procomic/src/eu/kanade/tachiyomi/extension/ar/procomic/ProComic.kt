@@ -129,11 +129,11 @@ class ProComic : HttpSource() {
         }
         .build()
 
+    // إزالة الـ User-Agent الثابت لحل مشكلة تطابق الـ JWT uah
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
         .add("Origin", baseUrl)
         .add("Accept-Language", "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7")
-        .add("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
 
     override fun popularMangaRequest(page: Int) = GET(
         "$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page",
@@ -196,12 +196,13 @@ class ProComic : HttpSource() {
     override fun chapterListParse(response: Response): List<SChapter> {
         val parts = response.request.url.pathSegments
         val idx = parts.indexOf("public")
-        val originalType = parts.getOrElse(idx + 1) { "manga" }
-        val seriesId = parts.getOrElse(idx + 2) { "0" }
+        val type = parts.getOrElse(idx + 1) { "manga" }
+        val id = parts.getOrElse(idx + 2) { "0" }
 
         return response.parseAs<ChaptersResponse>().data.map { ch ->
             SChapter.create().apply {
-                url = "$originalType/$seriesId/${ch.id}/${ch.chapterNumber}"
+                // تمرير رقم الفصل لبناء الـ Referer لاحقاً
+                url = "$type/$id/${ch.id}/${ch.chapterNumber}"
                 name = "الفصل ${ch.chapterNumber}" + (if (!ch.title.isNullOrBlank()) " - ${ch.title}" else "")
                 date_upload = runCatching { dateFormat.parse(ch.publishedAt ?: "")?.time }.getOrNull() ?: 0L
                 chapter_number = ch.chapterNumber.toFloatOrNull() ?: 0f
@@ -212,19 +213,27 @@ class ProComic : HttpSource() {
 
     override fun pageListRequest(chapter: SChapter): Request {
         val parts = chapter.url.split("/")
-        val seriesType = parts.getOrElse(0) { "manga" }
-        val seriesId = parts.getOrElse(1) { "0" }
-        val chapterId = parts.getOrElse(2) { "0" }
+        val type = parts.getOrElse(0) { "manga" }
+        val id = parts.getOrElse(1) { "0" }
+        val cid = parts.getOrElse(2) { "0" }
+        val cnum = parts.getOrElse(3) { "1" }
 
-        val url = "$baseUrl/api/public/$seriesType/$seriesId/chapters".toHttpUrl()
+        // بناء Referer مطابق تماماً لطلب السيرفر لتخطي خطأ 502/404 للمانهوا والمانها
+        val referer = "$baseUrl/series/$type/$id/slug-placeholder/$cid/$cnum"
+
+        val url = "$baseUrl/api/public/$type/$id/chapters".toHttpUrl()
             .newBuilder()
             .addQueryParameter("page", "1")
             .addQueryParameter("limit", "500")
             .addQueryParameter("order", "desc")
-            .addQueryParameter("_cid", chapterId)
+            .addQueryParameter("_cid", cid)
             .build()
 
-        return GET(url, headers.newBuilder().set("Accept", "application/json").build())
+        return GET(url, headers.newBuilder()
+            .set("Accept", "application/json")
+            .set("Referer", referer)
+            .build()
+        )
     }
 
     override fun pageListParse(response: Response): List<Page> {
@@ -238,7 +247,14 @@ class ProComic : HttpSource() {
             parts.getOrElse(idx + 2) { "0" }
         }
 
-        val apiHeaders = headers.newBuilder().set("Accept", "application/json").build()
+        // استخراج الـ Referer الدقيق الذي أرسلناه في pageListRequest
+        val referer = response.request.header("Referer") ?: "$baseUrl/"
+        
+        val apiHeaders = headers.newBuilder()
+            .set("Accept", "application/json")
+            .set("Referer", referer)
+            .build()
+
         val pages = mutableListOf<Page>()
         val seenUrls = mutableSetOf<String>()
 
@@ -318,19 +334,19 @@ class ProComic : HttpSource() {
                     val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
                     if (resolved != null && resolved.pieces.isNotEmpty()) {
                         val absolutePieces = resolved.pieces.map { it.toAbsoluteUrl(cdnBase) }
-                        processMap(resolved.dim, resolved.mode, absolutePieces, resolved.order, resolved.token, pages, seenUrls)
+                        processMap(resolved.dim, resolved.mode, absolutePieces, resolved.order, resolved.token, pages, seenUrls, referer)
                     }
                 }
                 map.pieces.isNotEmpty() -> {
                     val absolutePieces = map.pieces.map { it.toAbsoluteUrl(cdnBase) }
-                    processMap(map.dim, map.mode, absolutePieces, map.order, map.token, pages, seenUrls)
+                    processMap(map.dim, map.mode, absolutePieces, map.order, map.token, pages, seenUrls, referer)
                 }
             }
         }
 
         for (jwtToken in mapTokens) {
             try {
-                val newPages = fetchDeferredPages(chapterId, jwtToken, apiHeaders, seenUrls, cdnBase, getSessionKey)
+                val newPages = fetchDeferredPages(chapterId, jwtToken, apiHeaders, seenUrls, cdnBase, getSessionKey, referer)
                 pages.addAll(newPages)
             } catch (e: Exception) { }
         }
@@ -362,6 +378,7 @@ class ProComic : HttpSource() {
         seenUrls: MutableSet<String>,
         cdnBase: String,
         getSessionKey: () -> String?,
+        referer: String,
     ): List<Page> {
         val pages = mutableListOf<Page>()
         val jwtSplit = jwtSplitValue(jwtToken)
@@ -411,7 +428,7 @@ class ProComic : HttpSource() {
 
             decryptedMaps.forEach { map ->
                 val absolutePieces = map.pieces.map { it.toAbsoluteUrl(cdnBase) }
-                processMap(map.dim, map.mode, absolutePieces, map.order, map.token, pages, seenUrls)
+                processMap(map.dim, map.mode, absolutePieces, map.order, map.token, pages, seenUrls, referer)
             }
         }
 
@@ -440,8 +457,7 @@ class ProComic : HttpSource() {
                         "$baseUrl/chapter-map-proxy-plan/$chapterId",
                         apiHeaders.newBuilder()
                             .set("Origin", baseUrl)
-                            .set("Referer", "$baseUrl/")
-                            .build(),
+                            .build(), // الآن يحتوي الـ apiHeaders على الـ Referer الصحيح
                         body,
                     )
                     val proxyResp = client.newCall(proxyReq).execute()
@@ -461,6 +477,7 @@ class ProComic : HttpSource() {
         signedToken: String,
         pages: MutableList<Page>,
         seenUrls: MutableSet<String>,
+        referer: String,
     ) {
         if (pieces.isEmpty() || !seenUrls.add(pieces.first())) return
 
@@ -482,6 +499,7 @@ class ProComic : HttpSource() {
                         signedToken = signedToken,
                         splitPart = p,
                         totalParts = parts,
+                        referer = referer // تمرير الرابط المرجعي للاستخدام في جلب الصور
                     ),
                 ).toByteArray(Charsets.UTF_8),
                 Base64.URL_SAFE or Base64.NO_WRAP,
@@ -507,9 +525,10 @@ class ProComic : HttpSource() {
                 basePieceUrl
             }
 
+            val reqReferer = map.referer ?: "$baseUrl/"
             val req = Request.Builder()
                 .url(pieceUrl)
-                .header("Referer", "$baseUrl/")
+                .header("Referer", reqReferer)
                 .header("Accept", "image/avif,image/webp,image/jpeg,*/*")
                 .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
                 .build()
@@ -704,6 +723,7 @@ data class ScrambledMap(
     val signedToken: String = "",
     val splitPart: Int? = null,
     val totalParts: Int? = null,
+    val referer: String? = null // تمت إضافة حقل لتمرير الرابط المرجعي للصور
 )
 
 @Serializable
