@@ -190,9 +190,8 @@ class ProComic : HttpSource() {
         val p = manga.url.split("/")
         val seriesType = p.getOrElse(0) { "manga" }
         val seriesId = p.getOrElse(1) { "0" }
-        // استخدام limit=50 بدلاً من 500 لتجنب انهيار السيرفر وخطأ 502
         return GET(
-            "$baseUrl/api/public/$seriesType/$seriesId/chapters?page=1&limit=50&order=desc",
+            "$baseUrl/api/public/$seriesType/$seriesId/chapters?page=1&limit=500&order=desc",
             headers,
         )
     }
@@ -203,34 +202,7 @@ class ProComic : HttpSource() {
         val seriesType = parts.getOrElse(idx + 1) { "manga" }
         val seriesId = parts.getOrElse(idx + 2) { "0" }
 
-        val chaptersData = mutableListOf<ChapterDto>()
-        
-        val firstPageData = try { response.parseAs<ChaptersResponse>() } catch (e: Exception) { ChaptersResponse() }
-        chaptersData.addAll(firstPageData.data)
-        
-        val total = firstPageData.total
-        var fetched = chaptersData.size
-        var page = 2
-        
-        while (fetched < total && page <= 20) { 
-            try {
-                val req = GET("$baseUrl/api/public/$seriesType/$seriesId/chapters?page=$page&limit=50&order=desc", headers)
-                val resp = client.newCall(req).execute()
-                if (resp.isSuccessful) {
-                    val newData = resp.parseAs<ChaptersResponse>()
-                    if (newData.data.isEmpty()) break
-                    chaptersData.addAll(newData.data)
-                    fetched += newData.data.size
-                    page++
-                } else {
-                    break
-                }
-            } catch (e: Exception) {
-                break
-            }
-        }
-
-        return chaptersData.map { ch ->
+        return response.parseAs<ChaptersResponse>().data.map { ch ->
             SChapter.create().apply {
                 url = "$seriesType/$seriesId/${ch.id}/${ch.chapterNumber}"
                 name = "الفصل ${ch.chapterNumber}" + (if (!ch.title.isNullOrBlank()) " - ${ch.title}" else "")
@@ -247,7 +219,7 @@ class ProComic : HttpSource() {
         val seriesId = parts.getOrElse(1) { "0" }
         val chapterId = parts.getOrElse(2) { "0" }
 
-        val url = "$baseUrl/api/public/$seriesType/$seriesId/chapters?page=1&limit=30&order=desc#$chapterId"
+        val url = "$baseUrl/api/public/$seriesType/$seriesId/chapters?page=1&limit=3&order=desc&_cid=$chapterId"
         
         val dynamicReferer = "$baseUrl/series/$seriesType/$seriesId/reading/$chapterId/1"
 
@@ -258,8 +230,7 @@ class ProComic : HttpSource() {
     }
 
     override fun pageListParse(response: Response): List<Page> {
-        val chapterId = response.request.url.fragment ?: return emptyList()
-        
+        val chapterId = response.request.url.queryParameter("_cid") ?: return emptyList()
         val parts = response.request.url.pathSegments
         val idx = parts.indexOf("public")
         val seriesType = parts.getOrElse(idx + 1) { "manga" }
@@ -277,7 +248,6 @@ class ProComic : HttpSource() {
         var cdnPath = "cdn1"
         var metadataImages = emptyList<String>()
         val mapsList = mutableListOf<DeferredPageMap>()
-        var found = false
 
         var cachedSessionKey: String? = null
         var sessionKeyAttempted = false
@@ -302,34 +272,7 @@ class ProComic : HttpSource() {
                 cdnPath = ch.cdnPath ?: "cdn1"
                 metadataImages = ch.metadata?.images ?: emptyList()
                 ch.metadata?.maps?.let { mapsList.addAll(it) }
-                found = true
                 break
-            }
-        }
-
-        if (!found) {
-            var pg = 2
-            outer@ while (pg <= 30) {
-                try {
-                    val resp = client.newCall(
-                        GET(
-                            "$baseUrl/api/public/$seriesType/$seriesId/chapters?limit=30&page=$pg&order=desc#$chapterId",
-                            apiHeaders,
-                        ),
-                    ).execute()
-                    if (!resp.isSuccessful) break
-                    val data = resp.parseAs<ChaptersResponse>()
-                    if (data.data.isEmpty()) break
-                    for (ch in data.data) {
-                        if (ch.id.toString() == chapterId) {
-                            cdnPath = ch.cdnPath ?: "cdn1"
-                            metadataImages = ch.metadata?.images ?: emptyList()
-                            ch.metadata?.maps?.let { mapsList.addAll(it) }
-                            break@outer
-                        }
-                    }
-                } catch (e: Exception) { break }
-                pg++
             }
         }
 
