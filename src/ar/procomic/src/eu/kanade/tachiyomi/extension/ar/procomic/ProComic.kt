@@ -83,7 +83,7 @@ class ProComic : HttpSource() {
                 val mergedBytes = reconstructPage(pageMap)
                     ?: return@addInterceptor Response.Builder()
                         .request(request).protocol(Protocol.HTTP_1_1)
-                        .code(500).message("Error")
+                        .code(500).message("Error Reconstructing Image")
                         .body("".toResponseBody(null)).build()
 
                 return@addInterceptor Response.Builder()
@@ -93,7 +93,15 @@ class ProComic : HttpSource() {
                     .build()
             }
 
-            val response = chain.proceed(request)
+            var response = chain.proceed(request)
+            var tryCount = 0
+            // معالجة ذكية لخطأ 502 عند جلب القطع لضمان إعادة المحاولة الفورية
+            while (response.code == 502 && tryCount < 3) {
+                tryCount++
+                response.close()
+                Thread.sleep(1000L * tryCount)
+                response = chain.proceed(request)
+            }
 
             val isPotentialBase64Image = response.isSuccessful && request.method == "GET" &&
                 url.contains("/i/") && url.contains("procomic")
@@ -132,7 +140,7 @@ class ProComic : HttpSource() {
         .add("Referer", "$baseUrl/")
         .add("Origin", baseUrl)
         .add("Accept-Language", "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7")
-        .add("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
+        .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
     override fun popularMangaRequest(page: Int) = GET(
         "$baseUrl/api/public/content/latest-updates?limit=600&category=comics&page=$page",
@@ -218,10 +226,10 @@ class ProComic : HttpSource() {
         val seriesType = parts.getOrElse(0) { "manga" }
         val seriesId = parts.getOrElse(1) { "0" }
         val chapterId = parts.getOrElse(2) { "0" }
+        val chapterNum = parts.getOrElse(3) { "1" }
 
         val url = "$baseUrl/api/public/$seriesType/$seriesId/chapters?page=1&limit=3&order=desc&_cid=$chapterId"
-        
-        val dynamicReferer = "$baseUrl/series/$seriesType/$seriesId/reading/$chapterId/1"
+        val dynamicReferer = "$baseUrl/series/$seriesType/$seriesId/reading/$chapterId/$chapterNum"
 
         return GET(url, headers.newBuilder()
             .set("Accept", "application/json")
