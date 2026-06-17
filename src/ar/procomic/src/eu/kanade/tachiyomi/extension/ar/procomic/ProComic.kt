@@ -135,7 +135,7 @@ class ProComic : HttpSource() {
         .add("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
 
     override fun popularMangaRequest(page: Int) = GET(
-        "$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page",
+        "$baseUrl/api/public/content/latest-updates?limit=10&category=comics&page=$page",
         headers,
     )
 
@@ -149,7 +149,7 @@ class ProComic : HttpSource() {
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList) = GET(
-        "$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page" +
+        "$baseUrl/api/public/content/latest-updates?limit=10&category=comics&page=$page" +
             (if (query.isNotBlank()) "&q=$query" else ""),
         headers,
     )
@@ -191,7 +191,7 @@ class ProComic : HttpSource() {
         val seriesType = p.getOrElse(0) { "manga" }
         val seriesId = p.getOrElse(1) { "0" }
         return GET(
-            "$baseUrl/api/public/$seriesType/$seriesId/chapters?page=1&limit=500&order=desc",
+            "$baseUrl/api/public/$seriesType/$seriesId/chapters?page=1&limit=10&order=desc",
             headers,
         )
     }
