@@ -7,7 +7,6 @@ import android.util.Base64
 import okhttp3.Headers
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import tachiyomi.decoder.ImageDecoder
 import java.io.ByteArrayOutputStream
 
 object ProComicImageReconstructor {
@@ -42,11 +41,8 @@ object ProComicImageReconstructor {
                         bodyBytes = Base64.decode(base64Str, Base64.DEFAULT)
                     }
                     
-                    val bmp = if (ImageDecoder.isSupportedAndEnabled()) {
-                        ImageDecoder.decode(bodyBytes)
-                    } else {
-                        BitmapFactory.decodeByteArray(bodyBytes, 0, bodyBytes.size)
-                    }
+                    // استخدام الـ BitmapFactory المدمج لتجنب مشكلة اختلاف اصدار الـ ImageDecoder
+                    val bmp = BitmapFactory.decodeByteArray(bodyBytes, 0, bodyBytes.size)
                     bitmaps[targetIdx] = bmp
                 }
                 res.close()
