@@ -57,14 +57,13 @@ class ProComic : HttpSource() {
     companion object {
         private const val SCRAMBLED_SCHEME = "https://procomic.pro/__scrambled__/?map="
         private const val MAX_SAFE_HEIGHT = 6000
-        private const val PROXY_PLAN_RETRIES = 4
-        private const val PIECE_FETCH_RETRIES = 5
+        private const val DEFAULT_SPLIT = 3
     }
 
     private fun String.toAbsoluteUrl(cdnBase: String): String {
         return when {
             this.startsWith("http") -> this
-            this.startsWith("eyJ2IjoxLCJpdiI6IJ") -> "$cdnBase/i/$this"
+            this.startsWith("eyJ2IjoxLCJpdiI6I") -> "$cdnBase/i/$this"
             this.startsWith("/") -> "$cdnBase$this"
             else -> "$cdnBase/$this"
         }
@@ -98,10 +97,10 @@ class ProComic : HttpSource() {
 
             var response = chain.proceed(request)
             var tryCount = 0
-            while (response.code in listOf(502, 503, 429) && tryCount < 3) {
+            while (response.code in listOf(502, 503, 429) && tryCount < 4) {
                 tryCount++
                 response.close()
-                Thread.sleep(1500L * tryCount)
+                Thread.sleep(2000L * tryCount)
                 response = chain.proceed(request)
             }
 
@@ -141,10 +140,10 @@ class ProComic : HttpSource() {
         .add("Referer", "$baseUrl/")
         .add("Origin", baseUrl)
         .add("Accept-Language", "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7")
-        .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .add("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
 
     override fun popularMangaRequest(page: Int) = GET(
-        "$baseUrl/api/public/content/latest-updates?limit=600&category=comics&page=$page",
+        "$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page",
         headers,
     )
 
@@ -158,7 +157,7 @@ class ProComic : HttpSource() {
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList) = GET(
-        "$baseUrl/api/public/content/latest-updates?limit=600&category=comics&page=$page" +
+        "$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page" +
             (if (query.isNotBlank()) "&q=$query" else ""),
         headers,
     )
@@ -196,7 +195,7 @@ class ProComic : HttpSource() {
     override fun chapterListRequest(manga: SManga): Request {
         val p = manga.url.split("/")
         return GET(
-            "$baseUrl/api/public/${p[0]}/${p[1]}/chapters?page=1&limit=600&order=desc",
+            "$baseUrl/api/public/${p[0]}/${p[1]}/chapters?page=1&limit=500&order=desc",
             headers,
         )
     }
@@ -226,7 +225,7 @@ class ProComic : HttpSource() {
         val chapterNum = parts.getOrElse(3) { "1" }
         val dynamicReferer = "$baseUrl/series/$seriesType/$seriesId/reading/$chapterId/$chapterNum"
         return GET(
-            "$baseUrl/api/public/$seriesType/$seriesId/chapters?page=1&limit=3&order=desc&_cid=$chapterId",
+            "$baseUrl/api/public/$seriesType/$seriesId/chapters?page=1&limit=500&order=desc&_cid=$chapterId",
             headers.newBuilder()
                 .set("Accept", "application/json")
                 .set("Referer", dynamicReferer)
@@ -497,7 +496,7 @@ class ProComic : HttpSource() {
                 .set("Origin", baseUrl)
                 .build()
 
-            while (!proxySuccess && attempt < PROXY_PLAN_RETRIES) {
+            while (!proxySuccess && attempt < 4) {
                 attempt++
                 try {
                     val fallbackMap = DeferredPageMap(token = finalMap.mapToken!!)
@@ -522,7 +521,7 @@ class ProComic : HttpSource() {
                         }
                     }
                 } catch (_: Exception) {
-                    Thread.sleep(1000L * attempt)
+                    Thread.sleep(1500L * attempt)
                 }
             }
             if (!proxySuccess) return null
@@ -547,17 +546,12 @@ class ProComic : HttpSource() {
             var pieceDownloaded = false
             var pAttempt = 0
             
-            val parsedUri = pieceUrl.toHttpUrl()
-            val authorityHost = parsedUri.host
-
             val pieceHeaders = headers.newBuilder()
-                .set("Host", authorityHost)
                 .set("Referer", finalMap.dynamicReferer)
                 .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
-                .set("Accept-Encoding", "gzip, deflate, br")
                 .build()
 
-            while (!pieceDownloaded && pAttempt < PIECE_FETCH_RETRIES) {
+            while (!pieceDownloaded && pAttempt < 5) {
                 pAttempt++
                 try {
                     val req = Request.Builder().url(pieceUrl).headers(pieceHeaders).build()
@@ -580,13 +574,13 @@ class ProComic : HttpSource() {
                             bitmaps[targetIdx] = decodeAvif(finalBytes)
                             pieceDownloaded = bitmaps[targetIdx] != null
                         } else if (resp.code in listOf(502, 503, 429)) {
-                            Thread.sleep(1000L * pAttempt)
+                            Thread.sleep(1500L * pAttempt)
                         } else {
                             break 
                         }
                     }
                 } catch (_: Exception) {
-                    Thread.sleep(1000L * pAttempt)
+                    Thread.sleep(1500L * pAttempt)
                 }
             }
         }
@@ -733,8 +727,6 @@ class ProComic : HttpSource() {
 
     private inline fun <reified T> Response.parseAs(): T = json.decodeFromStream(body.byteStream())
 }
-
-private const val DEFAULT_SPLIT = 3
 
 @Serializable
 data class LazyScrambledMap(
