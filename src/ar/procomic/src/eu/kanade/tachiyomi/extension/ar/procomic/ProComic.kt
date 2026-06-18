@@ -64,15 +64,15 @@ class ProComic : HttpSource() {
     private fun String.toAbsoluteUrl(cdnBase: String): String {
         return when {
             this.startsWith("http") -> this
-            this.startsWith("eyJ") -> "$cdnBase/i/$this"
+            this.startsWith("eyJ2IjoxLCJpdiI6IJ") -> "$cdnBase/i/$this"
             this.startsWith("/") -> "$cdnBase$this"
             else -> "$cdnBase/$this"
         }
     }
 
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(90, TimeUnit.SECONDS)
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
         .rateLimit(2, 1)
         .addInterceptor { chain ->
             val request = chain.request()
