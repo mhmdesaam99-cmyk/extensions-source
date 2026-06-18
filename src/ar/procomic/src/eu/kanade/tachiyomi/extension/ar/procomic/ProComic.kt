@@ -20,6 +20,7 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.decodeFromStream
 import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
@@ -54,8 +55,6 @@ class ProComic : HttpSource() {
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
     companion object {
-        // SCRAMBLED_SCHEME يحمل الآن LazyScrambledMap (token + metadata) بدلاً من pieces مباشرة
-        // هذا يحل مشكلة 502: الـ piece URLs تُجلب لحظة العرض وليس لحظة بناء قائمة الصفحات
         private const val SCRAMBLED_SCHEME = "https://procomic.pro/__scrambled__/?map="
         private const val MAX_SAFE_HEIGHT = 6000
         private const val PROXY_PLAN_RETRIES = 4
@@ -97,7 +96,6 @@ class ProComic : HttpSource() {
                     .build()
             }
 
-            // Retry ذكي لأخطاء CDN المؤقتة
             var response = chain.proceed(request)
             var tryCount = 0
             while (response.code in listOf(502, 503, 429) && tryCount < 3) {
@@ -107,7 +105,6 @@ class ProComic : HttpSource() {
                 response = chain.proceed(request)
             }
 
-            // معالجة الصور المُرجَعة كـ base64 data URI
             val isImageEndpoint = response.isSuccessful &&
                 request.method == "GET" &&
                 url.contains("/i/") &&
@@ -146,8 +143,6 @@ class ProComic : HttpSource() {
         .add("Accept-Language", "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7")
         .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-    // ─── Popular / Latest ────────────────────────────────────────────────────
-
     override fun popularMangaRequest(page: Int) = GET(
         "$baseUrl/api/public/content/latest-updates?limit=600&category=comics&page=$page",
         headers,
@@ -162,8 +157,6 @@ class ProComic : HttpSource() {
     override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
 
-    // ─── Search ──────────────────────────────────────────────────────────────
-
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList) = GET(
         "$baseUrl/api/public/content/latest-updates?limit=600&category=comics&page=$page" +
             (if (query.isNotBlank()) "&q=$query" else ""),
@@ -171,8 +164,6 @@ class ProComic : HttpSource() {
     )
 
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
-
-    // ─── Manga Details ───────────────────────────────────────────────────────
 
     override fun mangaDetailsRequest(manga: SManga): Request {
         val p = manga.url.split("/")
@@ -202,8 +193,6 @@ class ProComic : HttpSource() {
         } catch (e: Exception) { SManga.create() }
     }
 
-    // ─── Chapter List ────────────────────────────────────────────────────────
-
     override fun chapterListRequest(manga: SManga): Request {
         val p = manga.url.split("/")
         return GET(
@@ -229,8 +218,6 @@ class ProComic : HttpSource() {
         }
     }
 
-    // ─── Page List ───────────────────────────────────────────────────────────
-
     override fun pageListRequest(chapter: SChapter): Request {
         val parts = chapter.url.split("/")
         val seriesType = parts.getOrElse(0) { "manga" }
@@ -254,7 +241,6 @@ class ProComic : HttpSource() {
         val seriesType = parts.getOrElse(idx + 1) { "manga" }
         val seriesId = parts.getOrElse(idx + 2) { "0" }
 
-        // الـ Referer الديناميكي يُستخدم لجميع طلبات هذا الفصل
         val dynamicReferer = "$baseUrl/series/$seriesType/$seriesId/reading/$chapterId/1"
         val apiHeaders = headers.newBuilder()
             .set("Accept", "application/json")
@@ -263,7 +249,6 @@ class ProComic : HttpSource() {
 
         val pages = mutableListOf<Page>()
 
-        // session key (يُجلب مرة واحدة فقط عند الحاجة)
         var cachedSessionKey: String? = null
         var sessionKeyAttempted = false
         val getSessionKey: () -> String? = {
@@ -281,7 +266,6 @@ class ProComic : HttpSource() {
             cachedSessionKey
         }
 
-        // ── بيانات الفصل من chapter list API ──────────────────────────────
         var cdnPath = "cdn1"
         var metadataImages = emptyList<String>()
         val staticMaps = mutableListOf<DeferredPageMap>()
@@ -294,11 +278,8 @@ class ProComic : HttpSource() {
                 metadataImages = ch.metadata?.images ?: emptyList()
                 ch.metadata?.maps?.forEach { map ->
                     when {
-                        // JWT token -> يحتاج deferred flow كامل
                         map.token.isJwt() -> jwtTokens.add(map.token)
-                        // browser_session token مباشرة في metadata (نادر)
                         map.token.isNotBlank() -> staticMaps.add(map)
-                        // pieces جاهزة
                         map.pieces.isNotEmpty() -> staticMaps.add(map)
                     }
                 }
@@ -308,21 +289,18 @@ class ProComic : HttpSource() {
 
         val cdnBase = "https://$cdnPath.procomic.pro"
         val seenMapTokens = mutableSetOf<String>()
-
-        // ── صور مباشرة من metadata ────────────────────────────────────────
         val seenUrls = mutableSetOf<String>()
+
         metadataImages.forEach { imgPath ->
             val fullUrl = imgPath.toAbsoluteUrl(cdnBase)
             if (seenUrls.add(fullUrl)) pages.add(Page(pages.size, imageUrl = fullUrl))
         }
 
-        // ── static maps من metadata ───────────────────────────────────────
         staticMaps.forEach { map ->
             enqueueMap(map, chapterId, cdnBase, dynamicReferer, apiHeaders, getSessionKey,
                 pages, seenUrls, seenMapTokens)
         }
 
-        // ── JWT deferred flow ─────────────────────────────────────────────
         for (jwtToken in jwtTokens) {
             try {
                 val newPages = fetchDeferredPages(
@@ -335,8 +313,6 @@ class ProComic : HttpSource() {
 
         return pages
     }
-
-    // ─── Deferred Pages ──────────────────────────────────────────────────────
 
     private fun fetchDeferredPages(
         chapterId: String,
@@ -364,13 +340,11 @@ class ProComic : HttpSource() {
                 val parsed = resp.parseAs<ChapterDeferredResponse>()
                 if (!parsed.success || parsed.data == null) continue
 
-                // صور مباشرة في هذا الـ split
                 parsed.data.images.forEach { url ->
                     val fullUrl = url.toAbsoluteUrl(cdnBase)
                     if (seenUrls.add(fullUrl)) pages.add(Page(pages.size, imageUrl = fullUrl))
                 }
 
-                // maps في هذا الـ split
                 parsed.data.maps.forEach { map ->
                     enqueueMap(map, chapterId, cdnBase, dynamicReferer, apiHeaders,
                         getSessionKey, pages, seenUrls, seenMapTokens)
@@ -381,10 +355,6 @@ class ProComic : HttpSource() {
         }
         return pages
     }
-
-    // ─── enqueueMap ──────────────────────────────────────────────────────────
-    // يُحوّل كل map إلى LazyScrambledMap URL بدلاً من جلب الـ pieces الآن.
-    // الـ pieces تُجلب لحظة عرض الصورة (في resolveAndReconstructPage) لضمان freshness.
 
     private fun enqueueMap(
         map: DeferredPageMap,
@@ -398,7 +368,6 @@ class ProComic : HttpSource() {
         seenMapTokens: MutableSet<String>,
     ) {
         when {
-            // ── الحالة 1: pieces جاهزة مباشرة ────────────────────────────
             map.pieces.isNotEmpty() -> {
                 val firstPiece = map.pieces.first().toAbsoluteUrl(cdnBase)
                 if (!seenUrls.add(firstPiece)) return
@@ -415,11 +384,8 @@ class ProComic : HttpSource() {
                     pages = pages,
                 )
             }
-
-            // ── الحالة 2: browser_session token → تخزين lazy ──────────────
             map.token.isNotBlank() && !map.token.isJwt() -> {
                 if (!seenMapTokens.add(map.token)) return
-                // نبني lazy URL بدون جلب الـ pieces الآن
                 buildLazyScrambledPage(
                     chapterId = chapterId,
                     mapToken = map.token,
@@ -428,8 +394,6 @@ class ProComic : HttpSource() {
                     pages = pages,
                 )
             }
-
-            // ── الحالة 3: token يمكن فك تشفيره بـ sessionKey ──────────────
             map.token.isNotBlank() -> {
                 if (!seenMapTokens.add(map.token)) return
                 val sk = getSessionKey()
@@ -448,7 +412,6 @@ class ProComic : HttpSource() {
                         pages = pages,
                     )
                 } else {
-                    // fallback: lazy
                     buildLazyScrambledPage(
                         chapterId = chapterId,
                         mapToken = map.token,
@@ -460,9 +423,6 @@ class ProComic : HttpSource() {
             }
         }
     }
-
-    // ─── بناء Lazy Page URL ──────────────────────────────────────────────────
-    // يخزن token + metadata فقط. الـ pieces تُجلب عند العرض.
 
     private fun buildLazyScrambledPage(
         chapterId: String,
@@ -476,7 +436,6 @@ class ProComic : HttpSource() {
             mapToken = mapToken,
             cdnBase = cdnBase,
             dynamicReferer = dynamicReferer,
-            // dim/mode/order/splitPart/totalParts مجهولة حتى يتم fetch الـ proxy-plan
         )
         val encoded = Base64.encodeToString(
             json.encodeToString(lazyMap).toByteArray(Charsets.UTF_8),
@@ -484,8 +443,6 @@ class ProComic : HttpSource() {
         )
         pages.add(Page(pages.size, imageUrl = "$SCRAMBLED_SCHEME$encoded"))
     }
-
-    // ─── بناء Eager Scrambled Pages (pieces معروفة مسبقاً) ──────────────────
 
     private fun buildScrambledPages(
         dim: List<Int>,
@@ -500,12 +457,13 @@ class ProComic : HttpSource() {
         pages: MutableList<Page>,
     ) {
         val estimatedTotalH = dim.getOrNull(1)?.takeIf { it > 0 } ?: 10000
-        val totalParts = if (estimatedTotalH > MAX_SAFE_HEIGHT) {
+        val parts = if (estimatedTotalH > MAX_SAFE_HEIGHT) {
             ceil(estimatedTotalH.toDouble() / MAX_SAFE_HEIGHT).toInt()
         } else {
             1
         }
-        for (p in 0 until totalParts) {
+
+        for (p in 0 until parts) {
             val lazyMap = LazyScrambledMap(
                 chapterId = chapterId,
                 mapToken = mapToken,
@@ -517,7 +475,7 @@ class ProComic : HttpSource() {
                 order = order,
                 signedToken = signedToken,
                 splitPart = p,
-                totalParts = totalParts,
+                totalParts = parts,
             )
             val encoded = Base64.encodeToString(
                 json.encodeToString(lazyMap).toByteArray(Charsets.UTF_8),
@@ -527,151 +485,110 @@ class ProComic : HttpSource() {
         }
     }
 
-    // ─── resolveAndReconstructPage ───────────────────────────────────────────
-    // يُستدعى من الـ interceptor عند طلب SCRAMBLED_SCHEME URL.
-    // إذا كانت الـ pieces فارغة: يجلب proxy-plan أولاً (fresh URLs).
-
     private fun resolveAndReconstructPage(lazyMap: LazyScrambledMap): ByteArray? {
-        // الحالة 1: pieces موجودة مسبقاً (eager map)
-        if (lazyMap.pieces.isNotEmpty()) {
-            return reconstructPage(
-                dim = lazyMap.dim,
-                mode = lazyMap.mode,
-                pieces = lazyMap.pieces,
-                order = lazyMap.order,
-                signedToken = lazyMap.signedToken ?: "",
-                splitPart = lazyMap.splitPart ?: 0,
-                totalParts = lazyMap.totalParts ?: 1,
-                dynamicReferer = lazyMap.dynamicReferer,
-            )
-        }
+        var finalMap: LazyScrambledMap = lazyMap
 
-        // الحالة 2: lazy map – يجب جلب proxy-plan للحصول على fresh pieces
-        if (lazyMap.mapToken.isNullOrBlank() || lazyMap.chapterId.isNullOrBlank()) return null
-
-        val apiHeaders = headers.newBuilder()
-            .set("Accept", "application/json")
-            .set("Referer", lazyMap.dynamicReferer)
-            .set("Origin", baseUrl)
-            .build()
-
-        // محاولة جلب proxy-plan مع retry عند 502
-        var resolvedMap: DeferredPageMap? = null
-        repeat(PROXY_PLAN_RETRIES) { attempt ->
-            if (resolvedMap != null) return@repeat
-            try {
-                val bodyStr = json.encodeToString(
-                    DeferredPageMap(token = lazyMap.mapToken, method = "browser_session"),
-                )
-                val resp = client.newCall(
-                    POST(
-                        "$baseUrl/chapter-map-proxy-plan/${lazyMap.chapterId}",
-                        apiHeaders,
-                        bodyStr.toRequestBody("application/json".toMediaType()),
-                    ),
-                ).execute()
-                if (resp.isSuccessful) {
-                    val result = resp.parseAs<ProxyPlanResponse>()
-                    if (result.success && result.data?.map != null) {
-                        resolvedMap = result.data.map
-                    }
-                } else if (resp.code == 502 || resp.code == 503) {
-                    resp.close()
-                    Thread.sleep(1500L * (attempt + 1))
-                }
-            } catch (_: Exception) {
-                Thread.sleep(1000L * (attempt + 1))
-            }
-        }
-
-        val rm = resolvedMap ?: return null
-        if (rm.pieces.isEmpty()) return null
-
-        val pieces = rm.pieces.map { it.toAbsoluteUrl(lazyMap.cdnBase) }
-        val estimatedTotalH = rm.dim.getOrNull(1)?.takeIf { it > 0 } ?: 10000
-        val totalParts = if (estimatedTotalH > MAX_SAFE_HEIGHT) {
-            ceil(estimatedTotalH.toDouble() / MAX_SAFE_HEIGHT).toInt()
-        } else {
-            1
-        }
-
-        return reconstructPage(
-            dim = rm.dim,
-            mode = rm.mode,
-            pieces = pieces,
-            order = rm.order,
-            signedToken = rm.token,
-            splitPart = lazyMap.splitPart ?: 0,
-            totalParts = totalParts,
-            dynamicReferer = lazyMap.dynamicReferer,
-        )
-    }
-
-    // ─── reconstructPage ─────────────────────────────────────────────────────
-
-    private fun reconstructPage(
-        dim: List<Int>,
-        mode: String,
-        pieces: List<String>,
-        order: List<Int>,
-        signedToken: String,
-        splitPart: Int,
-        totalParts: Int,
-        dynamicReferer: String,
-    ): ByteArray? {
-        if (pieces.isEmpty()) return null
-        val (cols, rows) = parseMode(mode, pieces.size)
-        val bitmaps = arrayOfNulls<Bitmap>(pieces.size)
-
-        for (targetIdx in pieces.indices) {
-            val srcIdx = if (order.size == pieces.size) order[targetIdx] else targetIdx
-            val basePieceUrl = pieces.getOrNull(srcIdx) ?: continue
-
-            val pieceUrl = when {
-                signedToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ") ->
-                    if (basePieceUrl.contains("?")) "$basePieceUrl&token=$signedToken"
-                    else "$basePieceUrl?token=$signedToken"
-                else -> basePieceUrl
-            }
-
-            val req = Request.Builder()
-                .url(pieceUrl)
-                .header("Referer", "$baseUrl/")
-                .header("Accept", "image/avif,image/webp,image/jpeg,*/*")
-                .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
+        if (finalMap.pieces.isEmpty() && !finalMap.chapterId.isNullOrBlank() && !finalMap.mapToken.isNullOrBlank()) {
+            var proxySuccess = false
+            var attempt = 0
+            val apiHeaders = headers.newBuilder()
+                .set("Accept", "application/json")
+                .set("Referer", finalMap.dynamicReferer)
+                .set("Origin", baseUrl)
                 .build()
 
-            // retry مع exponential backoff خاص بجلب الـ pieces
-            var bitmap: Bitmap? = null
-            repeat(PIECE_FETCH_RETRIES) { attempt ->
-                if (bitmap != null) return@repeat
+            while (!proxySuccess && attempt < PROXY_PLAN_RETRIES) {
+                attempt++
                 try {
-                    client.newCall(req).execute().use { resp ->
-                        if (!resp.isSuccessful) {
-                            if (resp.code == 502 || resp.code == 503) {
-                                Thread.sleep(1000L * (attempt + 1))
+                    val fallbackMap = DeferredPageMap(token = finalMap.mapToken!!)
+                    val bodyStr = json.encodeToString(fallbackMap)
+                    val body = bodyStr.toRequestBody("application/json".toMediaType())
+                    val proxyReq = POST("$baseUrl/chapter-map-proxy-plan/${finalMap.chapterId}", apiHeaders, body)
+                    
+                    client.newCall(proxyReq).execute().use { resp ->
+                        if (resp.isSuccessful) {
+                            val parsed = resp.parseAs<ProxyPlanResponse>()
+                            val resolved = parsed.data?.map
+                            if (resolved != null && resolved.pieces.isNotEmpty()) {
+                                finalMap = finalMap.copy(
+                                    dim = resolved.dim,
+                                    mode = resolved.mode,
+                                    pieces = resolved.pieces.map { it.toAbsoluteUrl(finalMap.cdnBase) },
+                                    order = resolved.order,
+                                    signedToken = resolved.token,
+                                )
+                                proxySuccess = true
                             }
-                            return@use
                         }
-                        val bodyBytes = resp.body?.bytes() ?: return@use
-                        val finalBytes = if (bodyBytes.size > 5 &&
-                            bodyBytes[0] == 'd'.code.toByte() &&
-                            bodyBytes[1] == 'a'.code.toByte() &&
-                            bodyBytes[2] == 't'.code.toByte() &&
-                            bodyBytes[3] == 'a'.code.toByte() &&
-                            bodyBytes[4] == ':'.code.toByte()
-                        ) {
-                            Base64.decode(String(bodyBytes).substringAfter("base64,"), Base64.DEFAULT)
-                        } else {
-                            bodyBytes
-                        }
-                        bitmap = decodeAvif(finalBytes)
                     }
                 } catch (_: Exception) {
-                    Thread.sleep(800L * (attempt + 1))
+                    Thread.sleep(1000L * attempt)
                 }
             }
-            bitmaps[targetIdx] = bitmap
+            if (!proxySuccess) return null
+        }
+
+        if (finalMap.pieces.isEmpty()) return null
+
+        val (cols, rows) = parseMode(finalMap.mode ?: "", finalMap.pieces.size)
+        val bitmaps = arrayOfNulls<Bitmap>(finalMap.pieces.size)
+
+        for (targetIdx in finalMap.pieces.indices) {
+            val srcIdx = if (finalMap.order.size == finalMap.pieces.size) finalMap.order[targetIdx] else targetIdx
+            val basePieceUrl = finalMap.pieces.getOrNull(srcIdx) ?: continue
+
+            val pieceUrl = if (!finalMap.signedToken.isNullOrBlank() && !basePieceUrl.contains("/i/eyJ")) {
+                if (basePieceUrl.contains("?")) "$basePieceUrl&token=${finalMap.signedToken}"
+                else "$basePieceUrl?token=${finalMap.signedToken}"
+            } else {
+                basePieceUrl
+            }
+
+            var pieceDownloaded = false
+            var pAttempt = 0
+            
+            val parsedUri = pieceUrl.toHttpUrl()
+            val authorityHost = parsedUri.host
+
+            val pieceHeaders = headers.newBuilder()
+                .set("Host", authorityHost)
+                .set("Referer", finalMap.dynamicReferer)
+                .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+                .set("Accept-Encoding", "gzip, deflate, br")
+                .build()
+
+            while (!pieceDownloaded && pAttempt < PIECE_FETCH_RETRIES) {
+                pAttempt++
+                try {
+                    val req = Request.Builder().url(pieceUrl).headers(pieceHeaders).build()
+                    client.newCall(req).execute().use { resp ->
+                        if (resp.isSuccessful) {
+                            val bodyBytes = resp.body.bytes()
+                            val isBase64Text = bodyBytes.size > 5 &&
+                                bodyBytes[0] == 'd'.code.toByte() &&
+                                bodyBytes[1] == 'a'.code.toByte() &&
+                                bodyBytes[2] == 't'.code.toByte() &&
+                                bodyBytes[3] == 'a'.code.toByte() &&
+                                bodyBytes[4] == ':'.code.toByte()
+
+                            val finalBytes = if (isBase64Text) {
+                                val base64Data = String(bodyBytes).substringAfter("base64,")
+                                Base64.decode(base64Data, Base64.DEFAULT)
+                            } else {
+                                bodyBytes
+                            }
+                            bitmaps[targetIdx] = decodeAvif(finalBytes)
+                            pieceDownloaded = bitmaps[targetIdx] != null
+                        } else if (resp.code in listOf(502, 503, 429)) {
+                            Thread.sleep(1000L * pAttempt)
+                        } else {
+                            break 
+                        }
+                    }
+                } catch (_: Exception) {
+                    Thread.sleep(1000L * pAttempt)
+                }
+            }
         }
 
         return try {
@@ -680,23 +597,29 @@ class ProComic : HttpSource() {
 
             val calcTotalW: Int
             val calcTotalH: Int
+
+            val mapDim = finalMap.dim
             when {
                 cols == 1 -> {
-                    calcTotalW = dim.getOrNull(0)?.takeIf { it > 0 } ?: validBitmaps.maxOf { it.width }
-                    calcTotalH = dim.getOrNull(1)?.takeIf { it > 0 } ?: validBitmaps.sumOf { it.height }
+                    calcTotalW = mapDim.getOrNull(0)?.takeIf { it > 0 } ?: validBitmaps.maxOf { it.width }
+                    calcTotalH = mapDim.getOrNull(1)?.takeIf { it > 0 } ?: validBitmaps.sumOf { it.height }
                 }
                 rows == 1 -> {
-                    calcTotalW = dim.getOrNull(0)?.takeIf { it > 0 } ?: validBitmaps.sumOf { it.width }
-                    calcTotalH = dim.getOrNull(1)?.takeIf { it > 0 } ?: validBitmaps.maxOf { it.height }
+                    calcTotalW = mapDim.getOrNull(0)?.takeIf { it > 0 } ?: validBitmaps.sumOf { it.width }
+                    calcTotalH = mapDim.getOrNull(1)?.takeIf { it > 0 } ?: validBitmaps.maxOf { it.height }
                 }
                 else -> {
-                    calcTotalW = dim.getOrNull(0)?.takeIf { it > 0 } ?: (validBitmaps.first().width * cols)
-                    calcTotalH = dim.getOrNull(1)?.takeIf { it > 0 } ?: (validBitmaps.first().height * rows)
+                    val firstBmp = validBitmaps.first()
+                    calcTotalW = mapDim.getOrNull(0)?.takeIf { it > 0 } ?: (firstBmp.width * cols)
+                    calcTotalH = mapDim.getOrNull(1)?.takeIf { it > 0 } ?: (firstBmp.height * rows)
                 }
             }
 
+            val totalParts = finalMap.totalParts ?: 1
+            val splitPart = finalMap.splitPart ?: 0
             val partH = calcTotalH / totalParts
             val actualPartH = if (splitPart == totalParts - 1) calcTotalH - (partH * splitPart) else partH
+
             if (calcTotalW <= 0 || actualPartH <= 0) return null
 
             val result = try {
@@ -710,24 +633,33 @@ class ProComic : HttpSource() {
             when {
                 cols == 1 -> {
                     var currentY = 0f
-                    bitmaps.forEach { bmp ->
-                        if (bmp != null) { canvas.drawBitmap(bmp, 0f, currentY, null); currentY += bmp.height; bmp.recycle() }
+                    for (bmp in bitmaps) {
+                        if (bmp != null) {
+                            canvas.drawBitmap(bmp, 0f, currentY, null)
+                            currentY += bmp.height
+                            bmp.recycle()
+                        }
                     }
                 }
                 rows == 1 -> {
                     var currentX = 0f
-                    bitmaps.forEach { bmp ->
-                        if (bmp != null) { canvas.drawBitmap(bmp, currentX, 0f, null); currentX += bmp.width; bmp.recycle() }
+                    for (bmp in bitmaps) {
+                        if (bmp != null) {
+                            canvas.drawBitmap(bmp, currentX, 0f, null)
+                            currentX += bmp.width
+                            bmp.recycle()
+                        }
                     }
                 }
                 else -> {
                     val tileW = validBitmaps.first().width
                     val tileH = validBitmaps.first().height
-                    bitmaps.forEachIndexed { targetIdx, bmp ->
-                        if (bmp != null) {
-                            canvas.drawBitmap(bmp, (targetIdx % cols * tileW).toFloat(), (targetIdx / cols * tileH).toFloat(), null)
-                            bmp.recycle()
-                        }
+                    for (targetIdx in bitmaps.indices) {
+                        val bmp = bitmaps[targetIdx] ?: continue
+                        val col = targetIdx % cols
+                        val row = targetIdx / cols
+                        canvas.drawBitmap(bmp, (col * tileW).toFloat(), (row * tileH).toFloat(), null)
+                        bmp.recycle()
                     }
                 }
             }
@@ -736,34 +668,29 @@ class ProComic : HttpSource() {
             result.compress(Bitmap.CompressFormat.JPEG, 85, out)
             result.recycle()
             out.toByteArray()
-        } catch (_: Exception) { null }
-    }
-
-    // ─── Helpers ─────────────────────────────────────────────────────────────
-
-    private fun String.isJwt() = startsWith("eyJhbGci") && count { it == '.' } == 2
-
-    private fun jwtSplitValue(jwtToken: String): Int {
-        return try {
-            val seg = jwtToken.split(".").getOrNull(1) ?: return DEFAULT_SPLIT
-            val padded = seg.padEnd(seg.length + (4 - seg.length % 4) % 4, '=')
-            json.decodeFromString<JwtPayload>(String(Base64.decode(padded, Base64.URL_SAFE))).split
-        } catch (_: Exception) { DEFAULT_SPLIT }
+        } catch (e: Exception) {
+            null
+        }
     }
 
     private fun decryptMap(tokenStr: String, sessionKeyBase64: String): DeferredPageMap? {
         return try {
-            val tokenData = json.decodeFromString<EncryptedToken>(
-                String(Base64.decode(tokenStr, Base64.URL_SAFE or Base64.DEFAULT)),
-            )
+            val tokenJsonStr = String(Base64.decode(tokenStr, Base64.URL_SAFE or Base64.DEFAULT))
+            val tokenData = json.decodeFromString<EncryptedToken>(tokenJsonStr)
+
             val keyBytes = Base64.decode(sessionKeyBase64, Base64.URL_SAFE)
+            val secretKey = SecretKeySpec(keyBytes, "AES")
             val ivBytes = Base64.decode(tokenData.iv, Base64.URL_SAFE)
             val tagBytes = Base64.decode(tokenData.tag, Base64.URL_SAFE)
-            val cipherBytes = Base64.decode(tokenData.data, Base64.URL_SAFE)
+            val cipherTextBytes = Base64.decode(tokenData.data, Base64.URL_SAFE)
+
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), GCMParameterSpec(128, ivBytes))
-            json.decodeFromString<DeferredPageMap>(String(cipher.doFinal(cipherBytes + tagBytes)))
-        } catch (_: Exception) { null }
+            cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(128, ivBytes))
+            val decryptedBytes = cipher.doFinal(cipherTextBytes + tagBytes)
+            json.decodeFromString<DeferredPageMap>(String(decryptedBytes))
+        } catch (e: Exception) {
+            null
+        }
     }
 
     private fun decodeAvif(bytes: ByteArray): Bitmap? {
@@ -789,34 +716,34 @@ class ProComic : HttpSource() {
         else -> Pair(1, pieceCount)
     }
 
+    private fun String.isJwt(): Boolean = startsWith("eyJhbGci") && count { it == '.' } == 2
+
+    private fun jwtSplitValue(jwtToken: String): Int {
+        return try {
+            val payloadSegment = jwtToken.split(".").getOrNull(1) ?: return DEFAULT_SPLIT
+            val padded = payloadSegment.padEnd(payloadSegment.length + (4 - payloadSegment.length % 4) % 4, '=')
+            val payloadJson = String(Base64.decode(padded, Base64.URL_SAFE))
+            json.decodeFromString<JwtPayload>(payloadJson).split
+        } catch (e: Exception) {
+            DEFAULT_SPLIT
+        }
+    }
+
     override fun imageUrlParse(response: Response) = ""
 
-    private inline fun <reified T> Response.parseAs(): T =
-        json.decodeFromStream(body.byteStream())
+    private inline fun <reified T> Response.parseAs(): T = json.decodeFromStream(body.byteStream())
 }
-
-// ─── Constants ───────────────────────────────────────────────────────────────
 
 private const val DEFAULT_SPLIT = 3
 
-// ─── Data Classes ────────────────────────────────────────────────────────────
-
-/**
- * LazyScrambledMap: يُخزَّن في SCRAMBLED_SCHEME URL بدلاً من ScrambledMap القديم.
- *
- * إذا كانت [pieces] فارغة:
- *   → الـ interceptor يجلب proxy-plan بـ [mapToken] ليحصل على fresh pieces لحظة العرض.
- * إذا كانت [pieces] ممتلئة:
- *   → يعيد البناء مباشرة بدون أي طلب شبكة إضافي.
- */
 @Serializable
 data class LazyScrambledMap(
     val chapterId: String? = null,
     val mapToken: String? = null,
-    val cdnBase: String = "https://cdn1.procomic.pro",
-    val dynamicReferer: String = "https://procomic.pro/",
+    val cdnBase: String,
+    val dynamicReferer: String,
     val dim: List<Int> = emptyList(),
-    val mode: String = "",
+    val mode: String? = null,
     val pieces: List<String> = emptyList(),
     val order: List<Int> = emptyList(),
     val signedToken: String? = null,
@@ -825,36 +752,19 @@ data class LazyScrambledMap(
 )
 
 @Serializable
-data class JwtPayload(
-    val split: Int = DEFAULT_SPLIT,
-    val cid: Int = 0,
-    val p: String = "",
-)
+data class JwtPayload(val split: Int = DEFAULT_SPLIT, val cid: Int = 0, val p: String = "")
 
 @Serializable
-data class SessionKeyResponse(
-    val success: Boolean = false,
-    val data: SessionKeyData? = null,
-)
+data class SessionKeyResponse(val success: Boolean = false, val data: SessionKeyData? = null)
 
 @Serializable
 data class SessionKeyData(val key: String = "")
 
 @Serializable
-data class EncryptedToken(
-    val v: Int = 3,
-    val m: String = "",
-    val cid: Int = 0,
-    val iv: String = "",
-    val tag: String = "",
-    val data: String = "",
-)
+data class EncryptedToken(val v: Int = 3, val m: String = "", val cid: Int = 0, val iv: String = "", val tag: String = "", val data: String = "")
 
 @Serializable
-data class LatestUpdatesResponse(
-    val success: Boolean = false,
-    val data: List<SeriesDto> = emptyList(),
-)
+data class LatestUpdatesResponse(val success: Boolean = false, val data: List<SeriesDto> = emptyList())
 
 @Serializable
 data class SeriesDto(
@@ -880,72 +790,35 @@ data class CardImages(val mobile: String? = null, val desktop: String? = null)
 
 @Serializable
 data class SeriesDetailResponse(
-    val id: Int = 0,
-    val title: String? = null,
-    val slug: String? = null,
-    val coverImage: String? = null,
-    val coverImageApp: CoverImageApp? = null,
-    val author: String? = null,
-    val artist: String? = null,
-    val description: String? = null,
-    val synopsis: String? = null,
-    val status: String? = null,
+    val id: Int = 0, val title: String? = null, val slug: String? = null, val coverImage: String? = null,
+    val coverImageApp: CoverImageApp? = null, val author: String? = null, val artist: String? = null,
+    val description: String? = null, val synopsis: String? = null, val status: String? = null,
 )
 
 @Serializable
-data class ChaptersResponse(
-    val data: List<ChapterDto> = emptyList(),
-    val total: Int = 0,
-)
+data class ChaptersResponse(val data: List<ChapterDto> = emptyList(), val total: Int = 0)
 
 @Serializable
 data class ChapterDto(
-    val id: Int = 0,
-    @SerialName("chapter_number") val chapterNumber: String = "0",
-    val title: String? = null,
-    @SerialName("published_at") val publishedAt: String? = null,
-    val lockedByCoins: Boolean? = null,
-    @SerialName("cdn_path") val cdnPath: String? = null,
-    val metadata: ChapterMetadataDto? = null,
+    val id: Int = 0, @SerialName("chapter_number") val chapterNumber: String = "0", val title: String? = null,
+    @SerialName("published_at") val publishedAt: String? = null, val lockedByCoins: Boolean? = null,
+    @SerialName("cdn_path") val cdnPath: String? = null, val metadata: ChapterMetadataDto? = null,
 )
 
 @Serializable
-data class ChapterMetadataDto(
-    val images: List<String> = emptyList(),
-    val maps: List<DeferredPageMap> = emptyList(),
-)
+data class ChapterMetadataDto(val images: List<String> = emptyList(), val maps: List<DeferredPageMap> = emptyList())
 
 @Serializable
-data class ChapterDeferredResponse(
-    val success: Boolean = false,
-    val data: ChapterDeferredData? = null,
-)
+data class ChapterDeferredResponse(val success: Boolean = false, val data: ChapterDeferredData? = null)
 
 @Serializable
-data class ChapterDeferredData(
-    val chapterId: Int = 0,
-    val splitIndex: Int = 0,
-    val images: List<String> = emptyList(),
-    val maps: List<DeferredPageMap> = emptyList(),
-)
+data class ChapterDeferredData(val chapterId: Int = 0, val splitIndex: Int = 0, val images: List<String> = emptyList(), val maps: List<DeferredPageMap> = emptyList())
 
 @Serializable
-data class DeferredPageMap(
-    val dim: List<Int> = emptyList(),
-    val mode: String = "",
-    val pieces: List<String> = emptyList(),
-    val order: List<Int> = emptyList(),
-    val token: String = "",
-    val method: String = "",
-)
+data class DeferredPageMap(val dim: List<Int> = emptyList(), val mode: String = "", val pieces: List<String> = emptyList(), val order: List<Int> = emptyList(), val token: String = "", val method: String = "")
 
 @Serializable
-data class ProxyPlanResponse(
-    val success: Boolean = false,
-    val data: ProxyPlanData? = null,
-)
+data class ProxyPlanResponse(val success: Boolean = false, val data: ProxyPlanData? = null)
 
 @Serializable
-data class ProxyPlanData(
-    val map: DeferredPageMap? = null,
-)
+data class ProxyPlanData(val map: DeferredPageMap? = null)
