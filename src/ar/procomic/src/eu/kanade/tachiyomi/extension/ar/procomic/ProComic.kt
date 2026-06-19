@@ -68,10 +68,12 @@ class ProComic : HttpSource() {
         }
     }
 
+    // تهيئة مخصصة لدعم بروتوكولات المتصفح الحديثة لتخطي خطأ 520 و 502
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
-        .rateLimit(2, 1)
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1)) // إجبار التوافق مع HTTP/2 مثل المتصفحات
+        .rateLimit(1, 1) // زيادة الفارق الزمني لتجنب إثارة جدار الحماية
         .addInterceptor { chain ->
             val request = chain.request()
             val url = request.url.toString()
@@ -129,11 +131,19 @@ class ProComic : HttpSource() {
         }
         .build()
 
+    // تحديث الـ Headers لتطابق تماماً متصفح كروم على الأندرويد لتخطي حماية Cloudflare
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
         .add("Origin", baseUrl)
-        .add("Accept-Language", "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7")
-        .add("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
+        .add("Accept", "application/json, text/plain, */*")
+        .add("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
+        .add("Sec-Ch-Ua", "\"Not A;Brand\";v=\"99\", \"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\"")
+        .add("Sec-Ch-Ua-Mobile", "?1")
+        .add("Sec-Ch-Ua-Platform", "\"Android\"")
+        .add("Sec-Fetch-Dest", "empty")
+        .add("Sec-Fetch-Mode", "cors")
+        .add("Sec-Fetch-Site", "same-origin")
+        .add("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
 
     override fun popularMangaRequest(page: Int) = GET(
         "$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page",
@@ -223,7 +233,7 @@ class ProComic : HttpSource() {
             .addQueryParameter("_cid", chapterId)
             .build()
 
-        return GET(url, headers.newBuilder().set("Accept", "application/json").build())
+        return GET(url, headers)
     }
 
     override fun pageListParse(response: Response): List<Page> {
@@ -237,7 +247,6 @@ class ProComic : HttpSource() {
             parts.getOrElse(idx + 2) { "0" }
         }
 
-        val apiHeaders = headers.newBuilder().set("Accept", "application/json").build()
         val pages = mutableListOf<Page>()
         val seenUrls = mutableSetOf<String>()
 
@@ -253,7 +262,7 @@ class ProComic : HttpSource() {
                 sessionKeyAttempted = true
                 try {
                     val req = client.newCall(
-                        GET("$baseUrl/chapter-map-session-key/$chapterId?legacy=1", apiHeaders),
+                        GET("$baseUrl/chapter-map-session-key/$chapterId?legacy=1", headers),
                     ).execute()
                     if (req.isSuccessful) {
                         cachedSessionKey = req.parseAs<SessionKeyResponse>().data?.key
@@ -281,7 +290,7 @@ class ProComic : HttpSource() {
                     val resp = client.newCall(
                         GET(
                             "$baseUrl/api/public/$seriesType/$seriesId/chapters?limit=600&page=$pg&order=desc",
-                            apiHeaders,
+                            headers,
                         ),
                     ).execute()
                     if (!resp.isSuccessful) break
@@ -303,28 +312,23 @@ class ProComic : HttpSource() {
         val cdnBase = "https://$cdnPath.procomic.pro"
         val mapTokens = mutableListOf<String>()
 
-        // ── الطريقة القديمة: صور عادية مباشرة ────────────────────────────
         metadataImages.forEach { imgPath ->
             val fullUrl = imgPath.toAbsoluteUrl(cdnBase)
             if (seenUrls.add(fullUrl)) pages.add(Page(pages.size, imageUrl = fullUrl))
         }
 
-        // ── معالجة الـ maps من metadata الفصل ────────────────────────────
         mapsList.forEach { map ->
             when {
-                // الطريقة الجديدة: JWT token بدون pieces
                 map.token.isNotBlank() && map.pieces.isEmpty() && map.token.isJwt() -> {
                     mapTokens.add(map.token)
                 }
-                // الطريقة القديمة: token مشفر AES بدون pieces
                 map.token.isNotBlank() && map.pieces.isEmpty() -> {
-                    val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
+                    val resolved = resolveMap(map, chapterId, getSessionKey)
                     if (resolved != null && resolved.pieces.isNotEmpty()) {
                         val absolutePieces = resolved.pieces.map { it.toAbsoluteUrl(cdnBase) }
                         processMap(resolved.dim, resolved.mode, absolutePieces, resolved.order, resolved.token, pages, seenUrls)
                     }
                 }
-                // pieces موجودة مباشرة
                 map.pieces.isNotEmpty() -> {
                     val absolutePieces = map.pieces.map { it.toAbsoluteUrl(cdnBase) }
                     processMap(map.dim, map.mode, absolutePieces, map.order, map.token, pages, seenUrls)
@@ -332,10 +336,9 @@ class ProComic : HttpSource() {
             }
         }
 
-        // ── الطريقة الجديدة: جلب الصفحات عبر JWT tokens ──────────────────
         for (jwtToken in mapTokens) {
             try {
-                val newPages = fetchDeferredPages(chapterId, jwtToken, apiHeaders, seenUrls, cdnBase, getSessionKey)
+                val newPages = fetchDeferredPages(chapterId, jwtToken, seenUrls, cdnBase, getSessionKey)
                 pages.addAll(newPages)
             } catch (e: Exception) { }
         }
@@ -363,7 +366,6 @@ class ProComic : HttpSource() {
     private fun fetchDeferredPages(
         chapterId: String,
         jwtToken: String,
-        apiHeaders: Headers,
         seenUrls: MutableSet<String>,
         cdnBase: String,
         getSessionKey: () -> String?,
@@ -374,15 +376,8 @@ class ProComic : HttpSource() {
 
         for (s in 0..jwtSplit) {
             try {
-                // نطبق فكرة التمويه هنا أثناء طلب ميديا الفصول المؤجلة لمنع الـ 502
                 val mediaUrl = "$baseUrl/chapter-deferred-media/$chapterId?token=$jwtToken&split=$s"
-                val bypassedUrl = if (mediaUrl.contains("manhua") || mediaUrl.contains("manhwa")) {
-                    mediaUrl.replace("manhua", "man%68ua").replace("manhwa", "man%68wa")
-                } else {
-                    mediaUrl
-                }
-
-                val resp = client.newCall(GET(bypassedUrl, apiHeaders)).execute()
+                val resp = client.newCall(GET(mediaUrl, headers)).execute()
 
                 if (!resp.isSuccessful) continue
 
@@ -401,7 +396,7 @@ class ProComic : HttpSource() {
                 when {
                     map.token.isNotBlank() && map.pieces.isEmpty() && map.token.isJwt() -> { }
                     else -> {
-                        val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
+                        val resolved = resolveMap(map, chapterId, getSessionKey)
                         if (resolved != null && resolved.pieces.isNotEmpty()) {
                             decryptedMaps.add(resolved)
                             absolutePieceUrls.addAll(resolved.pieces.map { it.toAbsoluteUrl(cdnBase) })
@@ -429,7 +424,6 @@ class ProComic : HttpSource() {
     private fun resolveMap(
         map: DeferredPageMap,
         chapterId: String,
-        apiHeaders: Headers,
         getSessionKey: () -> String?,
     ): DeferredPageMap? {
         if (map.pieces.isNotEmpty()) return map
@@ -445,22 +439,8 @@ class ProComic : HttpSource() {
                     val bodyStr = json.encodeToString(map)
                     val body = bodyStr.toRequestBody("application/json".toMediaType())
                     
-                    // نطبق فكرة التمويه هنا أثناء طلب الـ Proxy Plan لحماية فك التشفير للفصول من خطأ 502
                     val planUrl = "$baseUrl/chapter-map-proxy-plan/$chapterId"
-                    val bypassedPlanUrl = if (planUrl.contains("manhua") || planUrl.contains("manhwa")) {
-                        planUrl.replace("manhua", "man%68ua").replace("manhwa", "man%68wa")
-                    } else {
-                        planUrl
-                    }
-
-                    val proxyReq = POST(
-                        bypassedPlanUrl,
-                        apiHeaders.newBuilder()
-                            .set("Origin", baseUrl)
-                            .set("Referer", "$baseUrl/")
-                            .build(),
-                        body,
-                    )
+                    val proxyReq = POST(planUrl, headers, body)
                     val proxyResp = client.newCall(proxyReq).execute()
                     if (proxyResp.isSuccessful) dec = proxyResp.parseAs<ProxyPlanResponse>().data?.map
                 } catch (e: Exception) { }
@@ -517,23 +497,18 @@ class ProComic : HttpSource() {
             val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
             val basePieceUrl = map.pieces.getOrNull(srcIdx) ?: continue
 
-            var pieceUrl = if (map.signedToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ2IjoxLCJpdiI6IJ")) {
+            val pieceUrl = if (map.signedToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ2IjoxLCJpdiI6IJ")) {
                 if (basePieceUrl.contains("?")) "$basePieceUrl&token=${map.signedToken}"
                 else "$basePieceUrl?token=${map.signedToken}"
             } else {
                 basePieceUrl
             }
 
-            // نطبق التمويه هنا عند جلب قطع الصور الفردية من السيرفر لحمايتها من الـ 502 تماماً
-            if (pieceUrl.contains("manhua") || pieceUrl.contains("manhwa")) {
-                pieceUrl = pieceUrl.replace("manhua", "man%68ua").replace("manhwa", "man%68wa")
-            }
-
+            // جلب قطع الصور الفردية مع الـ Headers المحسنة لعدم إثارة جدار الحماية
             val req = Request.Builder()
                 .url(pieceUrl)
-                .header("Referer", "$baseUrl/")
-                .header("Accept", "image/avif,image/webp,image/jpeg,*/*")
-                .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
+                .headers(headers)
+                .header("Accept", "image/avif,image/webp,image/apng,image/jpeg,image/*;q=0.8")
                 .build()
 
             try {
