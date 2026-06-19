@@ -76,13 +76,24 @@ class ProComic : HttpSource() {
             var request = chain.request()
             val originalUrl = request.url.toString()
 
-            // فحص وتمويه الروابط التي تحتوي على manhua أو manhwa تلقائياً لتخطي الـ 502
-            // تم استخدام %2568 لضمان إرسال %68 بشكل صريح وصحيح عبر الشبكة دون أن يقوم التطبيق بفكها داخلياً
+            // تمويه الرابط برمجياً وبشكل دقيق ليفهم أن %68 هي حرف h وتخطي الـ 502 والـ 404 معاً
             if (originalUrl.contains("manhua") || originalUrl.contains("manhwa")) {
-                val bypassedUrl = originalUrl
-                    .replace("manhua", "man%2568ua")
-                    .replace("manhwa", "man%2568wa")
-                request = request.newBuilder().url(bypassedUrl.toHttpUrl()).build()
+                val originalHttpUrl = request.url
+                val newUrlBuilder = originalHttpUrl.newBuilder()
+                
+                // نقوم بإعادة بناء المسار (Path Segments) مع الحفاظ على الرمز %68 مشفراً بشكل صحيح للشبكة
+                val pathSegments = originalHttpUrl.pathSegments
+                for (i in pathSegments.indices) {
+                    var segment = pathSegments[i]
+                    if (segment == "manhua") {
+                        segment = "man%68ua"
+                    } else if (segment == "manhwa") {
+                        segment = "man%68wa"
+                    }
+                    newUrlBuilder.setEncodedPathSegment(i, segment)
+                }
+                
+                request = request.newBuilder().url(newUrlBuilder.build()).build()
             }
 
             val url = request.url.toString()
