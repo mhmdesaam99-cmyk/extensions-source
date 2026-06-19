@@ -68,11 +68,12 @@ class ProComic : HttpSource() {
         }
     }
 
+    // تم إجبار العميل على استخدام HTTP/1.1 أولاً لمنع انهيار السيرفر الخلفي والـ 502
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
-        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1)) // الحفاظ على الاستقرار مع السيرفر الجديد
-        .rateLimit(2, 1) // معدل طلبات طبيعي وسريع
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(25, TimeUnit.SECONDS)
+        .protocols(listOf(Protocol.HTTP_1_1, Protocol.HTTP_2)) 
+        .rateLimit(2, 1) 
         .addInterceptor { chain ->
             val request = chain.request()
             val url = request.url.toString()
@@ -85,7 +86,7 @@ class ProComic : HttpSource() {
                 val mergedBytes = reconstructPage(pageMap)
                     ?: return@addInterceptor Response.Builder()
                         .request(request).protocol(Protocol.HTTP_1_1)
-                        .code(500).message("Error")
+                        .code(500).message("Merge Error")
                         .body("".toResponseBody(null)).build()
 
                 return@addInterceptor Response.Builder()
@@ -130,12 +131,11 @@ class ProComic : HttpSource() {
         }
         .build()
 
-    // تنظيف الـ Headers تماماً وجعلها بسيطة ومقبولة من السيرفر لمنع الـ 502
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
         .add("Origin", baseUrl)
         .add("Accept", "application/json, text/plain, */*")
-        .add("User-Agent", "Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
+        .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 
     override fun popularMangaRequest(page: Int) = GET(
         "$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page",
