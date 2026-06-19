@@ -4,7 +4,6 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.util.Base64
-import android.webkit.CookieManager
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
@@ -69,12 +68,11 @@ class ProComic : HttpSource() {
         }
     }
 
-    // بناء العميل مع إجبار استخدام بروتوكولات متوافقة مع الحماية وتخفيف معدل الطلبات منعاً للـ 502
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
-        .rateLimit(1, 2) // فاصِل زمني آمن بين الطلبات لتجنب الـ Block من Cloudflare
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
+        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1)) // الحفاظ على الاستقرار مع السيرفر الجديد
+        .rateLimit(2, 1) // معدل طلبات طبيعي وسريع
         .addInterceptor { chain ->
             val request = chain.request()
             val url = request.url.toString()
@@ -132,30 +130,12 @@ class ProComic : HttpSource() {
         }
         .build()
 
-    // دالة ديناميكية لجلب الكوكيز الحية من WebView المتصفح وتمريرها لحماية الطلبات
-    private fun getLiveHeaders(): Headers {
-        val builder = headersBuilder()
-        try {
-            val cookies = CookieManager.getInstance().getCookie(baseUrl)
-            if (!cookies.isNullOrBlank()) {
-                builder.add("Cookie", cookies)
-            }
-        } catch (e: Exception) { }
-        return builder.build()
-    }
-
+    // تنظيف الـ Headers تماماً وجعلها بسيطة ومقبولة من السيرفر لمنع الـ 502
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
         .add("Origin", baseUrl)
         .add("Accept", "application/json, text/plain, */*")
-        .add("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
-        .add("Sec-Ch-Ua", "\"Not A;Brand\";v=\"99\", \"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\"")
-        .add("Sec-Ch-Ua-Mobile", "?1")
-        .add("Sec-Ch-Ua-Platform", "\"Android\"")
-        .add("Sec-Fetch-Dest", "empty")
-        .add("Sec-Fetch-Mode", "cors")
-        .add("Sec-Fetch-Site", "same-origin")
-        .add("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+        .add("User-Agent", "Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
 
     override fun popularMangaRequest(page: Int) = GET(
         "$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page",
@@ -245,7 +225,7 @@ class ProComic : HttpSource() {
             .addQueryParameter("_cid", chapterId)
             .build()
 
-        return GET(url, getLiveHeaders()) // استخدام كوكيز المتصفح الحية هنا لحماية الطلب الرئيسي لصفحات الفصل
+        return GET(url, headers)
     }
 
     override fun pageListParse(response: Response): List<Page> {
@@ -259,7 +239,6 @@ class ProComic : HttpSource() {
             parts.getOrElse(idx + 2) { "0" }
         }
 
-        val liveHeaders = getLiveHeaders()
         val pages = mutableListOf<Page>()
         val seenUrls = mutableSetOf<String>()
 
@@ -275,7 +254,7 @@ class ProComic : HttpSource() {
                 sessionKeyAttempted = true
                 try {
                     val req = client.newCall(
-                        GET("$baseUrl/chapter-map-session-key/$chapterId?legacy=1", liveHeaders),
+                        GET("$baseUrl/chapter-map-session-key/$chapterId?legacy=1", headers),
                     ).execute()
                     if (req.isSuccessful) {
                         cachedSessionKey = req.parseAs<SessionKeyResponse>().data?.key
@@ -303,7 +282,7 @@ class ProComic : HttpSource() {
                     val resp = client.newCall(
                         GET(
                             "$baseUrl/api/public/$seriesType/$seriesId/chapters?limit=600&page=$pg&order=desc",
-                            liveHeaders,
+                            headers,
                         ),
                     ).execute()
                     if (!resp.isSuccessful) break
@@ -336,7 +315,7 @@ class ProComic : HttpSource() {
                     mapTokens.add(map.token)
                 }
                 map.token.isNotBlank() && map.pieces.isEmpty() -> {
-                    val resolved = resolveMap(map, chapterId, getSessionKey, liveHeaders)
+                    val resolved = resolveMap(map, chapterId, getSessionKey)
                     if (resolved != null && resolved.pieces.isNotEmpty()) {
                         val absolutePieces = resolved.pieces.map { it.toAbsoluteUrl(cdnBase) }
                         processMap(resolved.dim, resolved.mode, absolutePieces, resolved.order, resolved.token, pages, seenUrls)
@@ -351,7 +330,7 @@ class ProComic : HttpSource() {
 
         for (jwtToken in mapTokens) {
             try {
-                val newPages = fetchDeferredPages(chapterId, jwtToken, seenUrls, cdnBase, getSessionKey, liveHeaders)
+                val newPages = fetchDeferredPages(chapterId, jwtToken, seenUrls, cdnBase, getSessionKey)
                 pages.addAll(newPages)
             } catch (e: Exception) { }
         }
@@ -382,7 +361,6 @@ class ProComic : HttpSource() {
         seenUrls: MutableSet<String>,
         cdnBase: String,
         getSessionKey: () -> String?,
-        liveHeaders: Headers,
     ): List<Page> {
         val pages = mutableListOf<Page>()
         val jwtSplit = jwtSplitValue(jwtToken)
@@ -391,7 +369,7 @@ class ProComic : HttpSource() {
         for (s in 0..jwtSplit) {
             try {
                 val mediaUrl = "$baseUrl/chapter-deferred-media/$chapterId?token=$jwtToken&split=$s"
-                val resp = client.newCall(GET(mediaUrl, liveHeaders)).execute()
+                val resp = client.newCall(GET(mediaUrl, headers)).execute()
 
                 if (!resp.isSuccessful) continue
 
@@ -410,7 +388,7 @@ class ProComic : HttpSource() {
                 when {
                     map.token.isNotBlank() && map.pieces.isEmpty() && map.token.isJwt() -> { }
                     else -> {
-                        val resolved = resolveMap(map, chapterId, getSessionKey, liveHeaders)
+                        val resolved = resolveMap(map, chapterId, getSessionKey)
                         if (resolved != null && resolved.pieces.isNotEmpty()) {
                             decryptedMaps.add(resolved)
                             absolutePieceUrls.addAll(resolved.pieces.map { it.toAbsoluteUrl(cdnBase) })
@@ -439,7 +417,6 @@ class ProComic : HttpSource() {
         map: DeferredPageMap,
         chapterId: String,
         getSessionKey: () -> String?,
-        liveHeaders: Headers,
     ): DeferredPageMap? {
         if (map.pieces.isNotEmpty()) return map
 
@@ -455,7 +432,7 @@ class ProComic : HttpSource() {
                     val body = bodyStr.toRequestBody("application/json".toMediaType())
                     
                     val planUrl = "$baseUrl/chapter-map-proxy-plan/$chapterId"
-                    val proxyReq = POST(planUrl, liveHeaders, body)
+                    val proxyReq = POST(planUrl, headers, body)
                     val proxyResp = client.newCall(proxyReq).execute()
                     if (proxyResp.isSuccessful) dec = proxyResp.parseAs<ProxyPlanResponse>().data?.map
                 } catch (e: Exception) { }
@@ -507,7 +484,6 @@ class ProComic : HttpSource() {
 
         val (cols, rows) = parseMode(map.mode, map.pieces.size)
         val bitmaps = arrayOfNulls<Bitmap>(map.pieces.size)
-        val liveHeaders = getLiveHeaders()
 
         for (targetIdx in 0 until map.pieces.size) {
             val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
@@ -522,7 +498,7 @@ class ProComic : HttpSource() {
 
             val req = Request.Builder()
                 .url(pieceUrl)
-                .headers(liveHeaders) // حماية طلبات قطع الصور المنفردة عبر الكوكيز والـ Headers الحية
+                .headers(headers)
                 .header("Accept", "image/avif,image/webp,image/apng,image/jpeg,image/*;q=0.8")
                 .build()
 
