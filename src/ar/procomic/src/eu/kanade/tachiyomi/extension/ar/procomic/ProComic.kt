@@ -73,29 +73,7 @@ class ProComic : HttpSource() {
         .readTimeout(20, TimeUnit.SECONDS)
         .rateLimit(2, 1)
         .addInterceptor { chain ->
-            var request = chain.request()
-            val originalUrl = request.url.toString()
-
-            // تمويه الرابط برمجياً وبشكل دقيق ليفهم أن %68 هي حرف h وتخطي الـ 502 والـ 404 معاً
-            if (originalUrl.contains("manhua") || originalUrl.contains("manhwa")) {
-                val originalHttpUrl = request.url
-                val newUrlBuilder = originalHttpUrl.newBuilder()
-                
-                // نقوم بإعادة بناء المسار (Path Segments) مع الحفاظ على الرمز %68 مشفراً بشكل صحيح للشبكة
-                val pathSegments = originalHttpUrl.pathSegments
-                for (i in pathSegments.indices) {
-                    var segment = pathSegments[i]
-                    if (segment == "manhua") {
-                        segment = "man%68ua"
-                    } else if (segment == "manhwa") {
-                        segment = "man%68wa"
-                    }
-                    newUrlBuilder.setEncodedPathSegment(i, segment)
-                }
-                
-                request = request.newBuilder().url(newUrlBuilder.build()).build()
-            }
-
+            val request = chain.request()
             val url = request.url.toString()
 
             if (url.startsWith(SCRAMBLED_SCHEME) || url.contains("?map=")) {
@@ -396,14 +374,17 @@ class ProComic : HttpSource() {
 
         for (s in 0..jwtSplit) {
             try {
-                val resp = client.newCall(
-                    GET(
-                        "$baseUrl/chapter-deferred-media/$chapterId?token=$jwtToken&split=$s",
-                        apiHeaders,
-                    ),
-                ).execute()
+                // نطبق فكرة التمويه هنا أثناء طلب ميديا الفصول المؤجلة لمنع الـ 502
+                val mediaUrl = "$baseUrl/chapter-deferred-media/$chapterId?token=$jwtToken&split=$s"
+                val bypassedUrl = if (mediaUrl.contains("manhua") || mediaUrl.contains("manhwa")) {
+                    mediaUrl.replace("manhua", "man%68ua").replace("manhwa", "man%68wa")
+                } else {
+                    mediaUrl
+                }
 
-                if (!resp.isSuccessful) continue   // split=0 → 500 للفصول الجديدة، نكمل
+                val resp = client.newCall(GET(bypassedUrl, apiHeaders)).execute()
+
+                if (!resp.isSuccessful) continue
 
                 val parsed = resp.parseAs<ChapterDeferredResponse>()
                 if (parsed.success && parsed.data != null) splitResponses.add(parsed.data)
@@ -463,8 +444,17 @@ class ProComic : HttpSource() {
                 try {
                     val bodyStr = json.encodeToString(map)
                     val body = bodyStr.toRequestBody("application/json".toMediaType())
+                    
+                    // نطبق فكرة التمويه هنا أثناء طلب الـ Proxy Plan لحماية فك التشفير للفصول من خطأ 502
+                    val planUrl = "$baseUrl/chapter-map-proxy-plan/$chapterId"
+                    val bypassedPlanUrl = if (planUrl.contains("manhua") || planUrl.contains("manhwa")) {
+                        planUrl.replace("manhua", "man%68ua").replace("manhwa", "man%68wa")
+                    } else {
+                        planUrl
+                    }
+
                     val proxyReq = POST(
-                        "$baseUrl/chapter-map-proxy-plan/$chapterId",
+                        bypassedPlanUrl,
                         apiHeaders.newBuilder()
                             .set("Origin", baseUrl)
                             .set("Referer", "$baseUrl/")
@@ -527,11 +517,16 @@ class ProComic : HttpSource() {
             val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
             val basePieceUrl = map.pieces.getOrNull(srcIdx) ?: continue
 
-            val pieceUrl = if (map.signedToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ2IjoxLCJpdiI6IJ")) {
+            var pieceUrl = if (map.signedToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ2IjoxLCJpdiI6IJ")) {
                 if (basePieceUrl.contains("?")) "$basePieceUrl&token=${map.signedToken}"
                 else "$basePieceUrl?token=${map.signedToken}"
             } else {
                 basePieceUrl
+            }
+
+            // نطبق التمويه هنا عند جلب قطع الصور الفردية من السيرفر لحمايتها من الـ 502 تماماً
+            if (pieceUrl.contains("manhua") || pieceUrl.contains("manhwa")) {
+                pieceUrl = pieceUrl.replace("manhua", "man%68ua").replace("manhwa", "man%68wa")
             }
 
             val req = Request.Builder()
