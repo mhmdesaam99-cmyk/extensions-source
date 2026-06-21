@@ -61,11 +61,16 @@ class ProComic : HttpSource() {
 
     // ============================= HELPERS ==============================
 
-    // يبني cdnBase من cdnPath مع نفس دومين baseUrl (pro أو net)
-    // يحل مشكلة manhwa/manhua التي كانت تبني روابط CDN على .pro دائماً
+    // يبني cdnBase من cdnPath:
+    // • إذا cdnPath يحتوي على "." (مثل "cdn2.pro") → دومين كامل، نستخدمه مباشرة
+    // • إذا لا (مثل "cdn1") → نضيف نفس نطاق baseUrl (procomic.pro أو procomic.net)
     private fun buildCdnBase(cdnPath: String): String {
-        val baseDomain = baseUrl.removePrefix("https://").substringAfter(".")
-        return "https://$cdnPath.$baseDomain"
+        return if (cdnPath.contains(".")) {
+            "https://$cdnPath"
+        } else {
+            val baseDomain = baseUrl.removePrefix("https://").substringAfter(".")
+            "https://$cdnPath.$baseDomain"
+        }
     }
 
     private fun String.toAbsoluteUrl(cdnBase: String): String {
@@ -175,29 +180,28 @@ class ProComic : HttpSource() {
 
     override fun imageUrlParse(response: Response): String = ""
 
-    // نبني الطلب يدوياً لتجنب إرسال #fragment لـ OkHttp (يرفضه بـ exception)
-    // ونلحق ScrambledMap كـ Tag محلي ليلتقطها الـ Interceptor
+    // للصور المجزأة (SCRAMBLED_SCHEME): نبني الطلب يدوياً لأن OkHttp يرفض #fragment في URL
+    // للصور العادية: نستخدم super.imageRequest() كالمعتاد
     override fun imageRequest(page: Page): Request {
-        val rawUrl = page.imageUrl ?: page.url
-        val fragmentData = rawUrl.substringAfter("#", "")
-        val cleanUrl = rawUrl.substringBefore("#")
+        val imageUrl = page.imageUrl ?: ""
+        val fragmentData = imageUrl.substringAfter("#", "")
 
-        if (fragmentData.isNotBlank()) {
-            try {
+        if (fragmentData.isNotBlank() && imageUrl.startsWith(SCRAMBLED_SCHEME)) {
+            return try {
                 val mapJson = String(Base64.decode(fragmentData, Base64.URL_SAFE or Base64.NO_WRAP))
                 val pageMap = json.decodeFromString<ScrambledMap>(mapJson)
-                return Request.Builder()
+                val cleanUrl = imageUrl.substringBefore("#")
+                Request.Builder()
                     .url(cleanUrl)
                     .headers(headers)
                     .tag(ScrambledMap::class.java, pageMap)
                     .build()
-            } catch (e: Exception) { }
+            } catch (e: Exception) {
+                super.imageRequest(page)
+            }
         }
 
-        return Request.Builder()
-            .url(cleanUrl)
-            .headers(headers)
-            .build()
+        return super.imageRequest(page)
     }
 
     // ============================= POPULAR / LATEST / SEARCH ==============================
