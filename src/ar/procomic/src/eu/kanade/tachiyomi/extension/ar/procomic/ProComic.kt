@@ -55,9 +55,17 @@ class ProComic : HttpSource() {
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
     companion object {
-        // تم تغيير البنية لمنع إرسال روابط طويلة عبر الشبكة
         private const val SCRAMBLED_SCHEME = "https://procomic.pro/__scrambled_asset__/"
         private const val MAX_SAFE_HEIGHT = 6000
+    }
+
+    // ============================= HELPERS ==============================
+
+    // يبني cdnBase من cdnPath مع نفس دومين baseUrl (pro أو net)
+    // يحل مشكلة manhwa/manhua التي كانت تبني روابط CDN على .pro دائماً
+    private fun buildCdnBase(cdnPath: String): String {
+        val baseDomain = baseUrl.removePrefix("https://").substringAfter(".")
+        return "https://$cdnPath.$baseDomain"
     }
 
     private fun String.toAbsoluteUrl(cdnBase: String): String {
@@ -69,7 +77,28 @@ class ProComic : HttpSource() {
         }
     }
 
-    // الـ Interceptor الآن يقرأ خريطة التفكيك محلياً من كائن الصفحة لمنع الـ 502 تماماً
+    private fun String.isJwt(): Boolean =
+        startsWith("eyJhbGci") && count { it == '.' } == 2
+
+    private fun jwtSplitValue(jwtToken: String): Int {
+        return try {
+            val payloadSegment = jwtToken.split(".").getOrNull(1) ?: return DEFAULT_SPLIT
+            val padded = payloadSegment.padEnd(
+                payloadSegment.length + (4 - payloadSegment.length % 4) % 4,
+                '=',
+            )
+            val payloadJson = String(Base64.decode(padded, Base64.URL_SAFE))
+            json.decodeFromString<JwtPayload>(payloadJson).split
+        } catch (e: Exception) {
+            DEFAULT_SPLIT
+        }
+    }
+
+    private inline fun <reified T> Response.parseAs(): T =
+        json.decodeFromStream(body.byteStream())
+
+    // ============================= CLIENT ==============================
+
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(25, TimeUnit.SECONDS)
@@ -78,8 +107,8 @@ class ProComic : HttpSource() {
             val request = chain.request()
             val url = request.url.toString()
 
+            // صفحة مجمّعة محلياً — لا نرسل الطلب للشبكة
             if (url.startsWith(SCRAMBLED_SCHEME)) {
-                // محاولة استخراج الخريطة من التاج المحلي الملحق بالطلب إن وجد
                 val pageMap = request.tag(ScrambledMap::class.java)
                     ?: return@addInterceptor Response.Builder()
                         .request(request).protocol(Protocol.HTTP_1_1)
@@ -101,8 +130,11 @@ class ProComic : HttpSource() {
 
             val response = chain.proceed(request)
 
-            val isPotentialBase64Image = response.isSuccessful && request.method == "GET" &&
-                url.contains("/i/") && url.contains("procomic")
+            // فك تشفير Base64 للصور المشفرة من CDN (يدعم .pro و .net معاً)
+            val isPotentialBase64Image = response.isSuccessful &&
+                request.method == "GET" &&
+                url.contains("/i/") &&
+                (url.contains("procomic.pro") || url.contains("procomic.net"))
 
             if (isPotentialBase64Image) {
                 val responseBody = response.body
@@ -115,52 +147,60 @@ class ProComic : HttpSource() {
                         bytes[3] == 'a'.code.toByte() &&
                         bytes[4] == ':'.code.toByte()
 
-                    if (isBase64Text) {
+                    return@addInterceptor if (isBase64Text) {
                         val bodyString = String(bytes)
                         val base64Data = bodyString.substringAfter("base64,")
                         val decodedBytes = Base64.decode(base64Data, Base64.DEFAULT)
                         val mimeType = bodyString.substringAfter("data:").substringBefore(";").toMediaType()
-                        return@addInterceptor response.newBuilder()
-                            .body(decodedBytes.toResponseBody(mimeType))
-                            .build()
+                        response.newBuilder().body(decodedBytes.toResponseBody(mimeType)).build()
                     } else {
-                        return@addInterceptor response.newBuilder()
-                            .body(bytes.toResponseBody(responseBody.contentType()))
-                            .build()
+                        response.newBuilder().body(bytes.toResponseBody(responseBody.contentType())).build()
                     }
                 }
             }
+
             response
         }
         .build()
 
-    // تخصيص دالة طلب الصورة لحقن خريطة الدمج محلياً داخل الـ Tag الخاص بـ OkHttp دون إرسالها للسيرفر
-    override fun imageUrlParse(response: Response): String = ""
-
-    override fun imageRequest(page: Page): Request {
-        val fragmentData = page.url.substringAfter("#", "")
-        if (fragmentData.isNotBlank()) {
-            try {
-                val mapJson = String(Base64.decode(fragmentData, Base64.URL_SAFE or Base64.NO_WRAP))
-                val pageMap = json.decodeFromString<ScrambledMap>(mapJson)
-                // نبني الطلب يدوياً بالـ URL النظيف (بدون fragment) لأن OkHttp يرفض الـ # في الـ URL
-                // ثم نربط الخريطة كـ Tag محلي ليلتقطها الـ Interceptor
-                val cleanUrl = page.url.substringBefore("#")
-                return Request.Builder()
-                    .url(cleanUrl)
-                    .headers(headers)
-                    .tag(ScrambledMap::class.java, pageMap)
-                    .build()
-            } catch (e: Exception) {}
-        }
-        return super.imageRequest(page)
-    }
+    // ============================= HEADERS ==============================
 
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
         .add("Origin", baseUrl)
         .add("Accept-Language", "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7")
         .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+    // ============================= IMAGE REQUEST ==============================
+
+    override fun imageUrlParse(response: Response): String = ""
+
+    // نبني الطلب يدوياً لتجنب إرسال #fragment لـ OkHttp (يرفضه بـ exception)
+    // ونلحق ScrambledMap كـ Tag محلي ليلتقطها الـ Interceptor
+    override fun imageRequest(page: Page): Request {
+        val rawUrl = page.imageUrl ?: page.url
+        val fragmentData = rawUrl.substringAfter("#", "")
+        val cleanUrl = rawUrl.substringBefore("#")
+
+        if (fragmentData.isNotBlank()) {
+            try {
+                val mapJson = String(Base64.decode(fragmentData, Base64.URL_SAFE or Base64.NO_WRAP))
+                val pageMap = json.decodeFromString<ScrambledMap>(mapJson)
+                return Request.Builder()
+                    .url(cleanUrl)
+                    .headers(headers)
+                    .tag(ScrambledMap::class.java, pageMap)
+                    .build()
+            } catch (e: Exception) { }
+        }
+
+        return Request.Builder()
+            .url(cleanUrl)
+            .headers(headers)
+            .build()
+    }
+
+    // ============================= POPULAR / LATEST / SEARCH ==============================
 
     override fun popularMangaRequest(page: Int) = GET(
         "$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page",
@@ -183,6 +223,8 @@ class ProComic : HttpSource() {
     )
 
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
+
+    // ============================= MANGA DETAILS ==============================
 
     override fun mangaDetailsRequest(manga: SManga): Request {
         val p = manga.url.split("/")
@@ -211,6 +253,8 @@ class ProComic : HttpSource() {
         } catch (e: Exception) { SManga.create() }
     }
 
+    // ============================= CHAPTER LIST ==============================
+
     override fun chapterListRequest(manga: SManga): Request {
         val p = manga.url.split("/")
         return GET(
@@ -236,13 +280,14 @@ class ProComic : HttpSource() {
         }
     }
 
+    // ============================= PAGE LIST ==============================
+
     override fun pageListRequest(chapter: SChapter): Request {
         val parts = chapter.url.split("/")
         val seriesType = parts.getOrElse(0) { "manga" }
         val seriesId = parts.getOrElse(1) { "0" }
         val chapterId = parts.getOrElse(2) { "0" }
 
-        // نجلب limit=600 (الحد الأقصى) لتقليل احتمال عدم العثور على الفصل في الصفحة الأولى
         val url = "$baseUrl/api/public/$seriesType/$seriesId/chapters".toHttpUrl()
             .newBuilder()
             .addQueryParameter("page", "1")
@@ -256,14 +301,10 @@ class ProComic : HttpSource() {
 
     override fun pageListParse(response: Response): List<Page> {
         val chapterId = response.request.url.queryParameter("_cid") ?: return emptyList()
-        val seriesType = response.request.url.pathSegments.let { parts ->
-            val idx = parts.indexOf("public")
-            parts.getOrElse(idx + 1) { "manga" }
-        }
-        val seriesId = response.request.url.pathSegments.let { parts ->
-            val idx = parts.indexOf("public")
-            parts.getOrElse(idx + 2) { "0" }
-        }
+        val pathParts = response.request.url.pathSegments
+        val pubIdx = pathParts.indexOf("public")
+        val seriesType = pathParts.getOrElse(pubIdx + 1) { "manga" }
+        val seriesId = pathParts.getOrElse(pubIdx + 2) { "0" }
 
         val apiHeaders = headers.newBuilder().set("Accept", "application/json").build()
         val pages = mutableListOf<Page>()
@@ -272,11 +313,11 @@ class ProComic : HttpSource() {
         var cdnPath = "cdn1"
         var metadataImages = emptyList<String>()
         val mapsList = mutableListOf<DeferredPageMap>()
-        var found = false
 
+        // =================== Session Key (Lazy) ===================
         var cachedSessionKey: String? = null
         var sessionKeyAttempted = false
-        val getSessionKey = {
+        val getSessionKey: () -> String? = {
             if (!sessionKeyAttempted) {
                 sessionKeyAttempted = true
                 try {
@@ -291,6 +332,8 @@ class ProComic : HttpSource() {
             cachedSessionKey
         }
 
+        // =================== البحث في الصفحة الأولى ===================
+        var found = false
         val currentData = try { response.parseAs<ChaptersResponse>() } catch (e: Exception) { ChaptersResponse() }
         for (ch in currentData.data) {
             if (ch.id.toString() == chapterId) {
@@ -302,6 +345,7 @@ class ProComic : HttpSource() {
             }
         }
 
+        // =================== fallback: باقي صفحات قائمة الفصول ===================
         if (!found) {
             var pg = 2
             outer@ while (pg <= 10) {
@@ -320,6 +364,7 @@ class ProComic : HttpSource() {
                             cdnPath = ch.cdnPath ?: "cdn1"
                             metadataImages = ch.metadata?.images ?: emptyList()
                             ch.metadata?.maps?.let { mapsList.addAll(it) }
+                            found = true
                             break@outer
                         }
                     }
@@ -328,19 +373,51 @@ class ProComic : HttpSource() {
             }
         }
 
-        val cdnBase = "https://$cdnPath.procomic.pro"
+        // =================== fallback مباشر للـ manhwa/manhua ===================
+        // كثير من manhwa/manhua لا تضع metadata داخل قائمة الفصول
+        // بل تعتمد على endpoint خاص يرجع الصور مباشرة
+        if (metadataImages.isEmpty() && mapsList.isEmpty()) {
+            // النمط الأول: /api/public/{type}/{seriesId}/chapter/{chapterId}
+            tryFetchDirectChapter(
+                "$baseUrl/api/public/$seriesType/$seriesId/chapter/$chapterId",
+                apiHeaders,
+            )?.let { direct ->
+                if (direct.cdnPath != null) cdnPath = direct.cdnPath
+                metadataImages = direct.images
+                mapsList.addAll(direct.maps)
+            }
+        }
+
+        if (metadataImages.isEmpty() && mapsList.isEmpty()) {
+            // النمط الثاني: /api/public/chapter/{chapterId}
+            tryFetchDirectChapter(
+                "$baseUrl/api/public/chapter/$chapterId",
+                apiHeaders,
+            )?.let { direct ->
+                if (direct.cdnPath != null) cdnPath = direct.cdnPath
+                metadataImages = direct.images
+                mapsList.addAll(direct.maps)
+            }
+        }
+
+        // =================== بناء cdnBase بنفس دومين baseUrl ===================
+        val cdnBase = buildCdnBase(cdnPath)
         val mapTokens = mutableListOf<String>()
 
+        // =================== صور مباشرة ===================
         metadataImages.forEach { imgPath ->
             val fullUrl = imgPath.toAbsoluteUrl(cdnBase)
             if (seenUrls.add(fullUrl)) pages.add(Page(pages.size, imageUrl = fullUrl))
         }
 
+        // =================== خرائط الصور المجزأة ===================
         mapsList.forEach { map ->
             when {
+                // JWT: صفحات deferred تُجلب لاحقاً
                 map.token.isNotBlank() && map.pieces.isEmpty() && map.token.isJwt() -> {
                     mapTokens.add(map.token)
                 }
+                // token مشفر: نفك تشفيره عبر session key أو proxy
                 map.token.isNotBlank() && map.pieces.isEmpty() -> {
                     val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
                     if (resolved != null && resolved.pieces.isNotEmpty()) {
@@ -348,6 +425,7 @@ class ProComic : HttpSource() {
                         processMap(resolved.dim, resolved.mode, absolutePieces, resolved.order, resolved.token, pages, seenUrls)
                     }
                 }
+                // قطع جاهزة
                 map.pieces.isNotEmpty() -> {
                     val absolutePieces = map.pieces.map { it.toAbsoluteUrl(cdnBase) }
                     processMap(map.dim, map.mode, absolutePieces, map.order, map.token, pages, seenUrls)
@@ -355,6 +433,7 @@ class ProComic : HttpSource() {
             }
         }
 
+        // =================== صفحات deferred (JWT) ===================
         for (jwtToken in mapTokens) {
             try {
                 val newPages = fetchDeferredPages(chapterId, jwtToken, apiHeaders, seenUrls, cdnBase, getSessionKey)
@@ -365,22 +444,30 @@ class ProComic : HttpSource() {
         return pages
     }
 
-    private fun String.isJwt(): Boolean =
-        startsWith("eyJhbGci") && count { it == '.' } == 2
-    
-    private fun jwtSplitValue(jwtToken: String): Int {
+    // يجرب جلب بيانات الفصل مباشرة من endpoint محدد — مطلوب لـ manhwa/manhua
+    private fun tryFetchDirectChapter(url: String, apiHeaders: Headers): ChapterDirectData? {
         return try {
-            val payloadSegment = jwtToken.split(".").getOrNull(1) ?: return DEFAULT_SPLIT
-            val padded = payloadSegment.padEnd(
-                payloadSegment.length + (4 - payloadSegment.length % 4) % 4,
-                '=',
-            )
-            val payloadJson = String(Base64.decode(padded, Base64.URL_SAFE))
-            json.decodeFromString<JwtPayload>(payloadJson).split
-        } catch (e: Exception) {
-            DEFAULT_SPLIT
-        }
+            val resp = client.newCall(GET(url, apiHeaders)).execute()
+            if (!resp.isSuccessful) return null
+            val body = resp.body.string()
+            // نجرب ChapterDirectResponse أولاً
+            try {
+                json.decodeFromString<ChapterDirectResponse>(body).data
+            } catch (e: Exception) {
+                // بعض الـ endpoints ترجع ChapterDto مباشرة
+                try {
+                    val dto = json.decodeFromString<ChapterDto>(body)
+                    ChapterDirectData(
+                        cdnPath = dto.cdnPath,
+                        images = dto.metadata?.images ?: emptyList(),
+                        maps = dto.metadata?.maps ?: emptyList(),
+                    )
+                } catch (e2: Exception) { null }
+            }
+        } catch (e: Exception) { null }
     }
+
+    // ============================= DEFERRED PAGES ==============================
 
     private fun fetchDeferredPages(
         chapterId: String,
@@ -402,14 +489,10 @@ class ProComic : HttpSource() {
                         apiHeaders,
                     ),
                 ).execute()
-
                 if (!resp.isSuccessful) continue
-
                 val parsed = resp.parseAs<ChapterDeferredResponse>()
                 if (parsed.success && parsed.data != null) splitResponses.add(parsed.data)
-            } catch (e: Exception) {
-                continue
-            }
+            } catch (e: Exception) { continue }
         }
 
         for (splitData in splitResponses) {
@@ -418,8 +501,7 @@ class ProComic : HttpSource() {
 
             splitData.maps.forEach { map ->
                 when {
-                    // JWT متداخل داخل split: نحاول فك تشفيره بـ session key مباشرةً
-                    // لو فشل نتجاهله فقط (لا نتركه صامتاً بدون محاولة)
+                    // JWT متداخل: نحاول فكه مباشرة بدلاً من تجاهله صامتاً
                     map.token.isNotBlank() && map.pieces.isEmpty() && map.token.isJwt() -> {
                         val sk = getSessionKey()
                         if (sk != null) {
@@ -456,6 +538,8 @@ class ProComic : HttpSource() {
         return pages
     }
 
+    // ============================= RESOLVE MAP ==============================
+
     private fun resolveMap(
         map: DeferredPageMap,
         chapterId: String,
@@ -491,7 +575,8 @@ class ProComic : HttpSource() {
         return null
     }
 
-    // هنا تكمن معالجة المشكلة: إبقاء الرابط الخارجي قصيراً وحفظ الـ Map كـ Hash محلي متصل بالصفحة
+    // ============================= PROCESS MAP ==============================
+
     private fun processMap(
         dim: List<Int>,
         mode: String,
@@ -502,8 +587,7 @@ class ProComic : HttpSource() {
         seenUrls: MutableSet<String>,
     ) {
         if (pieces.isEmpty()) return
-        // مفتاح التكرار يعتمد على مجموعة القطع كاملة لا على القطعة الأولى فقط
-        // هذا يمنع حذف صفحتين تشتركان في نفس القطعة الأولى بالخطأ
+        // مفتاح dedup يعتمد على كل القطع — يمنع حذف صفحتين تشتركان في القطعة الأولى
         val dedupeKey = "map:${pieces.joinToString("|")}"
         if (!seenUrls.add(dedupeKey)) return
 
@@ -528,11 +612,12 @@ class ProComic : HttpSource() {
                 json.encodeToString(mapData).toByteArray(Charsets.UTF_8),
                 Base64.URL_SAFE or Base64.NO_WRAP,
             )
-            // نضع الرابط قصيراً جداً لتجنب خطأ السيرفر، ونلحق البيانات بعد علامة # كـ Fragment محلي للتطبيق فقط
             val shortUrl = "$SCRAMBLED_SCHEME${pages.size}_part_$p.jpg#$encoded"
             pages.add(Page(pages.size, url = shortUrl, imageUrl = shortUrl))
         }
     }
+
+    // ============================= RECONSTRUCT PAGE ==============================
 
     private fun reconstructPage(map: ScrambledMap): ByteArray? {
         if (map.pieces.isEmpty()) return null
@@ -558,19 +643,18 @@ class ProComic : HttpSource() {
                 .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
                 .build()
 
-            // محاولة جلب القطعة مع إعادة المحاولة مرتين عند الفشل (خطأ الشبكة أو 5xx)
+            // retry مرتين عند أخطاء 5xx من CDN
             var attempt = 0
             while (attempt < 3) {
                 try {
-                    val fetched = client.newCall(req).execute().use { resp ->
+                    val done = client.newCall(req).execute().use { resp ->
                         if (!resp.isSuccessful) {
-                            // 5xx = مشكلة سيرفر مؤقتة، نحاول مجدداً
                             if (resp.code in 500..599 && attempt < 2) {
                                 attempt++
                                 Thread.sleep(500L * attempt)
                                 return@use false
                             }
-                            return@use true // فشل نهائي، نخرج من الحلقة
+                            return@use true
                         }
                         val bodyBytes = resp.body.bytes()
                         val isBase64Text = bodyBytes.size > 20 &&
@@ -587,9 +671,9 @@ class ProComic : HttpSource() {
                             bodyBytes
                         }
                         bitmaps[targetIdx] = decodeAvif(finalBytes)
-                        true // نجح، نخرج من الحلقة
+                        true
                     }
-                    if (fetched) break
+                    if (done) break
                 } catch (e: Exception) {
                     attempt++
                     if (attempt < 3) Thread.sleep(500L * attempt)
@@ -601,8 +685,8 @@ class ProComic : HttpSource() {
             val validBitmaps = bitmaps.filterNotNull()
             if (validBitmaps.isEmpty()) return null
 
-            var calcTotalW: Int
-            var calcTotalH: Int
+            val calcTotalW: Int
+            val calcTotalH: Int
 
             when {
                 cols == 1 -> {
@@ -678,6 +762,8 @@ class ProComic : HttpSource() {
         }
     }
 
+    // ============================= DECRYPT ==============================
+
     private fun decryptMap(tokenStr: String, sessionKeyBase64: String): DeferredPageMap? {
         return try {
             val tokenJsonStr = String(Base64.decode(tokenStr, Base64.URL_SAFE or Base64.DEFAULT))
@@ -697,7 +783,9 @@ class ProComic : HttpSource() {
             null
         }
     }
-    
+
+    // ============================= AVIF DECODE ==============================
+
     private fun decodeAvif(bytes: ByteArray): Bitmap? {
         if (bytes.isEmpty()) return null
         val decoder = ImageDecoder.newInstance(bytes.inputStream())
@@ -710,6 +798,8 @@ class ProComic : HttpSource() {
         }
     }
 
+    // ============================= PARSE MODE ==============================
+
     private fun parseMode(mode: String, pieceCount: Int): Pair<Int, Int> = when {
         mode.startsWith("grid_") -> {
             val clean = mode.removePrefix("grid_")
@@ -720,12 +810,13 @@ class ProComic : HttpSource() {
         mode.startsWith("horizontal_") -> Pair(1, mode.removePrefix("horizontal_").toIntOrNull() ?: pieceCount)
         else -> Pair(1, pieceCount)
     }
-
-    private inline fun <reified T> Response.parseAs(): T =
-        json.decodeFromStream(body.byteStream())
 }
 
+// ============================= CONSTANTS ==============================
+
 private const val DEFAULT_SPLIT = 3
+
+// ============================= DATA CLASSES ==============================
 
 @Serializable
 data class JwtPayload(
@@ -825,6 +916,20 @@ data class ChapterDto(
 
 @Serializable
 data class ChapterMetadataDto(
+    val images: List<String> = emptyList(),
+    val maps: List<DeferredPageMap> = emptyList(),
+)
+
+// نموذج الاستجابة المباشرة للفصل — مطلوب لـ manhwa/manhua
+@Serializable
+data class ChapterDirectResponse(
+    val success: Boolean = false,
+    val data: ChapterDirectData? = null,
+)
+
+@Serializable
+data class ChapterDirectData(
+    @SerialName("cdn_path") val cdnPath: String? = null,
     val images: List<String> = emptyList(),
     val maps: List<DeferredPageMap> = emptyList(),
 )
