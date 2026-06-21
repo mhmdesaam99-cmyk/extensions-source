@@ -178,16 +178,30 @@ class ProComic : HttpSource() {
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException("Not used")
 
-    override fun getImage(page: Page): Response {
-        val imageUrl = page.imageUrl ?: return super.getImage(page)
-        if (!imageUrl.startsWith("{")) {
-            return super.getImage(page)
+    override fun fetchImage(page: Page): rx.Observable<Response> {
+        if (page.url.contains("chapter-deferred-media")) {
+            return client.newCall(GET(page.url, headers))
+                .asObservable()
+                .flatMap { response ->
+                    val result = json.decodeFromString<ChapterDeferredResponse>(response.body.string())
+                    val map = result.data?.maps?.firstOrNull()
+                    if (map != null) {
+                        fetchCanvasImage(map)
+                    } else {
+                        super.fetchImage(page)
+                    }
+                }
         }
-        val scrambledPage = try {
-            json.decodeFromString<ScrambledPage>(imageUrl)
-        } catch (e: Exception) {
-            return super.getImage(page)
+
+        val pageMapJson = page.url.substringAfter("pageMap=", "")
+        if (pageMapJson.isNotEmpty()) {
+            val pageMap = json.decodeFromString<DeferredPageMap>(pageMapJson)
+            return fetchCanvasImage(pageMap)
         }
+
+        // استخدام super.fetchImage بدلاً من getImage
+        return super.fetchImage(page)
+    }
         val width = scrambledPage.dim.getOrNull(0) ?: 800
         val height = scrambledPage.dim.getOrNull(1) ?: 1250
         val modeParts = scrambledPage.mode.removePrefix("grid_").split("x")
