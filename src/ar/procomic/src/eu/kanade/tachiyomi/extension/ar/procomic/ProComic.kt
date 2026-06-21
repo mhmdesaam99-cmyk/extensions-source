@@ -138,17 +138,22 @@ class ProComic : HttpSource() {
     override fun imageUrlParse(response: Response): String = ""
 
     override fun imageRequest(page: Page): Request {
-        val request = super.imageRequest(page)
         val fragmentData = page.url.substringAfter("#", "")
         if (fragmentData.isNotBlank()) {
             try {
                 val mapJson = String(Base64.decode(fragmentData, Base64.URL_SAFE or Base64.NO_WRAP))
                 val pageMap = json.decodeFromString<ScrambledMap>(mapJson)
-                // نربط الخريطة كـ Tag محلي بالطلب لكي تلتقطها دالة الـ Interceptor
-                return request.newBuilder().tag(ScrambledMap::class.java, pageMap).build()
+                // نبني الطلب يدوياً بالـ URL النظيف (بدون fragment) لأن OkHttp يرفض الـ # في الـ URL
+                // ثم نربط الخريطة كـ Tag محلي ليلتقطها الـ Interceptor
+                val cleanUrl = page.url.substringBefore("#")
+                return Request.Builder()
+                    .url(cleanUrl)
+                    .headers(headers)
+                    .tag(ScrambledMap::class.java, pageMap)
+                    .build()
             } catch (e: Exception) {}
         }
-        return request
+        return super.imageRequest(page)
     }
 
     override fun headersBuilder() = super.headersBuilder()
@@ -237,10 +242,11 @@ class ProComic : HttpSource() {
         val seriesId = parts.getOrElse(1) { "0" }
         val chapterId = parts.getOrElse(2) { "0" }
 
+        // نجلب limit=600 (الحد الأقصى) لتقليل احتمال عدم العثور على الفصل في الصفحة الأولى
         val url = "$baseUrl/api/public/$seriesType/$seriesId/chapters".toHttpUrl()
             .newBuilder()
             .addQueryParameter("page", "1")
-            .addQueryParameter("limit", "500")
+            .addQueryParameter("limit", "600")
             .addQueryParameter("order", "desc")
             .addQueryParameter("_cid", chapterId)
             .build()
@@ -412,7 +418,18 @@ class ProComic : HttpSource() {
 
             splitData.maps.forEach { map ->
                 when {
-                    map.token.isNotBlank() && map.pieces.isEmpty() && map.token.isJwt() -> { }
+                    // JWT متداخل داخل split: نحاول فك تشفيره بـ session key مباشرةً
+                    // لو فشل نتجاهله فقط (لا نتركه صامتاً بدون محاولة)
+                    map.token.isNotBlank() && map.pieces.isEmpty() && map.token.isJwt() -> {
+                        val sk = getSessionKey()
+                        if (sk != null) {
+                            val dec = decryptMap(map.token, sk)
+                            if (dec != null && dec.pieces.isNotEmpty()) {
+                                decryptedMaps.add(dec)
+                                absolutePieceUrls.addAll(dec.pieces.map { it.toAbsoluteUrl(cdnBase) })
+                            }
+                        }
+                    }
                     else -> {
                         val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
                         if (resolved != null && resolved.pieces.isNotEmpty()) {
@@ -484,7 +501,11 @@ class ProComic : HttpSource() {
         pages: MutableList<Page>,
         seenUrls: MutableSet<String>,
     ) {
-        if (pieces.isEmpty() || !seenUrls.add(pieces.first())) return
+        if (pieces.isEmpty()) return
+        // مفتاح التكرار يعتمد على مجموعة القطع كاملة لا على القطعة الأولى فقط
+        // هذا يمنع حذف صفحتين تشتركان في نفس القطعة الأولى بالخطأ
+        val dedupeKey = "map:${pieces.joinToString("|")}"
+        if (!seenUrls.add(dedupeKey)) return
 
         val estimatedTotalH = dim.getOrNull(1)?.takeIf { it > 0 } ?: 10000
         val parts = if (estimatedTotalH > MAX_SAFE_HEIGHT) {
@@ -537,9 +558,20 @@ class ProComic : HttpSource() {
                 .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
                 .build()
 
-            try {
-                client.newCall(req).execute().use { resp ->
-                    if (resp.isSuccessful) {
+            // محاولة جلب القطعة مع إعادة المحاولة مرتين عند الفشل (خطأ الشبكة أو 5xx)
+            var attempt = 0
+            while (attempt < 3) {
+                try {
+                    val fetched = client.newCall(req).execute().use { resp ->
+                        if (!resp.isSuccessful) {
+                            // 5xx = مشكلة سيرفر مؤقتة، نحاول مجدداً
+                            if (resp.code in 500..599 && attempt < 2) {
+                                attempt++
+                                Thread.sleep(500L * attempt)
+                                return@use false
+                            }
+                            return@use true // فشل نهائي، نخرج من الحلقة
+                        }
                         val bodyBytes = resp.body.bytes()
                         val isBase64Text = bodyBytes.size > 20 &&
                             bodyBytes[0] == 'd'.code.toByte() &&
@@ -555,9 +587,14 @@ class ProComic : HttpSource() {
                             bodyBytes
                         }
                         bitmaps[targetIdx] = decodeAvif(finalBytes)
+                        true // نجح، نخرج من الحلقة
                     }
+                    if (fetched) break
+                } catch (e: Exception) {
+                    attempt++
+                    if (attempt < 3) Thread.sleep(500L * attempt)
                 }
-            } catch (e: Exception) { }
+            }
         }
 
         return try {
