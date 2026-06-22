@@ -56,7 +56,6 @@ class ProComic : HttpSource() {
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
     companion object {
-        // تم تغيير البنية لمنع إرسال روابط طويلة عبر الشبكة
         private const val SCRAMBLED_SCHEME = "https://procomic.pro/__scrambled_asset__/"
         private const val MAX_SAFE_HEIGHT = 6000
     }
@@ -70,7 +69,6 @@ class ProComic : HttpSource() {
         }
     }
 
-    // الـ Interceptor الآن يقرأ خريطة التفكيك محلياً من كائن الصفحة لمنع الـ 502 تماماً
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(25, TimeUnit.SECONDS)
@@ -80,7 +78,6 @@ class ProComic : HttpSource() {
             val url = request.url.toString()
 
             if (url.startsWith(SCRAMBLED_SCHEME)) {
-                // محاولة استخراج الخريطة من التاج المحلي الملحق بالطلب إن وجد
                 val pageMap = request.tag(ScrambledMap::class.java)
                     ?: return@addInterceptor Response.Builder()
                         .request(request).protocol(Protocol.HTTP_1_1)
@@ -117,7 +114,7 @@ class ProComic : HttpSource() {
                         bytes[4] == ':'.code.toByte()
 
                     if (isBase64Text) {
-                        val bodyString = String(bytes)
+                        val bodyString = String(bytes, Charsets.UTF_8)
                         val base64Data = bodyString.substringAfter("base64,")
                         val decodedBytes = Base64.decode(base64Data, Base64.DEFAULT)
                         val mimeType = bodyString.substringAfter("data:").substringBefore(";").toMediaType()
@@ -135,13 +132,9 @@ class ProComic : HttpSource() {
         }
         .build()
 
-    // تخصيص دالة طلب الصورة لحقن خريطة الدمج محلياً داخل الـ Tag الخاص بـ OkHttp دون إرسالها للسيرفر
     override fun imageUrlParse(response: Response): String = ""
 
     override fun imageRequest(page: Page): Request {
-        // Read fragment from imageUrl first (set by processMap), then fall back to url.
-        // OkHttp strips the #fragment before sending, so we must extract it here from
-        // the Page object before building the Request.
         val imageUrl = page.imageUrl ?: ""
         val fragmentData = when {
             imageUrl.contains("#") -> imageUrl.substringAfter("#")
@@ -151,10 +144,8 @@ class ProComic : HttpSource() {
 
         if (fragmentData.isNotBlank()) {
             try {
-                val mapJson = String(Base64.decode(fragmentData, Base64.URL_SAFE or Base64.NO_WRAP))
+                val mapJson = String(Base64.decode(fragmentData, Base64.URL_SAFE or Base64.NO_WRAP), Charsets.UTF_8)
                 val pageMap = json.decodeFromString<ScrambledMap>(mapJson)
-                // Build the request using only the part before #, then attach the map as a Tag.
-                // Using the SCRAMBLED_SCHEME URL without fragment so OkHttp accepts it.
                 val cleanUrl = imageUrl.substringBefore("#")
                 val req = Request.Builder()
                     .url(cleanUrl)
@@ -386,7 +377,7 @@ class ProComic : HttpSource() {
                 payloadSegment.length + (4 - payloadSegment.length % 4) % 4,
                 '=',
             )
-            val payloadJson = String(Base64.decode(padded, Base64.URL_SAFE))
+            val payloadJson = String(Base64.decode(padded, Base64.URL_SAFE), Charsets.UTF_8)
             json.decodeFromString<JwtPayload>(payloadJson).split
         } catch (e: Exception) {
             DEFAULT_SPLIT
@@ -491,7 +482,6 @@ class ProComic : HttpSource() {
         return null
     }
 
-    // هنا تكمن معالجة المشكلة: إبقاء الرابط الخارجي قصيراً وحفظ الـ Map كـ Hash محلي متصل بالصفحة
     private fun processMap(
         dim: List<Int>,
         mode: String,
@@ -524,7 +514,6 @@ class ProComic : HttpSource() {
                 json.encodeToString(mapData).toByteArray(Charsets.UTF_8),
                 Base64.URL_SAFE or Base64.NO_WRAP,
             )
-            // نضع الرابط قصيراً جداً لتجنب خطأ السيرفر، ونلحق البيانات بعد علامة # كـ Fragment محلي للتطبيق فقط
             val shortUrl = "$SCRAMBLED_SCHEME${pages.size}_part_$p.jpg#$encoded"
             pages.add(Page(pages.size, url = shortUrl, imageUrl = shortUrl))
         }
@@ -536,7 +525,6 @@ class ProComic : HttpSource() {
         val (cols, rows) = parseMode(map.mode, map.pieces.size)
         val bitmaps = arrayOfNulls<Bitmap>(map.pieces.size)
 
-        // Build resolved piece URLs for all slots upfront
         val pieceUrls = Array(map.pieces.size) { targetIdx ->
             val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
             val base = map.pieces.getOrNull(srcIdx) ?: ""
@@ -547,8 +535,6 @@ class ProComic : HttpSource() {
             }
         }
 
-        // Download all pieces in parallel to avoid slow sequential loading.
-        // Uses a dedicated newCall() (not chain.proceed) to prevent interceptor re-entry.
         val futures = pieceUrls.map { pieceUrl ->
             val future = CompletableFuture<ByteArray?>()
             if (pieceUrl.isBlank()) {
@@ -560,7 +546,9 @@ class ProComic : HttpSource() {
                     .header("Accept", "image/avif,image/webp,image/jpeg,*/*")
                     .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
                     .build()
-                client.newCall(req).enqueue(object : okhttp3.Callback {
+                
+                // استخدام الكلاينت النقي لمنع الـ Interceptor Loop الدائري
+                network.cloudflareClient.newCall(req).enqueue(object : okhttp3.Callback {
                     override fun onResponse(call: okhttp3.Call, response: Response) {
                         try {
                             val bodyBytes = response.use { it.body.bytes() }
@@ -571,7 +559,7 @@ class ProComic : HttpSource() {
                                 bodyBytes[3] == 'a'.code.toByte() &&
                                 bodyBytes[4] == ':'.code.toByte()
                             val finalBytes = if (isBase64Text) {
-                                val base64Data = String(bodyBytes).substringAfter("base64,")
+                                val base64Data = String(bodyBytes, Charsets.UTF_8).substringAfter("base64,")
                                 Base64.decode(base64Data, Base64.DEFAULT)
                             } else {
                                 bodyBytes
@@ -622,7 +610,10 @@ class ProComic : HttpSource() {
             val partH = calcTotalH / totalParts
             val actualPartH = if (splitPart == totalParts - 1) calcTotalH - (partH * splitPart) else partH
 
-            if (calcTotalW <= 0 || actualPartH <= 0) return null
+            if (calcTotalW <= 0 || actualPartH <= 0) {
+                bitmaps.forEach { it?.recycle() }
+                return null
+            }
 
             val result = try {
                 Bitmap.createBitmap(calcTotalW, actualPartH, Bitmap.Config.ARGB_8888)
@@ -671,13 +662,14 @@ class ProComic : HttpSource() {
             result.recycle()
             out.toByteArray()
         } catch (e: Exception) {
+            bitmaps.forEach { it?.recycle() }
             null
         }
     }
 
     private fun decryptMap(tokenStr: String, sessionKeyBase64: String): DeferredPageMap? {
         return try {
-            val tokenJsonStr = String(Base64.decode(tokenStr, Base64.URL_SAFE or Base64.DEFAULT))
+            val tokenJsonStr = String(Base64.decode(tokenStr, Base64.URL_SAFE or Base64.DEFAULT), Charsets.UTF_8)
             val tokenData = json.decodeFromString<EncryptedToken>(tokenJsonStr)
 
             val keyBytes = Base64.decode(sessionKeyBase64, Base64.URL_SAFE)
@@ -689,7 +681,7 @@ class ProComic : HttpSource() {
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(128, ivBytes))
             val decryptedBytes = cipher.doFinal(cipherTextBytes + tagBytes)
-            json.decodeFromString<DeferredPageMap>(String(decryptedBytes))
+            json.decodeFromString<DeferredPageMap>(String(decryptedBytes, Charsets.UTF_8))
         } catch (e: Exception) {
             null
         }
@@ -713,8 +705,9 @@ class ProComic : HttpSource() {
             val p = if (clean.contains("x")) clean.split("x") else clean.split("_")
             Pair(p.getOrNull(0)?.toIntOrNull() ?: 1, p.getOrNull(1)?.toIntOrNull() ?: 1)
         }
-        mode.startsWith("vertical_") -> Pair(mode.removePrefix("vertical_").toIntOrNull() ?: pieceCount, 1)
-        mode.startsWith("horizontal_") -> Pair(1, mode.removePrefix("horizontal_").toIntOrNull() ?: pieceCount)
+        // تم الإصلاح هنا: النمط العمودي يعني (عمود واحد، وعدة صفوف)، والنمط الأفقي يعني (عدة أعمدة، وصف واحد)
+        mode.startsWith("vertical_") -> Pair(1, mode.removePrefix("vertical_").toIntOrNull() ?: pieceCount)
+        mode.startsWith("horizontal_") -> Pair(mode.removePrefix("horizontal_").toIntOrNull() ?: pieceCount, 1)
         else -> Pair(1, pieceCount)
     }
 
