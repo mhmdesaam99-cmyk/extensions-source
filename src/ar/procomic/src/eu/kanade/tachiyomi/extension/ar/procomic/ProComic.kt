@@ -139,17 +139,33 @@ class ProComic : HttpSource() {
     override fun imageUrlParse(response: Response): String = ""
 
     override fun imageRequest(page: Page): Request {
-        val request = super.imageRequest(page)
-        val fragmentData = page.url.substringAfter("#", "")
+        // Read fragment from imageUrl first (set by processMap), then fall back to url.
+        // OkHttp strips the #fragment before sending, so we must extract it here from
+        // the Page object before building the Request.
+        val imageUrl = page.imageUrl ?: ""
+        val fragmentData = when {
+            imageUrl.contains("#") -> imageUrl.substringAfter("#")
+            page.url.contains("#") -> page.url.substringAfter("#")
+            else -> ""
+        }
+
         if (fragmentData.isNotBlank()) {
             try {
                 val mapJson = String(Base64.decode(fragmentData, Base64.URL_SAFE or Base64.NO_WRAP))
                 val pageMap = json.decodeFromString<ScrambledMap>(mapJson)
-                // نربط الخريطة كـ Tag محلي بالطلب لكي تلتقطها دالة الـ Interceptor
-                return request.newBuilder().tag(ScrambledMap::class.java, pageMap).build()
+                // Build the request using only the part before #, then attach the map as a Tag.
+                // Using the SCRAMBLED_SCHEME URL without fragment so OkHttp accepts it.
+                val cleanUrl = imageUrl.substringBefore("#")
+                val req = Request.Builder()
+                    .url(cleanUrl)
+                    .headers(headers)
+                    .tag(ScrambledMap::class.java, pageMap)
+                    .build()
+                return req
             } catch (e: Exception) {}
         }
-        return request
+
+        return super.imageRequest(page)
     }
 
     override fun headersBuilder() = super.headersBuilder()
