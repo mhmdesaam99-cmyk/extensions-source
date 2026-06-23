@@ -45,11 +45,22 @@ class ProComic : HttpSource() {
     override val lang = "ar"
     override val supportsLatest = true
 
+    // رابط تسجيل الدخول — يفتح WebView في mihon تلقائياً عند الضغط على "تسجيل الدخول"
+    override val loginUrl = "$baseUrl/login"
+
     private val json = Json {
         ignoreUnknownKeys = true
         isLenient = true
         explicitNulls = false
         encodeDefaults = true
+    }
+
+    // مخصص لتشفير الـ request bodies — يتجاهل القيم الفارغة (null)
+    private val jsonRequest = Json {
+        ignoreUnknownKeys = true
+        isLenient = true
+        explicitNulls = false
+        encodeDefaults = false
     }
 
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
@@ -324,6 +335,19 @@ class ProComic : HttpSource() {
 
         val cdnBase = "https://$cdnPath.procomic.pro"
 
+        // فحص تسجيل الدخول: إذا كانت هناك maps مشفرة وفشل الحصول على الـ cookies
+        // نتحقق بطلب بسيط للـ proxy-plan هل الجلسة نشطة
+        val hasEncryptedMaps = mapsList.any { it.token.isNotBlank() && it.pieces.isEmpty() }
+        if (hasEncryptedMaps && pages.isEmpty() && metadataImages.isEmpty()) {
+            // اختبار الجلسة باستخدام أول map مشفرة
+            val testMap = mapsList.first { it.token.isNotBlank() && it.pieces.isEmpty() }
+            val testResult = resolveMapViaProxy(testMap, chapterId, apiHeaders)
+            if (testResult == null) {
+                // فشل تماماً — المستخدم غير مسجل دخوله
+                throw Exception("يجب تسجيل الدخول إلى ProComic لقراءة هذا الفصل.\nافتح إعدادات المصدر وسجّل دخولك عبر WebView.")
+            }
+        }
+
         metadataImages.forEach { imgPath ->
             val fullUrl = imgPath.toAbsoluteUrl(cdnBase)
             if (seenUrls.add(fullUrl)) pages.add(Page(pages.size, imageUrl = fullUrl))
@@ -359,19 +383,31 @@ class ProComic : HttpSource() {
         apiHeaders: Headers,
     ): DeferredPageMap? {
         return try {
-            val bodyStr = json.encodeToString(map)
+            // نُرسل فقط الحقول غير الفارغة — مثل ما يُرسله المتصفح بالضبط
+            val requestBody = ProxyPlanRequestBody(
+                token = map.token.ifBlank { null },
+                method = map.method.ifBlank { null },
+                dim = map.dim.ifEmpty { null },
+                mode = map.mode.ifBlank { null },
+                order = map.order.ifEmpty { null },
+            )
+            val bodyStr = jsonRequest.encodeToString(requestBody)
             val body = bodyStr.toRequestBody("application/json".toMediaType())
+            val reqHeaders = apiHeaders.newBuilder()
+                .set("Origin", baseUrl)
+                .set("Referer", "$baseUrl/")
+                .set("Content-Type", "application/json")
+                .set("Accept", "application/json")
+                .build()
             val proxyReq = POST(
                 "$baseUrl/chapter-map-proxy-plan/$chapterId",
-                apiHeaders.newBuilder()
-                    .set("Origin", baseUrl)
-                    .set("Referer", "$baseUrl/")
-                    .set("Content-Type", "application/json")
-                    .build(),
+                reqHeaders,
                 body,
             )
             val proxyResp = client.newCall(proxyReq).execute()
-            if (proxyResp.isSuccessful) proxyResp.parseAs<ProxyPlanResponse>().data?.map else null
+            if (!proxyResp.isSuccessful) return null
+            val result = proxyResp.parseAs<ProxyPlanResponse>()
+            if (result.success) result.data?.map else null
         } catch (e: Exception) { null }
     }
 
@@ -391,13 +427,22 @@ class ProComic : HttpSource() {
 
             if (dec == null || dec.pieces.isEmpty()) {
                 try {
-                    val bodyStr = json.encodeToString(map)
+                    val requestBody = ProxyPlanRequestBody(
+                        token = map.token.ifBlank { null },
+                        method = map.method.ifBlank { null },
+                        dim = map.dim.ifEmpty { null },
+                        mode = map.mode.ifBlank { null },
+                        order = map.order.ifEmpty { null },
+                    )
+                    val bodyStr = jsonRequest.encodeToString(requestBody)
                     val body = bodyStr.toRequestBody("application/json".toMediaType())
                     val proxyReq = POST(
                         "$baseUrl/chapter-map-proxy-plan/$chapterId",
                         apiHeaders.newBuilder()
                             .set("Origin", baseUrl)
                             .set("Referer", "$baseUrl/")
+                            .set("Content-Type", "application/json")
+                            .set("Accept", "application/json")
                             .build(),
                         body,
                     )
@@ -750,4 +795,14 @@ data class ProxyPlanResponse(
 @Serializable
 data class ProxyPlanData(
     val map: DeferredPageMap? = null,
+)
+
+// كائن مخصص للـ request body — يحذف الحقول الفارغة تلقائياً
+@Serializable
+data class ProxyPlanRequestBody(
+    val token: String? = null,
+    val method: String? = null,
+    val dim: List<Int>? = null,
+    val mode: String? = null,
+    val order: List<Int>? = null,
 )
