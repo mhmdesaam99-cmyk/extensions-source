@@ -57,7 +57,6 @@ class ProComic : HttpSource() {
 
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
-    // عميل مخصص للقطع للتحميل التسلسلي بهدوء لتجنب حظر Cloudflare
     private val pieceClient: OkHttpClient by lazy {
         network.cloudflareClient.newBuilder()
             .connectTimeout(20, TimeUnit.SECONDS)
@@ -275,10 +274,13 @@ class ProComic : HttpSource() {
 
     override fun pageListParse(response: Response): List<Page> {
         val chapterId = response.request.url.queryParameter("_cid") ?: return emptyList()
+        
+        // استخراج نوع السلسلة لمعرفة ما إذا كانت مانهوا/مانها أو مانجا
         val seriesType = response.request.url.pathSegments.let { parts ->
             val idx = parts.indexOf("public")
             parts.getOrElse(idx + 1) { "manga" }
         }
+        
         val seriesId = response.request.url.pathSegments.let { parts ->
             val idx = parts.indexOf("public")
             parts.getOrElse(idx + 2) { "0" }
@@ -370,19 +372,19 @@ class ProComic : HttpSource() {
                     val resolvedPieces = resolved?.pieces ?: emptyList()
                     if (resolved != null && resolvedPieces.isNotEmpty()) {
                         val absolutePieces = resolvedPieces.map { it.toAbsoluteUrl(cdnBase) }
-                        processMap(resolved.dim ?: emptyList(), resolved.mode ?: "", absolutePieces, resolved.order ?: emptyList(), resolved.token ?: "", pages, seenUrls)
+                        processMap(resolved.dim ?: emptyList(), resolved.mode ?: "", absolutePieces, resolved.order ?: emptyList(), resolved.token ?: "", seriesType, pages, seenUrls)
                     }
                 }
                 safePieces.isNotEmpty() -> {
                     val absolutePieces = safePieces.map { it.toAbsoluteUrl(cdnBase) }
-                    processMap(map.dim ?: emptyList(), map.mode ?: "", absolutePieces, map.order ?: emptyList(), safeToken, pages, seenUrls)
+                    processMap(map.dim ?: emptyList(), map.mode ?: "", absolutePieces, map.order ?: emptyList(), safeToken, seriesType, pages, seenUrls)
                 }
             }
         }
 
         for (jwtToken in mapTokens) {
             try {
-                val newPages = fetchDeferredPages(chapterId, jwtToken, seenUrls, cdnBase, getSessionKey)
+                val newPages = fetchDeferredPages(chapterId, jwtToken, seenUrls, cdnBase, getSessionKey, seriesType)
                 pages.addAll(newPages)
             } catch (e: Exception) { }
         }
@@ -413,6 +415,7 @@ class ProComic : HttpSource() {
         seenUrls: MutableSet<String>,
         cdnBase: String,
         getSessionKey: () -> String?,
+        seriesType: String // تم تمرير نوع السلسلة هنا أيضاً
     ): List<Page> {
         val pages = mutableListOf<Page>()
         val jwtSplit = jwtSplitValue(jwtToken)
@@ -466,7 +469,7 @@ class ProComic : HttpSource() {
 
             decryptedMaps.forEach { map ->
                 val absolutePieces = (map.pieces ?: emptyList()).map { it.toAbsoluteUrl(cdnBase) }
-                processMap(map.dim ?: emptyList(), map.mode ?: "", absolutePieces, map.order ?: emptyList(), map.token ?: "", pages, seenUrls)
+                processMap(map.dim ?: emptyList(), map.mode ?: "", absolutePieces, map.order ?: emptyList(), map.token ?: "", seriesType, pages, seenUrls)
             }
         }
 
@@ -512,11 +515,31 @@ class ProComic : HttpSource() {
         pieces: List<String>,
         order: List<Int>,
         signedToken: String,
+        seriesType: String, // تحديد نوع العمل
         pages: MutableList<Page>,
         seenUrls: MutableSet<String>,
     ) {
         if (pieces.isEmpty() || !seenUrls.add(pieces.first())) return
 
+        // 🟢 الإضافة الجديدة: فحص نوع السلسلة (مانهوا أو مانها)
+        // إذا كانت مانهوا/مانها، نستخرج القطع مرتبة كصفحات مستقلة، وتطبيق تاتش يومي سيعرضها متتالية
+        if (seriesType.equals("manhwa", ignoreCase = true) || seriesType.equals("manhua", ignoreCase = true)) {
+            for (targetIdx in pieces.indices) {
+                val srcIdx = if (order.size == pieces.size) order[targetIdx] else targetIdx
+                val base = pieces.getOrNull(srcIdx) ?: continue
+                
+                val pieceUrl = if (base.isNotBlank() && signedToken.isNotBlank() && !base.contains("/i/eyJ2IjoxLCJpdiI6IJ")) {
+                    if (base.contains("?")) "$base&token=$signedToken" else "$base?token=$signedToken"
+                } else {
+                    base
+                }
+                
+                pages.add(Page(pages.size, url = pieceUrl, imageUrl = pieceUrl))
+            }
+            return
+        }
+
+        // 🔴 الكود أدناه سيُطبق فقط على فصول سلسلة الـ Manga
         val estimatedTotalH = dim.getOrNull(1)?.takeIf { it > 0 } ?: 10000
         val parts = if (estimatedTotalH > MAX_SAFE_HEIGHT) {
             ceil(estimatedTotalH.toDouble() / MAX_SAFE_HEIGHT).toInt()
@@ -543,7 +566,6 @@ class ProComic : HttpSource() {
         }
     }
 
-    // ✅ التعديل الجوهري: التحميل التسلسلي الآمن (قطعة بقطعة) لتجنب الحظر والاختناق 
     private fun reconstructPage(map: ScrambledMap): ByteArray? {
         if (map.pieces.isEmpty()) return null
 
@@ -560,7 +582,6 @@ class ProComic : HttpSource() {
             }
         }
 
-        // تحميل القطع بشكل متسلسل (Sequential Download) كما اقترحت
         for (targetIdx in pieceUrls.indices) {
             val pieceUrl = pieceUrls[targetIdx]
             if (pieceUrl.isBlank()) continue
@@ -571,12 +592,11 @@ class ProComic : HttpSource() {
                     .headers(headers)
                     .build()
                 
-                // التنفيذ التسلسلي: نطلب القطعة، وننتظر حتى تكتمل قبل طلب القطعة التالية
                 val response = pieceClient.newCall(req).execute()
                 
                 if (!response.isSuccessful) {
                     response.close()
-                    return null // إذا فشلت قطعة واحدة نعيد null لكي يحاول التطبيق مرة أخرى
+                    return null 
                 }
                 
                 val bodyBytes = response.body?.bytes()
