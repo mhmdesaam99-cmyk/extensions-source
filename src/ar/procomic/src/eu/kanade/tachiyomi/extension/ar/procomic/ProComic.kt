@@ -323,7 +323,6 @@ class ProComic : HttpSource() {
         }
 
         val cdnBase = "https://$cdnPath.procomic.pro"
-        val mapTokens = mutableListOf<String>()
 
         metadataImages.forEach { imgPath ->
             val fullUrl = imgPath.toAbsoluteUrl(cdnBase)
@@ -332,11 +331,10 @@ class ProComic : HttpSource() {
 
         mapsList.forEach { map ->
             when {
-                map.token.isNotBlank() && map.pieces.isEmpty() && map.token.isJwt() -> {
-                    mapTokens.add(map.token)
-                }
+                // JWT tokens من metadata منتهية الصلاحية دائماً — نتجاهلها ونستخدم proxy-plan مباشرة
                 map.token.isNotBlank() && map.pieces.isEmpty() -> {
-                    val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
+                    val resolved = resolveMapViaProxy(map, chapterId, apiHeaders)
+                        ?: resolveMap(map, chapterId, apiHeaders, getSessionKey)
                     if (resolved != null && resolved.pieces.isNotEmpty()) {
                         val absolutePieces = resolved.pieces.map { it.toAbsoluteUrl(cdnBase) }
                         processMap(resolved.dim, resolved.mode, absolutePieces, resolved.order, resolved.rects, resolved.token, pages, seenUrls)
@@ -349,102 +347,7 @@ class ProComic : HttpSource() {
             }
         }
 
-        for (jwtToken in mapTokens) {
-            try {
-                val newPages = fetchDeferredPages(chapterId, jwtToken, apiHeaders, seenUrls, cdnBase, getSessionKey)
-                pages.addAll(newPages)
-            } catch (e: Exception) { }
-        }
-
-        return pages
-    }
-
-    private fun String.isJwt(): Boolean =
-        startsWith("eyJhbGci") && count { it == '.' } == 2
-    
-    private fun jwtSplitValue(jwtToken: String): Int {
-        return try {
-            val payloadSegment = jwtToken.split(".").getOrNull(1) ?: return DEFAULT_SPLIT
-            val padded = payloadSegment.padEnd(
-                payloadSegment.length + (4 - payloadSegment.length % 4) % 4,
-                '=',
-            )
-            val payloadJson = String(Base64.decode(padded, Base64.URL_SAFE))
-            json.decodeFromString<JwtPayload>(payloadJson).split
-        } catch (e: Exception) {
-            DEFAULT_SPLIT
-        }
-    }
-
-    private fun fetchDeferredPages(
-        chapterId: String,
-        jwtToken: String,
-        apiHeaders: Headers,
-        seenUrls: MutableSet<String>,
-        cdnBase: String,
-        getSessionKey: () -> String?,
-    ): List<Page> {
-        val pages = mutableListOf<Page>()
-        val jwtSplit = jwtSplitValue(jwtToken)
-        val splitResponses = mutableListOf<ChapterDeferredData>()
-
-        for (s in 0..jwtSplit) {
-            try {
-                val resp = client.newCall(
-                    GET(
-                        "$baseUrl/chapter-deferred-media/$chapterId?token=$jwtToken&split=$s",
-                        apiHeaders,
-                    ),
-                ).execute()
-
-                if (!resp.isSuccessful) continue
-
-                val parsed = resp.parseAs<ChapterDeferredResponse>()
-                if (parsed.success && parsed.data != null) splitResponses.add(parsed.data)
-            } catch (e: Exception) {
-                continue
-            }
-        }
-
-        for (splitData in splitResponses) {
-            val decryptedMaps = mutableListOf<DeferredPageMap>()
-            val absolutePieceUrls = mutableSetOf<String>()
-
-            splitData.maps.forEach { map ->
-                when {
-                    // تجاهل JWT tokens (تُعالج لاحقاً في mapTokens)
-                    map.token.isNotBlank() && map.pieces.isEmpty() && map.token.isJwt() -> { }
-                    // معالجة browser_session tokens و غيرها عبر proxy-plan مباشرة
-                    map.token.isNotBlank() && map.pieces.isEmpty() -> {
-                        val resolved = resolveMapViaProxy(map, chapterId, apiHeaders)
-                            ?: resolveMap(map, chapterId, apiHeaders, getSessionKey)
-                        if (resolved != null && resolved.pieces.isNotEmpty()) {
-                            decryptedMaps.add(resolved)
-                            absolutePieceUrls.addAll(resolved.pieces.map { it.toAbsoluteUrl(cdnBase) })
-                        }
-                    }
-                    else -> {
-                        val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
-                        if (resolved != null && resolved.pieces.isNotEmpty()) {
-                            decryptedMaps.add(resolved)
-                            absolutePieceUrls.addAll(resolved.pieces.map { it.toAbsoluteUrl(cdnBase) })
-                        }
-                    }
-                }
-            }
-
-            splitData.images.forEach { url ->
-                val fullUrl = url.toAbsoluteUrl(cdnBase)
-                if (fullUrl !in absolutePieceUrls && seenUrls.add(fullUrl)) {
-                    pages.add(Page(pages.size, imageUrl = fullUrl))
-                }
-            }
-
-            decryptedMaps.forEach { map ->
-                val absolutePieces = map.pieces.map { it.toAbsoluteUrl(cdnBase) }
-                processMap(map.dim, map.mode, absolutePieces, map.order, map.rects, map.token, pages, seenUrls)
-            }
-        }
+        // لم نعد نحتاج fetchDeferredPages لأن proxy-plan يتولى كل شيء مباشرة
 
         return pages
     }
@@ -722,15 +625,6 @@ class ProComic : HttpSource() {
         json.decodeFromStream(body.byteStream())
 }
 
-private const val DEFAULT_SPLIT = 3
-
-@Serializable
-data class JwtPayload(
-    val split: Int = DEFAULT_SPLIT,
-    val cid: Int = 0,
-    val p: String = "",
-)
-
 @Serializable
 data class SessionKeyResponse(
     val success: Boolean = false,
@@ -832,20 +726,6 @@ data class ChapterDto(
 
 @Serializable
 data class ChapterMetadataDto(
-    val images: List<String> = emptyList(),
-    val maps: List<DeferredPageMap> = emptyList(),
-)
-
-@Serializable
-data class ChapterDeferredResponse(
-    val success: Boolean = false,
-    val data: ChapterDeferredData? = null,
-)
-
-@Serializable
-data class ChapterDeferredData(
-    val chapterId: Int = 0,
-    val splitIndex: Int = 0,
     val images: List<String> = emptyList(),
     val maps: List<DeferredPageMap> = emptyList(),
 )
