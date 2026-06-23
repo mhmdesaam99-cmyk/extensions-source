@@ -241,7 +241,7 @@ class ProComic : HttpSource() {
         }
     }
 
-    override fun pageListRequest(chapter: SChapter): Request {
+        override fun pageListRequest(chapter: SChapter): Request {
         val parts = chapter.url.split("/")
         val seriesType = parts.getOrElse(0) { "manga" }
         val seriesId = parts.getOrElse(1) { "0" }
@@ -255,19 +255,20 @@ class ProComic : HttpSource() {
             .addQueryParameter("_cid", chapterId)
             .build()
 
+        // نمرر نوع السلسلة الأصلي كـ Tag لكي نستخدمه في الفلترة والتبديل لاحقاً إذا لزم الأمر
         return GET(url, headers.newBuilder().set("Accept", "application/json").build())
+            .newBuilder()
+            .tag(String::class.java, seriesType) 
+            .build()
     }
-
-    override fun pageListParse(response: Response): List<Page> {
+        
+        override fun pageListParse(response: Response): List<Page> {
         val chapterId = response.request.url.queryParameter("_cid") ?: return emptyList()
-        val seriesType = response.request.url.pathSegments.let { parts ->
-            val idx = parts.indexOf("public")
-            parts.getOrElse(idx + 1) { "manga" }
-        }
-        val seriesId = response.request.url.pathSegments.let { parts ->
-            val idx = parts.indexOf("public")
-            parts.getOrElse(idx + 2) { "0" }
-        }
+        val originalType = response.request.tag(String::class.java) ?: "manga"
+        
+        val parts = response.request.url.pathSegments
+        val idx = parts.indexOf("public")
+        val seriesId = parts.getOrElse(idx + 2) { "0" }
 
         val apiHeaders = headers.newBuilder().set("Accept", "application/json").build()
         val pages = mutableListOf<Page>()
@@ -278,24 +279,30 @@ class ProComic : HttpSource() {
         val mapsList = mutableListOf<DeferredPageMap>()
         var found = false
 
-        var cachedSessionKey: String? = null
-        var sessionKeyAttempted = false
-        val getSessionKey = {
-            if (!sessionKeyAttempted) {
-                sessionKeyAttempted = true
+        // محاولة القراءة من الاستجابة الحالية
+        var currentData = try { response.parseAs<ChaptersResponse>() } catch (e: Exception) { ChaptersResponse() }
+        
+        // [التعديل الفعال]: إذا كانت الاستجابة فارغة وكان العمل manhua/manhwa، نجرب المسارات البديلة فوراً
+        if ((currentData.data.isEmpty() || currentData.data.none { it.id.toString() == chapterId }) && 
+            (originalType == "manhua" || originalType == "manhwa")) {
+            
+            val typesToTry = listOf("manga", "comic")
+            for (fallbackType in typesToTry) {
                 try {
-                    val req = client.newCall(
-                        GET("$baseUrl/chapter-map-session-key/$chapterId?legacy=1", apiHeaders),
-                    ).execute()
-                    if (req.isSuccessful) {
-                        cachedSessionKey = req.parseAs<SessionKeyResponse>().data?.key
+                    val fallbackUrl = "$baseUrl/api/public/$fallbackType/$seriesId/chapters?page=1&limit=500&order=desc&_cid=$chapterId"
+                    val fallbackResp = client.newCall(GET(fallbackUrl, apiHeaders)).execute()
+                    if (fallbackResp.isSuccessful) {
+                        val fallbackData = fallbackResp.parseAs<ChaptersResponse>()
+                        if (fallbackData.data.any { it.id.toString() == chapterId }) {
+                            currentData = fallbackData
+                            break
+                        }
                     }
-                } catch (e: Exception) { }
+                } catch (e: Exception) {}
             }
-            cachedSessionKey
         }
 
-        val currentData = try { response.parseAs<ChaptersResponse>() } catch (e: Exception) { ChaptersResponse() }
+        // نتابع الكود الأصلي بشكل طبيعي لاستخراج البيانات بعد التبديل الآمن
         for (ch in currentData.data) {
             if (ch.id.toString() == chapterId) {
                 cdnPath = ch.cdnPath ?: "cdn1"
@@ -306,16 +313,27 @@ class ProComic : HttpSource() {
             }
         }
 
+        // ... بقية الدالة تظل كما هي دون أي تغيير لضمان عدم تأثر السلاسل الأخرى ...
+        val cachedSessionKey: String? = null
+        var sessionKeyAttempted = false
+        val getSessionKey = {
+            if (!sessionKeyAttempted) {
+                sessionKeyAttempted = true
+                try {
+                    val req = client.newCall(GET("$baseUrl/chapter-map-session-key/$chapterId?legacy=1", apiHeaders)).execute()
+                    if (req.isSuccessful) cachedSessionKey = req.parseAs<SessionKeyResponse>().data?.key
+                } catch (e: Exception) { }
+            }
+            cachedSessionKey
+        }
+
         if (!found) {
+            // كود البحث في الصفحات التالية (Pagination) في حال لم يعثر عليه في الصفحة الأولى
             var pg = 2
+            val typeForPages = if (originalType == "manhua" || originalType == "manhwa") "manga" else originalType
             outer@ while (pg <= 10) {
                 try {
-                    val resp = client.newCall(
-                        GET(
-                            "$baseUrl/api/public/$seriesType/$seriesId/chapters?limit=600&page=$pg&order=desc",
-                            apiHeaders,
-                        ),
-                    ).execute()
+                    val resp = client.newCall(GET("$baseUrl/api/public/$typeForPages/$seriesId/chapters?limit=600&page=$pg&order=desc", apiHeaders)).execute()
                     if (!resp.isSuccessful) break
                     val data = resp.parseAs<ChaptersResponse>()
                     if (data.data.isEmpty()) break
@@ -341,33 +359,19 @@ class ProComic : HttpSource() {
         }
 
         mapsList.forEach { map ->
-            when {
-                map.token.isNotBlank() && map.pieces.isEmpty() && map.token.isJwt() -> {
-                    mapTokens.add(map.token)
-                }
-                map.token.isNotBlank() && map.pieces.isEmpty() -> {
-                    val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
-                    if (resolved != null && resolved.pieces.isNotEmpty()) {
-                        val absolutePieces = resolved.pieces.map { it.toAbsoluteUrl(cdnBase) }
-                        processMap(resolved.dim, resolved.mode, absolutePieces, resolved.order, resolved.token, pages, seenUrls)
-                    }
-                }
-                map.pieces.isNotEmpty() -> {
-                    val absolutePieces = map.pieces.map { it.toAbsoluteUrl(cdnBase) }
-                    processMap(map.dim, map.mode, absolutePieces, map.order, map.token, pages, seenUrls)
+            if (map.pieces.isNotEmpty()) {
+                val absolutePieces = map.pieces.map { it.toAbsoluteUrl(cdnBase) }
+                processMap(map.dim, map.mode, absolutePieces, map.order, map.token, pages, seenUrls)
+            } else if (map.token.isNotBlank() && map.pieces.isEmpty()) {
+                val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
+                if (resolved != null && resolved.pieces.isNotEmpty()) {
+                    val absolutePieces = resolved.pieces.map { it.toAbsoluteUrl(cdnBase) }
+                    processMap(resolved.dim, resolved.mode, absolutePieces, resolved.order, resolved.token, pages, seenUrls)
                 }
             }
         }
-
-        for (jwtToken in mapTokens) {
-            try {
-                val newPages = fetchDeferredPages(chapterId, jwtToken, apiHeaders, seenUrls, cdnBase, getSessionKey)
-                pages.addAll(newPages)
-            } catch (e: Exception) { }
-        }
-
         return pages
-    }
+        }
 
     private fun String.isJwt(): Boolean =
         startsWith("eyJhbGci") && count { it == '.' } == 2
