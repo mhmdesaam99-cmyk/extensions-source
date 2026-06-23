@@ -55,6 +55,14 @@ class ProComic : HttpSource() {
 
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
+    // ✅ التعديل 1: إضافة عميل مستقل للقطع لمنع الاختناق (Deadlock)
+    private val piecesClient: OkHttpClient by lazy {
+        network.cloudflareClient.newBuilder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .build()
+    }
+
     companion object {
         // تم تغيير البنية لمنع إرسال روابط طويلة عبر الشبكة
         private const val SCRAMBLED_SCHEME = "https://procomic.pro/__scrambled_asset__/"
@@ -135,9 +143,6 @@ class ProComic : HttpSource() {
     override fun imageUrlParse(response: Response): String = ""
 
     override fun imageRequest(page: Page): Request {
-        // Read fragment from imageUrl first (set by processMap), then fall back to url.
-        // OkHttp strips the #fragment before sending, so we must extract it here from
-        // the Page object before building the Request.
         val imageUrl = page.imageUrl ?: ""
         val fragmentData = when {
             imageUrl.contains("#") -> imageUrl.substringAfter("#")
@@ -147,10 +152,11 @@ class ProComic : HttpSource() {
 
         if (fragmentData.isNotBlank()) {
             try {
-                val mapJson = String(Base64.decode(fragmentData, Base64.URL_SAFE or Base64.NO_WRAP))
+                // ✅ التعديل 2: فك تشفير الـ URL واستخدام NO_PADDING
+                val decodedFragment = java.net.URLDecoder.decode(fragmentData, "UTF-8")
+                val mapJson = String(Base64.decode(decodedFragment, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING))
                 val pageMap = json.decodeFromString<ScrambledMap>(mapJson)
-                // Build the request using only the part before #, then attach the map as a Tag.
-                // Using the SCRAMBLED_SCHEME URL without fragment so OkHttp accepts it.
+                
                 val cleanUrl = imageUrl.substringBefore("#")
                 val req = Request.Builder()
                     .url(cleanUrl)
@@ -158,7 +164,9 @@ class ProComic : HttpSource() {
                     .tag(ScrambledMap::class.java, pageMap)
                     .build()
                 return req
-            } catch (e: Exception) {}
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
         }
 
         return super.imageRequest(page)
@@ -487,7 +495,6 @@ class ProComic : HttpSource() {
         return null
     }
 
-    // هنا تكمن معالجة المشكلة: إبقاء الرابط الخارجي قصيراً وحفظ الـ Map كـ Hash محلي متصل بالصفحة
     private fun processMap(
         dim: List<Int>,
         mode: String,
@@ -518,9 +525,9 @@ class ProComic : HttpSource() {
             )
             val encoded = Base64.encodeToString(
                 json.encodeToString(mapData).toByteArray(Charsets.UTF_8),
-                Base64.URL_SAFE or Base64.NO_WRAP,
+                // ✅ التعديل 3: إضافة NO_PADDING
+                Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING,
             )
-            // نضع الرابط قصيراً جداً لتجنب خطأ السيرفر، ونلحق البيانات بعد علامة # كـ Fragment محلي للتطبيق فقط
             val shortUrl = "$SCRAMBLED_SCHEME${pages.size}_part_$p.jpg#$encoded"
             pages.add(Page(pages.size, url = shortUrl, imageUrl = shortUrl))
         }
@@ -532,7 +539,6 @@ class ProComic : HttpSource() {
         val (cols, rows) = parseMode(map.mode, map.pieces.size)
         val bitmaps = arrayOfNulls<Bitmap>(map.pieces.size)
 
-        // Build resolved piece URLs for all slots upfront
         val pieceUrls = Array(map.pieces.size) { targetIdx ->
             val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
             val base = map.pieces.getOrNull(srcIdx) ?: ""
@@ -543,8 +549,6 @@ class ProComic : HttpSource() {
             }
         }
 
-        // Download all pieces in parallel to avoid slow sequential loading.
-        // Uses a dedicated newCall() (not chain.proceed) to prevent interceptor re-entry.
         val futures = pieceUrls.map { pieceUrl ->
             val future = CompletableFuture<ByteArray?>()
             if (pieceUrl.isBlank()) {
@@ -556,12 +560,11 @@ class ProComic : HttpSource() {
                     .header("Accept", "image/avif,image/webp,image/jpeg,*/*")
                     .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
                     .build()
-                client.newCall(req).enqueue(object : okhttp3.Callback {
+                // ✅ التعديل 4: استخدام piecesClient بدلاً من client الأساسي
+                piecesClient.newCall(req).enqueue(object : okhttp3.Callback {
                     override fun onResponse(call: okhttp3.Call, response: Response) {
                         try {
                             val bodyBytes = response.use { it.body.bytes() }
-                            // Probe first 50 bytes as ASCII to detect data-URI safely,
-                            // avoids single-byte checks that fail on compressed responses.
                             val sampleSize = minOf(bodyBytes.size, 50)
                             val sample = String(bodyBytes, 0, sampleSize, Charsets.US_ASCII).trim()
                             val finalBytes = if (sample.startsWith("data:image", ignoreCase = true)) {
