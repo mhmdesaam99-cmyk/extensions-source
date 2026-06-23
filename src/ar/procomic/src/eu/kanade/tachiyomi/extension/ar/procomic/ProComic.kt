@@ -35,8 +35,6 @@ import tachiyomi.decoder.ImageDecoder
 import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Locale
-import java.util.concurrent.CompletableFuture
-import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
@@ -58,7 +56,14 @@ class ProComic : HttpSource() {
     }
 
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
-    private val pieceExecutor = Executors.newFixedThreadPool(8)
+
+    // عميل مخصص للقطع للتحميل التسلسلي بهدوء لتجنب حظر Cloudflare
+    private val pieceClient: OkHttpClient by lazy {
+        network.cloudflareClient.newBuilder()
+            .connectTimeout(20, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .build()
+    }
 
     companion object {
         private const val SCRAMBLED_SCHEME = "https://procomic.pro/__scrambled_asset__/"
@@ -170,7 +175,6 @@ class ProComic : HttpSource() {
         return super.imageRequest(page)
     }
 
-    // ✅ التعديل الأهم: إزالة User-Agent الثابت لمنع تعارض Cloudflare 
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
         .add("Origin", baseUrl)
@@ -539,6 +543,7 @@ class ProComic : HttpSource() {
         }
     }
 
+    // ✅ التعديل الجوهري: التحميل التسلسلي الآمن (قطعة بقطعة) لتجنب الحظر والاختناق 
     private fun reconstructPage(map: ScrambledMap): ByteArray? {
         if (map.pieces.isEmpty()) return null
 
@@ -555,39 +560,44 @@ class ProComic : HttpSource() {
             }
         }
 
-        val futures = pieceUrls.map { pieceUrl ->
-            CompletableFuture.supplyAsync({
-                if (pieceUrl.isBlank()) return@supplyAsync null
-                try {
-                    val req = Request.Builder()
-                        .url(pieceUrl)
-                        .headers(headers)
-                        .build()
-                    
-                    val response = network.cloudflareClient.newCall(req).execute()
-                    if (!response.isSuccessful) return@supplyAsync null
-                    
-                    val bodyBytes = response.body?.bytes() ?: return@supplyAsync null
+        // تحميل القطع بشكل متسلسل (Sequential Download) كما اقترحت
+        for (targetIdx in pieceUrls.indices) {
+            val pieceUrl = pieceUrls[targetIdx]
+            if (pieceUrl.isBlank()) continue
+
+            try {
+                val req = Request.Builder()
+                    .url(pieceUrl)
+                    .headers(headers)
+                    .build()
+                
+                // التنفيذ التسلسلي: نطلب القطعة، وننتظر حتى تكتمل قبل طلب القطعة التالية
+                val response = pieceClient.newCall(req).execute()
+                
+                if (!response.isSuccessful) {
+                    response.close()
+                    return null // إذا فشلت قطعة واحدة نعيد null لكي يحاول التطبيق مرة أخرى
+                }
+                
+                val bodyBytes = response.body?.bytes()
+                response.close()
+                
+                if (bodyBytes != null) {
                     val sampleSize = minOf(bodyBytes.size, 50)
                     val sample = String(bodyBytes, 0, sampleSize, Charsets.US_ASCII).trim()
                     
-                    if (sample.startsWith("data:image", ignoreCase = true)) {
+                    val finalBytes = if (sample.startsWith("data:image", ignoreCase = true)) {
                         val base64Data = String(bodyBytes, Charsets.UTF_8).substringAfter(",").trim()
                         Base64.decode(base64Data, Base64.DEFAULT)
                     } else {
                         bodyBytes
                     }
-                } catch (e: Exception) {
-                    null
+                    bitmaps[targetIdx] = decodeAvif(finalBytes)
                 }
-            }, pieceExecutor)
-        }
-
-        futures.forEachIndexed { targetIdx, future ->
-            try {
-                val bytes = future.get(30, TimeUnit.SECONDS)
-                if (bytes != null) bitmaps[targetIdx] = decodeAvif(bytes)
-            } catch (e: Exception) { }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                return null
+            }
         }
 
         return try {
