@@ -56,15 +56,10 @@ class ProComic : HttpSource() {
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
     companion object {
+        // تم تغيير البنية لمنع إرسال روابط طويلة عبر الشبكة
         private const val SCRAMBLED_SCHEME = "https://procomic.pro/__scrambled_asset__/"
         private const val MAX_SAFE_HEIGHT = 6000
     }
-
-    private val piecesClient = network.cloudflareClient.newBuilder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(25, TimeUnit.SECONDS)
-        .rateLimit(4, 1)
-        .build()
 
     private fun String.toAbsoluteUrl(cdnBase: String): String {
         return when {
@@ -75,6 +70,7 @@ class ProComic : HttpSource() {
         }
     }
 
+    // الـ Interceptor الآن يقرأ خريطة التفكيك محلياً من كائن الصفحة لمنع الـ 502 تماماً
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(25, TimeUnit.SECONDS)
@@ -84,6 +80,7 @@ class ProComic : HttpSource() {
             val url = request.url.toString()
 
             if (url.startsWith(SCRAMBLED_SCHEME)) {
+                // محاولة استخراج الخريطة من التاج المحلي الملحق بالطلب إن وجد
                 val pageMap = request.tag(ScrambledMap::class.java)
                     ?: return@addInterceptor Response.Builder()
                         .request(request).protocol(Protocol.HTTP_1_1)
@@ -134,9 +131,13 @@ class ProComic : HttpSource() {
         }
         .build()
 
+    // تخصيص دالة طلب الصورة لحقن خريطة الدمج محلياً داخل الـ Tag الخاص بـ OkHttp دون إرسالها للسيرفر
     override fun imageUrlParse(response: Response): String = ""
 
     override fun imageRequest(page: Page): Request {
+        // Read fragment from imageUrl first (set by processMap), then fall back to url.
+        // OkHttp strips the #fragment before sending, so we must extract it here from
+        // the Page object before building the Request.
         val imageUrl = page.imageUrl ?: ""
         val fragmentData = when {
             imageUrl.contains("#") -> imageUrl.substringAfter("#")
@@ -148,6 +149,8 @@ class ProComic : HttpSource() {
             try {
                 val mapJson = String(Base64.decode(fragmentData, Base64.URL_SAFE or Base64.NO_WRAP))
                 val pageMap = json.decodeFromString<ScrambledMap>(mapJson)
+                // Build the request using only the part before #, then attach the map as a Tag.
+                // Using the SCRAMBLED_SCHEME URL without fragment so OkHttp accepts it.
                 val cleanUrl = imageUrl.substringBefore("#")
                 val req = Request.Builder()
                     .url(cleanUrl)
@@ -241,7 +244,7 @@ class ProComic : HttpSource() {
         }
     }
 
-        override fun pageListRequest(chapter: SChapter): Request {
+    override fun pageListRequest(chapter: SChapter): Request {
         val parts = chapter.url.split("/")
         val seriesType = parts.getOrElse(0) { "manga" }
         val seriesId = parts.getOrElse(1) { "0" }
@@ -255,20 +258,19 @@ class ProComic : HttpSource() {
             .addQueryParameter("_cid", chapterId)
             .build()
 
-        // نمرر نوع السلسلة الأصلي كـ Tag لكي نستخدمه في الفلترة والتبديل لاحقاً إذا لزم الأمر
         return GET(url, headers.newBuilder().set("Accept", "application/json").build())
-            .newBuilder()
-            .tag(String::class.java, seriesType) 
-            .build()
     }
-        
-        override fun pageListParse(response: Response): List<Page> {
+
+    override fun pageListParse(response: Response): List<Page> {
         val chapterId = response.request.url.queryParameter("_cid") ?: return emptyList()
-        val originalType = response.request.tag(String::class.java) ?: "manga"
-        
-        val parts = response.request.url.pathSegments
-        val idx = parts.indexOf("public")
-        val seriesId = parts.getOrElse(idx + 2) { "0" }
+        val seriesType = response.request.url.pathSegments.let { parts ->
+            val idx = parts.indexOf("public")
+            parts.getOrElse(idx + 1) { "manga" }
+        }
+        val seriesId = response.request.url.pathSegments.let { parts ->
+            val idx = parts.indexOf("public")
+            parts.getOrElse(idx + 2) { "0" }
+        }
 
         val apiHeaders = headers.newBuilder().set("Accept", "application/json").build()
         val pages = mutableListOf<Page>()
@@ -279,30 +281,24 @@ class ProComic : HttpSource() {
         val mapsList = mutableListOf<DeferredPageMap>()
         var found = false
 
-        // محاولة القراءة من الاستجابة الحالية
-        var currentData = try { response.parseAs<ChaptersResponse>() } catch (e: Exception) { ChaptersResponse() }
-        
-        // [التعديل الفعال]: إذا كانت الاستجابة فارغة وكان العمل manhua/manhwa، نجرب المسارات البديلة فوراً
-        if ((currentData.data.isEmpty() || currentData.data.none { it.id.toString() == chapterId }) && 
-            (originalType == "manhua" || originalType == "manhwa")) {
-            
-            val typesToTry = listOf("manga", "comic")
-            for (fallbackType in typesToTry) {
+        var cachedSessionKey: String? = null
+        var sessionKeyAttempted = false
+        val getSessionKey = {
+            if (!sessionKeyAttempted) {
+                sessionKeyAttempted = true
                 try {
-                    val fallbackUrl = "$baseUrl/api/public/$fallbackType/$seriesId/chapters?page=1&limit=500&order=desc&_cid=$chapterId"
-                    val fallbackResp = client.newCall(GET(fallbackUrl, apiHeaders)).execute()
-                    if (fallbackResp.isSuccessful) {
-                        val fallbackData = fallbackResp.parseAs<ChaptersResponse>()
-                        if (fallbackData.data.any { it.id.toString() == chapterId }) {
-                            currentData = fallbackData
-                            break
-                        }
+                    val req = client.newCall(
+                        GET("$baseUrl/chapter-map-session-key/$chapterId?legacy=1", apiHeaders),
+                    ).execute()
+                    if (req.isSuccessful) {
+                        cachedSessionKey = req.parseAs<SessionKeyResponse>().data?.key
                     }
-                } catch (e: Exception) {}
+                } catch (e: Exception) { }
             }
+            cachedSessionKey
         }
 
-        // نتابع الكود الأصلي بشكل طبيعي لاستخراج البيانات بعد التبديل الآمن
+        val currentData = try { response.parseAs<ChaptersResponse>() } catch (e: Exception) { ChaptersResponse() }
         for (ch in currentData.data) {
             if (ch.id.toString() == chapterId) {
                 cdnPath = ch.cdnPath ?: "cdn1"
@@ -313,27 +309,16 @@ class ProComic : HttpSource() {
             }
         }
 
-        // ... بقية الدالة تظل كما هي دون أي تغيير لضمان عدم تأثر السلاسل الأخرى ...
-        val cachedSessionKey: String? = null
-        var sessionKeyAttempted = false
-        val getSessionKey = {
-            if (!sessionKeyAttempted) {
-                sessionKeyAttempted = true
-                try {
-                    val req = client.newCall(GET("$baseUrl/chapter-map-session-key/$chapterId?legacy=1", apiHeaders)).execute()
-                    if (req.isSuccessful) cachedSessionKey = req.parseAs<SessionKeyResponse>().data?.key
-                } catch (e: Exception) { }
-            }
-            cachedSessionKey
-        }
-
         if (!found) {
-            // كود البحث في الصفحات التالية (Pagination) في حال لم يعثر عليه في الصفحة الأولى
             var pg = 2
-            val typeForPages = if (originalType == "manhua" || originalType == "manhwa") "manga" else originalType
             outer@ while (pg <= 10) {
                 try {
-                    val resp = client.newCall(GET("$baseUrl/api/public/$typeForPages/$seriesId/chapters?limit=600&page=$pg&order=desc", apiHeaders)).execute()
+                    val resp = client.newCall(
+                        GET(
+                            "$baseUrl/api/public/$seriesType/$seriesId/chapters?limit=600&page=$pg&order=desc",
+                            apiHeaders,
+                        ),
+                    ).execute()
                     if (!resp.isSuccessful) break
                     val data = resp.parseAs<ChaptersResponse>()
                     if (data.data.isEmpty()) break
@@ -359,19 +344,33 @@ class ProComic : HttpSource() {
         }
 
         mapsList.forEach { map ->
-            if (map.pieces.isNotEmpty()) {
-                val absolutePieces = map.pieces.map { it.toAbsoluteUrl(cdnBase) }
-                processMap(map.dim, map.mode, absolutePieces, map.order, map.token, pages, seenUrls)
-            } else if (map.token.isNotBlank() && map.pieces.isEmpty()) {
-                val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
-                if (resolved != null && resolved.pieces.isNotEmpty()) {
-                    val absolutePieces = resolved.pieces.map { it.toAbsoluteUrl(cdnBase) }
-                    processMap(resolved.dim, resolved.mode, absolutePieces, resolved.order, resolved.token, pages, seenUrls)
+            when {
+                map.token.isNotBlank() && map.pieces.isEmpty() && map.token.isJwt() -> {
+                    mapTokens.add(map.token)
+                }
+                map.token.isNotBlank() && map.pieces.isEmpty() -> {
+                    val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
+                    if (resolved != null && resolved.pieces.isNotEmpty()) {
+                        val absolutePieces = resolved.pieces.map { it.toAbsoluteUrl(cdnBase) }
+                        processMap(resolved.dim, resolved.mode, absolutePieces, resolved.order, resolved.token, pages, seenUrls)
+                    }
+                }
+                map.pieces.isNotEmpty() -> {
+                    val absolutePieces = map.pieces.map { it.toAbsoluteUrl(cdnBase) }
+                    processMap(map.dim, map.mode, absolutePieces, map.order, map.token, pages, seenUrls)
                 }
             }
         }
-        return pages
+
+        for (jwtToken in mapTokens) {
+            try {
+                val newPages = fetchDeferredPages(chapterId, jwtToken, apiHeaders, seenUrls, cdnBase, getSessionKey)
+                pages.addAll(newPages)
+            } catch (e: Exception) { }
         }
+
+        return pages
+    }
 
     private fun String.isJwt(): Boolean =
         startsWith("eyJhbGci") && count { it == '.' } == 2
@@ -426,7 +425,23 @@ class ProComic : HttpSource() {
 
             splitData.maps.forEach { map ->
                 when {
-                    map.token.isNotBlank() && map.pieces.isEmpty() && map.token.isJwt() -> { }
+                    map.token.isNotBlank() && map.pieces.isEmpty() && map.token.isJwt() -> {
+                        // Lazy page: store only the token; pieces will be fetched fresh
+                        // at render time via proxy-plan to avoid expired CDN URLs.
+                        val lazyMap = ScrambledMap(
+                            dim = map.dim,
+                            mode = map.mode,
+                            pieces = emptyList(),   // intentionally empty — fetched lazily
+                            order = map.order,
+                            signedToken = map.token, // token drives proxy-plan call in reconstructPage
+                        )
+                        val encoded = Base64.encodeToString(
+                            json.encodeToString(lazyMap).toByteArray(Charsets.UTF_8),
+                            Base64.URL_SAFE or Base64.NO_WRAP,
+                        )
+                        val shortUrl = "$SCRAMBLED_SCHEME${pages.size}_part_0.jpg#$encoded"
+                        pages.add(Page(pages.size, url = shortUrl, imageUrl = shortUrl))
+                    }
                     else -> {
                         val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
                         if (resolved != null && resolved.pieces.isNotEmpty()) {
@@ -488,6 +503,17 @@ class ProComic : HttpSource() {
         return null
     }
 
+    // Extract cid (chapterId) from the JWT payload without full signature verification.
+    // JWT structure: header.payload.signature — all Base64URL encoded.
+    private fun extractChapterIdFromJwt(jwt: String): String? = try {
+        val payload = jwt.split(".").getOrNull(1) ?: return null
+        val decoded = String(Base64.decode(payload, Base64.URL_SAFE or Base64.NO_WRAP), Charsets.UTF_8)
+        val obj = json.parseToJsonElement(decoded).jsonObject
+        obj["cid"]?.jsonPrimitive?.content
+            ?: obj["chapterId"]?.jsonPrimitive?.content
+    } catch (_: Exception) { null }
+
+    // هنا تكمن معالجة المشكلة: إبقاء الرابط الخارجي قصيراً وحفظ الـ Map كـ Hash محلي متصل بالصفحة
     private fun processMap(
         dim: List<Int>,
         mode: String,
@@ -520,27 +546,66 @@ class ProComic : HttpSource() {
                 json.encodeToString(mapData).toByteArray(Charsets.UTF_8),
                 Base64.URL_SAFE or Base64.NO_WRAP,
             )
+            // نضع الرابط قصيراً جداً لتجنب خطأ السيرفر، ونلحق البيانات بعد علامة # كـ Fragment محلي للتطبيق فقط
             val shortUrl = "$SCRAMBLED_SCHEME${pages.size}_part_$p.jpg#$encoded"
             pages.add(Page(pages.size, url = shortUrl, imageUrl = shortUrl))
         }
     }
 
     private fun reconstructPage(map: ScrambledMap): ByteArray? {
-        if (map.pieces.isEmpty()) return null
+        // If pieces are empty but we have a token, fetch fresh piece URLs now
+        // (at render time) to avoid the CDN URL expiry problem.
+        val resolvedMap: ScrambledMap = if (map.pieces.isEmpty() && map.signedToken.isNotBlank()) {
+            try {
+                val lazyDeferred = DeferredPageMap(
+                    token  = map.signedToken,
+                    dim    = map.dim,
+                    mode   = map.mode,
+                    order  = map.order,
+                )
+                val bodyStr = json.encodeToString(lazyDeferred)
+                val body    = bodyStr.toRequestBody("application/json".toMediaType())
+                // chapterId is encoded in map.signedToken as the "cid" claim — extract it
+                val chapterId = extractChapterIdFromJwt(map.signedToken)
+                    ?: return null
+                val proxyReq = POST(
+                    "$baseUrl/chapter-map-proxy-plan/$chapterId",
+                    headersBuilder()
+                        .add("Accept", "application/json")
+                        .add("Content-Type", "application/json")
+                        .build(),
+                    body,
+                )
+                val resp = client.newCall(proxyReq).execute()
+                val fresh = if (resp.isSuccessful) resp.parseAs<ProxyPlanResponse>().data?.map else null
+                if (fresh == null || fresh.pieces.isEmpty()) return null
+                // Merge fresh pieces/order into original map (keep dim/mode from original)
+                map.copy(pieces = fresh.pieces, order = fresh.order.ifEmpty { map.order })
+            } catch (e: Exception) {
+                return null
+            }
+        } else {
+            map
+        }
 
-        val (cols, rows) = parseMode(map.mode, map.pieces.size)
-        val bitmaps = arrayOfNulls<Bitmap>(map.pieces.size)
+        if (resolvedMap.pieces.isEmpty()) return null
 
-        val pieceUrls = Array(map.pieces.size) { targetIdx ->
-            val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
-            val base = map.pieces.getOrNull(srcIdx) ?: ""
-            if (base.isNotBlank() && map.signedToken.isNotBlank() && !base.contains("/i/eyJ2IjoxLCJpdiI6IJ")) {
-                if (base.contains("?")) "$base&token=${map.signedToken}" else "$base?token=${map.signedToken}"
+        val (cols, rows) = parseMode(resolvedMap.mode, resolvedMap.pieces.size)
+        val bitmaps = arrayOfNulls<Bitmap>(resolvedMap.pieces.size)
+
+        // Build resolved piece URLs for all slots upfront
+        val pieceUrls = Array(resolvedMap.pieces.size) { targetIdx ->
+            val srcIdx = if (resolvedMap.order.size == resolvedMap.pieces.size) resolvedMap.order[targetIdx] else targetIdx
+            val base = resolvedMap.pieces.getOrNull(srcIdx) ?: ""
+            if (base.isNotBlank() && resolvedMap.signedToken.isNotBlank() && !base.contains("/i/eyJ2IjoxLCJpdiI6IJ")) {
+                if (base.contains("?")) "$base&token=${resolvedMap.signedToken}" else "$base?token=${resolvedMap.signedToken}"
             } else {
                 base
             }
         }
 
+        // Download all pieces in parallel to avoid slow sequential loading.
+        // Uses a dedicated newCall() (not chain.proceed) to prevent interceptor re-entry.
         val futures = pieceUrls.map { pieceUrl ->
             val future = CompletableFuture<ByteArray?>()
             if (pieceUrl.isBlank()) {
@@ -552,11 +617,12 @@ class ProComic : HttpSource() {
                     .header("Accept", "image/avif,image/webp,image/jpeg,*/*")
                     .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
                     .build()
-                
-                piecesClient.newCall(req).enqueue(object : okhttp3.Callback {
+                client.newCall(req).enqueue(object : okhttp3.Callback {
                     override fun onResponse(call: okhttp3.Call, response: Response) {
                         try {
                             val bodyBytes = response.use { it.body.bytes() }
+                            // Probe first 50 bytes as ASCII to detect data-URI safely,
+                            // avoids single-byte checks that fail on compressed responses.
                             val sampleSize = minOf(bodyBytes.size, 50)
                             val sample = String(bodyBytes, 0, sampleSize, Charsets.US_ASCII).trim()
                             val finalBytes = if (sample.startsWith("data:image", ignoreCase = true)) {
@@ -614,7 +680,7 @@ class ProComic : HttpSource() {
             if (calcTotalW <= 0 || actualPartH <= 0) return null
 
             val result = try {
-                Bitmap.createBitmap(calcTotalW, actualPartH, Bitmap.Config.RGB_565)
+                Bitmap.createBitmap(calcTotalW, actualPartH, Bitmap.Config.ARGB_8888)
             } catch (e: OutOfMemoryError) {
                 Bitmap.createBitmap(calcTotalW, actualPartH, Bitmap.Config.RGB_565)
             }
@@ -702,8 +768,8 @@ class ProComic : HttpSource() {
             val p = if (clean.contains("x")) clean.split("x") else clean.split("_")
             Pair(p.getOrNull(0)?.toIntOrNull() ?: 1, p.getOrNull(1)?.toIntOrNull() ?: 1)
         }
-        mode.startsWith("vertical_") -> Pair(1, mode.removePrefix("vertical_").toIntOrNull() ?: pieceCount)
-        mode.startsWith("horizontal_") -> Pair(mode.removePrefix("horizontal_").toIntOrNull() ?: pieceCount, 1)
+        mode.startsWith("vertical_") -> Pair(mode.removePrefix("vertical_").toIntOrNull() ?: pieceCount, 1)
+        mode.startsWith("horizontal_") -> Pair(1, mode.removePrefix("horizontal_").toIntOrNull() ?: pieceCount)
         else -> Pair(1, pieceCount)
     }
 
