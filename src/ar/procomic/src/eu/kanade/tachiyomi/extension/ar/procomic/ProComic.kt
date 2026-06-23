@@ -19,6 +19,9 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.decodeFromStream
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.parseToJsonElement
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
@@ -563,16 +566,16 @@ class ProComic : HttpSource() {
                     mode   = map.mode,
                     order  = map.order,
                 )
-                val bodyStr = json.encodeToString(lazyDeferred)
+                val bodyStr = json.encodeToString(DeferredPageMap.serializer(), lazyDeferred)
                 val body    = bodyStr.toRequestBody("application/json".toMediaType())
                 // chapterId is encoded in map.signedToken as the "cid" claim — extract it
                 val chapterId = extractChapterIdFromJwt(map.signedToken)
                     ?: return null
                 val proxyReq = POST(
                     "$baseUrl/chapter-map-proxy-plan/$chapterId",
-                    headersBuilder()
-                        .add("Accept", "application/json")
-                        .add("Content-Type", "application/json")
+                    headers.newBuilder()
+                        .set("Accept", "application/json")
+                        .set("Content-Type", "application/json")
                         .build(),
                     body,
                 )
