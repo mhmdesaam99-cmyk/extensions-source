@@ -339,12 +339,12 @@ class ProComic : HttpSource() {
                     val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
                     if (resolved != null && resolved.pieces.isNotEmpty()) {
                         val absolutePieces = resolved.pieces.map { it.toAbsoluteUrl(cdnBase) }
-                        processMap(resolved.dim, resolved.mode, absolutePieces, resolved.order, resolved.token, pages, seenUrls)
+                        processMap(resolved.dim, resolved.mode, absolutePieces, resolved.order, resolved.rects, resolved.token, pages, seenUrls)
                     }
                 }
                 map.pieces.isNotEmpty() -> {
                     val absolutePieces = map.pieces.map { it.toAbsoluteUrl(cdnBase) }
-                    processMap(map.dim, map.mode, absolutePieces, map.order, map.token, pages, seenUrls)
+                    processMap(map.dim, map.mode, absolutePieces, map.order, map.rects, map.token, pages, seenUrls)
                 }
             }
         }
@@ -442,7 +442,7 @@ class ProComic : HttpSource() {
 
             decryptedMaps.forEach { map ->
                 val absolutePieces = map.pieces.map { it.toAbsoluteUrl(cdnBase) }
-                processMap(map.dim, map.mode, absolutePieces, map.order, map.token, pages, seenUrls)
+                processMap(map.dim, map.mode, absolutePieces, map.order, map.rects, map.token, pages, seenUrls)
             }
         }
 
@@ -513,6 +513,7 @@ class ProComic : HttpSource() {
         mode: String,
         pieces: List<String>,
         order: List<Int>,
+        rects: List<RectDto>,
         signedToken: String,
         pages: MutableList<Page>,
         seenUrls: MutableSet<String>,
@@ -532,6 +533,7 @@ class ProComic : HttpSource() {
                 mode = mode,
                 pieces = pieces,
                 order = order,
+                rects = rects,
                 signedToken = signedToken,
                 splitPart = p,
                 totalParts = parts,
@@ -549,7 +551,8 @@ class ProComic : HttpSource() {
     private fun reconstructPage(map: ScrambledMap): ByteArray? {
         if (map.pieces.isEmpty()) return null
 
-        val (cols, rows) = parseMode(map.mode, map.pieces.size)
+        val useRects = map.rects.size == map.pieces.size
+        val (cols, rows) = if (!useRects) parseMode(map.mode, map.pieces.size) else Pair(1, 1)
         val bitmaps = arrayOfNulls<Bitmap>(map.pieces.size)
 
         for (targetIdx in 0 until map.pieces.size) {
@@ -597,70 +600,66 @@ class ProComic : HttpSource() {
             val validBitmaps = bitmaps.filterNotNull()
             if (validBitmaps.isEmpty()) return null
 
-            var calcTotalW: Int
-            var calcTotalH: Int
-
-            when {
-                cols == 1 -> {
-                    calcTotalW = map.dim.getOrNull(0)?.takeIf { it > 0 } ?: validBitmaps.maxOf { it.width }
-                    calcTotalH = map.dim.getOrNull(1)?.takeIf { it > 0 } ?: validBitmaps.sumOf { it.height }
-                }
-                rows == 1 -> {
-                    calcTotalW = map.dim.getOrNull(0)?.takeIf { it > 0 } ?: validBitmaps.sumOf { it.width }
-                    calcTotalH = map.dim.getOrNull(1)?.takeIf { it > 0 } ?: validBitmaps.maxOf { it.height }
-                }
-                else -> {
-                    val firstBmp = validBitmaps.first()
-                    calcTotalW = map.dim.getOrNull(0)?.takeIf { it > 0 } ?: (firstBmp.width * cols)
-                    calcTotalH = map.dim.getOrNull(1)?.takeIf { it > 0 } ?: (firstBmp.height * rows)
-                }
-            }
+            val totalW = map.dim.getOrNull(0)?.takeIf { it > 0 }
+                ?: if (useRects) map.rects.maxOf { it.left + it.width } else validBitmaps.maxOf { it.width }
+            val totalH = map.dim.getOrNull(1)?.takeIf { it > 0 }
+                ?: if (useRects) map.rects.maxOf { it.top + it.height } else validBitmaps.sumOf { it.height }
 
             val totalParts = map.totalParts ?: 1
             val splitPart = map.splitPart ?: 0
-            val partH = calcTotalH / totalParts
-            val actualPartH = if (splitPart == totalParts - 1) calcTotalH - (partH * splitPart) else partH
+            val partH = totalH / totalParts
+            val actualPartH = if (splitPart == totalParts - 1) totalH - (partH * splitPart) else partH
 
-            if (calcTotalW <= 0 || actualPartH <= 0) return null
+            if (totalW <= 0 || actualPartH <= 0) return null
 
             val result = try {
-                Bitmap.createBitmap(calcTotalW, actualPartH, Bitmap.Config.ARGB_8888)
+                Bitmap.createBitmap(totalW, actualPartH, Bitmap.Config.ARGB_8888)
             } catch (e: OutOfMemoryError) {
-                Bitmap.createBitmap(calcTotalW, actualPartH, Bitmap.Config.RGB_565)
+                Bitmap.createBitmap(totalW, actualPartH, Bitmap.Config.RGB_565)
             }
             val canvas = Canvas(result)
             canvas.translate(0f, -(splitPart * partH).toFloat())
 
-            when {
-                cols == 1 -> {
-                    var currentY = 0f
-                    for (bmp in bitmaps) {
-                        if (bmp != null) {
-                            canvas.drawBitmap(bmp, 0f, currentY, null)
-                            currentY += bmp.height
-                            bmp.recycle()
+            if (useRects) {
+                // استخدام الـ rects للموضع الدقيق لكل قطعة
+                for (targetIdx in bitmaps.indices) {
+                    val bmp = bitmaps[targetIdx] ?: continue
+                    val rect = map.rects[targetIdx]
+                    canvas.drawBitmap(bmp, rect.left.toFloat(), rect.top.toFloat(), null)
+                    bmp.recycle()
+                }
+            } else {
+                when {
+                    cols == 1 -> {
+                        var currentY = 0f
+                        for (bmp in bitmaps) {
+                            if (bmp != null) {
+                                canvas.drawBitmap(bmp, 0f, currentY, null)
+                                currentY += bmp.height
+                                bmp.recycle()
+                            }
                         }
                     }
-                }
-                rows == 1 -> {
-                    var currentX = 0f
-                    for (bmp in bitmaps) {
-                        if (bmp != null) {
-                            canvas.drawBitmap(bmp, currentX, 0f, null)
-                            currentX += bmp.width
-                            bmp.recycle()
+                    rows == 1 -> {
+                        var currentX = 0f
+                        for (bmp in bitmaps) {
+                            if (bmp != null) {
+                                canvas.drawBitmap(bmp, currentX, 0f, null)
+                                currentX += bmp.width
+                                bmp.recycle()
+                            }
                         }
                     }
-                }
-                else -> {
-                    val tileW = validBitmaps.first().width
-                    val tileH = validBitmaps.first().height
-                    for (targetIdx in bitmaps.indices) {
-                        val bmp = bitmaps[targetIdx] ?: continue
-                        val col = targetIdx % cols
-                        val row = targetIdx / cols
-                        canvas.drawBitmap(bmp, (col * tileW).toFloat(), (row * tileH).toFloat(), null)
-                        bmp.recycle()
+                    else -> {
+                        val tileW = validBitmaps.first().width
+                        val tileH = validBitmaps.first().height
+                        for (targetIdx in bitmaps.indices) {
+                            val bmp = bitmaps[targetIdx] ?: continue
+                            val col = targetIdx % cols
+                            val row = targetIdx / cols
+                            canvas.drawBitmap(bmp, (col * tileW).toFloat(), (row * tileH).toFloat(), null)
+                            bmp.recycle()
+                        }
                     }
                 }
             }
@@ -753,11 +752,20 @@ data class EncryptedToken(
 )
 
 @Serializable
+data class RectDto(
+    val left: Int = 0,
+    val top: Int = 0,
+    val width: Int = 0,
+    val height: Int = 0,
+)
+
+@Serializable
 data class ScrambledMap(
     val dim: List<Int> = emptyList(),
     val mode: String = "",
     val pieces: List<String> = emptyList(),
     val order: List<Int> = emptyList(),
+    val rects: List<RectDto> = emptyList(),
     val signedToken: String = "",
     val splitPart: Int? = null,
     val totalParts: Int? = null,
@@ -848,6 +856,7 @@ data class DeferredPageMap(
     val mode: String = "",
     val pieces: List<String> = emptyList(),
     val order: List<Int> = emptyList(),
+    val rects: List<RectDto> = emptyList(),
     val token: String = "",
     val method: String = "",
 )
