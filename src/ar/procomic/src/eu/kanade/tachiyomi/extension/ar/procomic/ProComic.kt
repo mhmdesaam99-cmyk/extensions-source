@@ -20,7 +20,6 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.decodeFromStream
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -275,7 +274,6 @@ class ProComic : HttpSource() {
     override fun pageListParse(response: Response): List<Page> {
         val chapterId = response.request.url.queryParameter("_cid") ?: return emptyList()
         
-        // استخراج نوع السلسلة لمعرفة ما إذا كانت مانهوا/مانها أو مانجا
         val seriesType = response.request.url.pathSegments.let { parts ->
             val idx = parts.indexOf("public")
             parts.getOrElse(idx + 1) { "manga" }
@@ -415,7 +413,7 @@ class ProComic : HttpSource() {
         seenUrls: MutableSet<String>,
         cdnBase: String,
         getSessionKey: () -> String?,
-        seriesType: String // تم تمرير نوع السلسلة هنا أيضاً
+        seriesType: String 
     ): List<Page> {
         val pages = mutableListOf<Page>()
         val jwtSplit = jwtSplitValue(jwtToken)
@@ -432,7 +430,7 @@ class ProComic : HttpSource() {
 
                 if (!resp.isSuccessful) continue
                 val parsed = resp.parseAs<ChapterDeferredResponse>()
-                if (parsed.success == true && parsed.data != null) splitResponses.add(parsed.data)
+                parsed.data?.let { splitResponses.add(it) }
             } catch (e: Exception) {
                 continue
             }
@@ -515,14 +513,13 @@ class ProComic : HttpSource() {
         pieces: List<String>,
         order: List<Int>,
         signedToken: String,
-        seriesType: String, // تحديد نوع العمل
+        seriesType: String,
         pages: MutableList<Page>,
         seenUrls: MutableSet<String>,
     ) {
         if (pieces.isEmpty() || !seenUrls.add(pieces.first())) return
 
-        // 🟢 الإضافة الجديدة: فحص نوع السلسلة (مانهوا أو مانها)
-        // إذا كانت مانهوا/مانها، نستخرج القطع مرتبة كصفحات مستقلة، وتطبيق تاتش يومي سيعرضها متتالية
+        // إذا كانت السلسلة مانهوا أو مانها نستخرج القطع مباشرة كصفحات متتالية
         if (seriesType.equals("manhwa", ignoreCase = true) || seriesType.equals("manhua", ignoreCase = true)) {
             for (targetIdx in pieces.indices) {
                 val srcIdx = if (order.size == pieces.size) order[targetIdx] else targetIdx
@@ -539,7 +536,7 @@ class ProComic : HttpSource() {
             return
         }
 
-        // 🔴 الكود أدناه سيُطبق فقط على فصول سلسلة الـ Manga
+        // هذا الكود ينطبق فقط على فصول سلسلة الـ Manga
         val estimatedTotalH = dim.getOrNull(1)?.takeIf { it > 0 } ?: 10000
         val parts = if (estimatedTotalH > MAX_SAFE_HEIGHT) {
             ceil(estimatedTotalH.toDouble() / MAX_SAFE_HEIGHT).toInt()
@@ -744,8 +741,9 @@ class ProComic : HttpSource() {
         else -> Pair(1, pieceCount)
     }
 
+    // تم إصلاح الخطأ المسبب لـ Build Failed في هذه الدالة
     private inline fun <reified T> Response.parseAs(): T =
-        json.decodeFromStream(body.byteStream())
+        json.decodeFromString(body!!.string())
 }
 
 private const val DEFAULT_SPLIT = 3
