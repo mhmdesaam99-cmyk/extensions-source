@@ -33,6 +33,7 @@ import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
@@ -55,16 +56,10 @@ class ProComic : HttpSource() {
 
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
-    // ✅ التعديل 1: إضافة عميل مستقل للقطع لمنع الاختناق (Deadlock)
-    private val piecesClient: OkHttpClient by lazy {
-        network.cloudflareClient.newBuilder()
-            .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
-            .build()
-    }
+    // ✅ الحل الجذري الأول: استخدام Thread Pool منفصل لتخطي اختناق طابور OkHttp بالكامل
+    private val pieceExecutor = Executors.newFixedThreadPool(8)
 
     companion object {
-        // تم تغيير البنية لمنع إرسال روابط طويلة عبر الشبكة
         private const val SCRAMBLED_SCHEME = "https://procomic.pro/__scrambled_asset__/"
         private const val MAX_SAFE_HEIGHT = 6000
     }
@@ -78,7 +73,6 @@ class ProComic : HttpSource() {
         }
     }
 
-    // الـ Interceptor الآن يقرأ خريطة التفكيك محلياً من كائن الصفحة لمنع الـ 502 تماماً
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(25, TimeUnit.SECONDS)
@@ -88,7 +82,6 @@ class ProComic : HttpSource() {
             val url = request.url.toString()
 
             if (url.startsWith(SCRAMBLED_SCHEME)) {
-                // محاولة استخراج الخريطة من التاج المحلي الملحق بالطلب إن وجد
                 val pageMap = request.tag(ScrambledMap::class.java)
                     ?: return@addInterceptor Response.Builder()
                         .request(request).protocol(Protocol.HTTP_1_1)
@@ -139,7 +132,6 @@ class ProComic : HttpSource() {
         }
         .build()
 
-    // تخصيص دالة طلب الصورة لحقن خريطة الدمج محلياً داخل الـ Tag الخاص بـ OkHttp دون إرسالها للسيرفر
     override fun imageUrlParse(response: Response): String = ""
 
     override fun imageRequest(page: Page): Request {
@@ -152,18 +144,27 @@ class ProComic : HttpSource() {
 
         if (fragmentData.isNotBlank()) {
             try {
-                // ✅ التعديل 2: فك تشفير الـ URL واستخدام NO_PADDING
-                val decodedFragment = java.net.URLDecoder.decode(fragmentData, "UTF-8")
-                val mapJson = String(Base64.decode(decodedFragment, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING))
+                // محاولة فك التشفير مع تأمين قوي للـ Fallback
+                val decodedFragment = try {
+                    java.net.URLDecoder.decode(fragmentData, "UTF-8")
+                } catch (e: Exception) { fragmentData }
+
+                val mapJson = try {
+                    String(Base64.decode(decodedFragment, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING))
+                } catch (e: Exception) {
+                    String(Base64.decode(fragmentData, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING))
+                }
+                
                 val pageMap = json.decodeFromString<ScrambledMap>(mapJson)
                 
-                val cleanUrl = imageUrl.substringBefore("#")
-                val req = Request.Builder()
+                val cleanUrl = imageUrl.substringBefore("#").takeIf { it.isNotBlank() } 
+                    ?: page.url.substringBefore("#")
+                    
+                return Request.Builder()
                     .url(cleanUrl)
                     .headers(headers)
                     .tag(ScrambledMap::class.java, pageMap)
                     .build()
-                return req
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -525,7 +526,6 @@ class ProComic : HttpSource() {
             )
             val encoded = Base64.encodeToString(
                 json.encodeToString(mapData).toByteArray(Charsets.UTF_8),
-                // ✅ التعديل 3: إضافة NO_PADDING
                 Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING,
             )
             val shortUrl = "$SCRAMBLED_SCHEME${pages.size}_part_$p.jpg#$encoded"
@@ -549,39 +549,35 @@ class ProComic : HttpSource() {
             }
         }
 
+        // ✅ الحل الجذري الثاني: استخدام execute() بدلاً من enqueue() داخل الثريد بول لفك التجمد بالكامل!
         val futures = pieceUrls.map { pieceUrl ->
-            val future = CompletableFuture<ByteArray?>()
-            if (pieceUrl.isBlank()) {
-                future.complete(null)
-            } else {
-                val req = Request.Builder()
-                    .url(pieceUrl)
-                    .header("Referer", "$baseUrl/")
-                    .header("Accept", "image/avif,image/webp,image/jpeg,*/*")
-                    .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
-                    .build()
-                // ✅ التعديل 4: استخدام piecesClient بدلاً من client الأساسي
-                piecesClient.newCall(req).enqueue(object : okhttp3.Callback {
-                    override fun onResponse(call: okhttp3.Call, response: Response) {
-                        try {
-                            val bodyBytes = response.use { it.body.bytes() }
-                            val sampleSize = minOf(bodyBytes.size, 50)
-                            val sample = String(bodyBytes, 0, sampleSize, Charsets.US_ASCII).trim()
-                            val finalBytes = if (sample.startsWith("data:image", ignoreCase = true)) {
-                                val base64Data = String(bodyBytes, Charsets.UTF_8).substringAfter(",")
-                                Base64.decode(base64Data, Base64.DEFAULT)
-                            } else {
-                                bodyBytes
-                            }
-                            future.complete(finalBytes)
-                        } catch (e: Exception) { future.complete(null) }
+            CompletableFuture.supplyAsync({
+                if (pieceUrl.isBlank()) return@supplyAsync null
+                try {
+                    val req = Request.Builder()
+                        .url(pieceUrl)
+                        .header("Referer", "$baseUrl/")
+                        .header("Accept", "image/avif,image/webp,image/jpeg,*/*")
+                        .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
+                        .build()
+                    
+                    val response = network.cloudflareClient.newCall(req).execute() // طلب متزامن يكسر الـ Deadlock
+                    if (!response.isSuccessful) return@supplyAsync null
+                    
+                    val bodyBytes = response.body?.bytes() ?: return@supplyAsync null
+                    val sampleSize = minOf(bodyBytes.size, 50)
+                    val sample = String(bodyBytes, 0, sampleSize, Charsets.US_ASCII).trim()
+                    
+                    if (sample.startsWith("data:image", ignoreCase = true)) {
+                        val base64Data = String(bodyBytes, Charsets.UTF_8).substringAfter(",")
+                        Base64.decode(base64Data, Base64.DEFAULT)
+                    } else {
+                        bodyBytes
                     }
-                    override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
-                        future.complete(null)
-                    }
-                })
-            }
-            future
+                } catch (e: Exception) {
+                    null
+                }
+            }, pieceExecutor)
         }
 
         futures.forEachIndexed { targetIdx, future ->
@@ -704,14 +700,15 @@ class ProComic : HttpSource() {
         }
     }
 
+    // ✅ الحل الجذري الثالث: تصحيح أبعاد الأعمدة والصفوف للصور الطولية والأفقية
     private fun parseMode(mode: String, pieceCount: Int): Pair<Int, Int> = when {
         mode.startsWith("grid_") -> {
             val clean = mode.removePrefix("grid_")
             val p = if (clean.contains("x")) clean.split("x") else clean.split("_")
             Pair(p.getOrNull(0)?.toIntOrNull() ?: 1, p.getOrNull(1)?.toIntOrNull() ?: 1)
         }
-        mode.startsWith("vertical_") -> Pair(mode.removePrefix("vertical_").toIntOrNull() ?: pieceCount, 1)
-        mode.startsWith("horizontal_") -> Pair(1, mode.removePrefix("horizontal_").toIntOrNull() ?: pieceCount)
+        mode.startsWith("vertical_") -> Pair(1, mode.removePrefix("vertical_").toIntOrNull() ?: pieceCount)
+        mode.startsWith("horizontal_") -> Pair(mode.removePrefix("horizontal_").toIntOrNull() ?: pieceCount, 1)
         else -> Pair(1, pieceCount)
     }
 
