@@ -60,11 +60,10 @@ class ProComic : HttpSource() {
         private const val MAX_SAFE_HEIGHT = 6000
     }
 
-    // عميل منفصل مخصص لتحميل القطع لتجنب التجميد (Deadlock) نهائياً
     private val piecesClient = network.cloudflareClient.newBuilder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(25, TimeUnit.SECONDS)
-        .rateLimit(4, 1) // أسرع قليلاً لأن القطع صغيرة وتحتاج تحميل متوازي
+        .rateLimit(4, 1)
         .build()
 
     private fun String.toAbsoluteUrl(cdnBase: String): String {
@@ -203,7 +202,7 @@ class ProComic : HttpSource() {
             SManga.create().apply {
                 url = "${parts.getOrElse(idx + 1) { "manga" }}/${parts.getOrElse(idx + 2) { "0" }}/${data.slug ?: ""}"
                 title = data.title ?: ""
-                thumbnail_url = coverImageApp?.card?.mobile ?: coverImageApp?.desktop ?: data.coverImage
+                thumbnail_url = data.coverImageApp?.card?.mobile ?: data.coverImageApp?.desktop ?: data.coverImage
                 author = data.author
                 artist = data.artist
                 description = data.synopsis ?: data.description
@@ -550,7 +549,6 @@ class ProComic : HttpSource() {
                     .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
                     .build()
                 
-                // تم التعديل هنا لطلب القطع عبر العميل المنفصل piecesClient لمنع الـ Deadlock والتجميد
                 piecesClient.newCall(req).enqueue(object : okhttp3.Callback {
                     override fun onResponse(call: okhttp3.Call, response: Response) {
                         try {
@@ -611,7 +609,6 @@ class ProComic : HttpSource() {
 
             if (calcTotalW <= 0 || actualPartH <= 0) return null
 
-            // استخدام RGB_565 افتراضياً لتوفير 50% من الذاكرة ومنع كراش الـ OOM في الفصول الطويلة
             val result = try {
                 Bitmap.createBitmap(calcTotalW, actualPartH, Bitmap.Config.RGB_565)
             } catch (e: OutOfMemoryError) {
@@ -695,16 +692,13 @@ class ProComic : HttpSource() {
         }
     }
 
-    // تم تعديل منطق تفكيك الأنماط هنا ليكون متوافقاً مع رسم الـ Canvas بشكل صحيح ودون قلب الصور
     private fun parseMode(mode: String, pieceCount: Int): Pair<Int, Int> = when {
         mode.startsWith("grid_") -> {
             val clean = mode.removePrefix("grid_")
             val p = if (clean.contains("x")) clean.split("x") else clean.split("_")
             Pair(p.getOrNull(0)?.toIntOrNull() ?: 1, p.getOrNull(1)?.toIntOrNull() ?: 1)
         }
-        // عمودي يعني: عمود واحد (1) وعدة صفوف (pieceCount)
         mode.startsWith("vertical_") -> Pair(1, mode.removePrefix("vertical_").toIntOrNull() ?: pieceCount)
-        // أفقي يعني: عدة أعمدة (pieceCount) وصف واحد (1)
         mode.startsWith("horizontal_") -> Pair(mode.removePrefix("horizontal_").toIntOrNull() ?: pieceCount, 1)
         else -> Pair(1, pieceCount)
     }
