@@ -19,9 +19,6 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.decodeFromStream
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
-import kotlinx.serialization.json.parseToJsonElement
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
@@ -508,12 +505,12 @@ class ProComic : HttpSource() {
 
     // Extract cid (chapterId) from the JWT payload without full signature verification.
     // JWT structure: header.payload.signature — all Base64URL encoded.
+    // Uses regex on the raw JSON string to avoid an extra json.parseToJsonElement call.
     private fun extractChapterIdFromJwt(jwt: String): String? = try {
         val payload = jwt.split(".").getOrNull(1) ?: return null
         val decoded = String(Base64.decode(payload, Base64.URL_SAFE or Base64.NO_WRAP), Charsets.UTF_8)
-        val obj = json.parseToJsonElement(decoded).jsonObject
-        obj["cid"]?.jsonPrimitive?.content
-            ?: obj["chapterId"]?.jsonPrimitive?.content
+        // Match "cid":12345 or "chapterId":12345 or "cid":"12345"
+        Regex(""""(?:cid|chapterId)"\s*:\s*"?(\d+)"?""").find(decoded)?.groupValues?.getOrNull(1)
     } catch (_: Exception) { null }
 
     // هنا تكمن معالجة المشكلة: إبقاء الرابط الخارجي قصيراً وحفظ الـ Map كـ Hash محلي متصل بالصفحة
