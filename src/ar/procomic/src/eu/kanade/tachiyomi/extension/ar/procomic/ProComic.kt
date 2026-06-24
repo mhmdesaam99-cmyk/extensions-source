@@ -55,7 +55,6 @@ class ProComic : HttpSource() {
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
     companion object {
-        // تم تغيير البنية لمنع إرسال روابط طويلة عبر الشبكة
         private const val SCRAMBLED_SCHEME = "https://procomic.pro/__scrambled_asset__/"
         private const val MAX_SAFE_HEIGHT = 6000
     }
@@ -69,7 +68,6 @@ class ProComic : HttpSource() {
         }
     }
 
-    // الـ Interceptor الآن يقرأ خريطة التفكيك محلياً من كائن الصفحة لمنع الـ 502 تماماً
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(25, TimeUnit.SECONDS)
@@ -79,7 +77,6 @@ class ProComic : HttpSource() {
             val url = request.url.toString()
 
             if (url.startsWith(SCRAMBLED_SCHEME)) {
-                // محاولة استخراج الخريطة من التاج المحلي الملحق بالطلب إن وجد
                 val pageMap = request.tag(ScrambledMap::class.java)
                     ?: return@addInterceptor Response.Builder()
                         .request(request).protocol(Protocol.HTTP_1_1)
@@ -134,7 +131,6 @@ class ProComic : HttpSource() {
         }
         .build()
 
-    // تخصيص دالة طلب الصورة لحقن خريطة الدمج محلياً داخل الـ Tag الخاص بـ OkHttp دون إرسالها للسيرفر
     override fun imageUrlParse(response: Response): String = ""
 
     override fun imageRequest(page: Page): Request {
@@ -144,7 +140,6 @@ class ProComic : HttpSource() {
             try {
                 val mapJson = String(Base64.decode(fragmentData, Base64.URL_SAFE or Base64.NO_WRAP))
                 val pageMap = json.decodeFromString<ScrambledMap>(mapJson)
-                // نربط الخريطة كـ Tag محلي بالطلب لكي تلتقطها دالة الـ Interceptor
                 return request.newBuilder().tag(ScrambledMap::class.java, pageMap).build()
             } catch (e: Exception) {}
         }
@@ -249,126 +244,115 @@ class ProComic : HttpSource() {
     }
 
     override fun pageListParse(response: Response): List<Page> {
-    val chapterId = response.request.url.queryParameter("_cid") ?: return emptyList()
-    val seriesType = response.request.url.pathSegments.let { parts ->
-        val idx = parts.indexOf("public")
-        parts.getOrElse(idx + 1) { "manga" }
-    }
-    val seriesId = response.request.url.pathSegments.let { parts ->
-        val idx = parts.indexOf("public")
-        parts.getOrElse(idx + 2) { "0" }
-    }
+        val chapterId = response.request.url.queryParameter("_cid") ?: return emptyList()
+        val seriesType = response.request.url.pathSegments.let { parts ->
+            val idx = parts.indexOf("public")
+            parts.getOrElse(idx + 1) { "manga" }
+        }
+        val seriesId = response.request.url.pathSegments.let { parts ->
+            val idx = parts.indexOf("public")
+            parts.getOrElse(idx + 2) { "0" }
+        }
 
-    val apiHeaders = headers.newBuilder().set("Accept", "application/json").build()
-    val pages = mutableListOf<Page>()
-    val seenUrls = mutableSetOf<String>()
+        val apiHeaders = headers.newBuilder().set("Accept", "application/json").build()
+        val pages = mutableListOf<Page>()
+        val seenUrls = mutableSetOf<String>()
 
-    var cdnPath = "cdn1"
-    var metadataImages = emptyList<String>()
-    val mapsList = mutableListOf<DeferredPageMap>()
-    var found = false
+        var cdnPath = "cdn1"
+        var metadataImages = emptyList<String>()
+        val mapsList = mutableListOf<DeferredPageMap>()
+        var found = false
 
-    var cachedSessionKey: String? = null
-    var sessionKeyAttempted = false
-    val getSessionKey = {
-        if (!sessionKeyAttempted) {
-            sessionKeyAttempted = true
-            try {
-                val req = client.newCall(
-                    GET("$baseUrl/chapter-map-session-key/$chapterId?legacy=1", apiHeaders),
-                ).execute()
-                if (req.isSuccessful) {
-                    cachedSessionKey = req.parseAs<SessionKeyResponse>().data?.key
+        var cachedSessionKey: String? = null
+        var sessionKeyAttempted = false
+        val getSessionKey = {
+            if (!sessionKeyAttempted) {
+                sessionKeyAttempted = true
+                try {
+                    val req = client.newCall(
+                        GET("$baseUrl/chapter-map-session-key/$chapterId?legacy=1", apiHeaders),
+                    ).execute()
+                    if (req.isSuccessful) {
+                        cachedSessionKey = req.parseAs<SessionKeyResponse>().data?.key
+                    }
+                } catch (e: Exception) { }
+            }
+            cachedSessionKey
+        }
+
+        val currentData = try { response.parseAs<ChaptersResponse>() } catch (e: Exception) { ChaptersResponse() }
+        for (ch in currentData.data) {
+            if (ch.id.toString() == chapterId) {
+                cdnPath = ch.cdnPath ?: "cdn1"
+                metadataImages = ch.metadata?.images ?: emptyList()
+                ch.metadata?.maps?.let { mapsList.addAll(it) }
+                found = true
+                break
+            }
+        }
+
+        if (!found) {
+            var pg = 2
+            outer@ while (pg <= 10) {
+                try {
+                    val resp = client.newCall(
+                        GET(
+                            "$baseUrl/api/public/$seriesType/$seriesId/chapters?limit=600&page=$pg&order=desc",
+                            apiHeaders,
+                        ),
+                    ).execute()
+                    if (!resp.isSuccessful) break
+                    val data = resp.parseAs<ChaptersResponse>()
+                    if (data.data.isEmpty()) break
+                    for (ch in data.data) {
+                        if (ch.id.toString() == chapterId) {
+                            cdnPath = ch.cdnPath ?: "cdn1"
+                            metadataImages = ch.metadata?.images ?: emptyList()
+                            ch.metadata?.maps?.let { mapsList.addAll(it) }
+                            break@outer
+                        }
+                    }
+                } catch (e: Exception) { break }
+                pg++
+            }
+        }
+
+        val cdnBase = "https://$cdnPath.procomic.pro"
+        val mapTokens = mutableListOf<String>()
+
+        metadataImages.forEach { imgPath ->
+            val fullUrl = imgPath.toAbsoluteUrl(cdnBase)
+            if (seenUrls.add(fullUrl)) pages.add(Page(pages.size, imageUrl = fullUrl))
+        }
+
+        mapsList.forEach { map ->
+            when {
+                map.token.isNotBlank() && map.pieces.isEmpty() && map.token.isJwt() -> {
+                    mapTokens.add(map.token)
                 }
-            } catch (e: Exception) { }
-        }
-        cachedSessionKey
-    }
-
-    val responseBodyStr = response.body.string()
-    val currentData = try {
-        if (responseBodyStr.trim().startsWith("{")) {
-            json.decodeFromString<ChaptersResponse>(responseBodyStr)
-        } else {
-            val decrypted = decryptResponse(responseBodyStr)
-            json.decodeFromString<ChaptersResponse>(decrypted)
-        }
-    } catch (e: Exception) {
-        ChaptersResponse()
-    }
-
-    for (ch in currentData.data) {
-        if (ch.id.toString() == chapterId) {
-            cdnPath = ch.cdnPath ?: "cdn1"
-            metadataImages = ch.metadata?.images ?: emptyList()
-            ch.metadata?.maps?.let { mapsList.addAll(it) }
-            found = true
-            break
-        }
-    }
-
-    if (!found) {
-        var pg = 2
-        outer@ while (pg <= 10) {
-            try {
-                val resp = client.newCall(
-                    GET(
-                        "$baseUrl/api/public/$seriesType/$seriesId/chapters?limit=600&page=$pg&order=desc",
-                        apiHeaders,
-                    ),
-                ).execute()
-                if (!resp.isSuccessful) break
-                val data = resp.parseAs<ChaptersResponse>()
-                if (data.data.isEmpty()) break
-                for (ch in data.data) {
-                    if (ch.id.toString() == chapterId) {
-                        cdnPath = ch.cdnPath ?: "cdn1"
-                        metadataImages = ch.metadata?.images ?: emptyList()
-                        ch.metadata?.maps?.let { mapsList.addAll(it) }
-                        break@outer
+                map.token.isNotBlank() && map.pieces.isEmpty() -> {
+                    val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
+                    if (resolved != null && resolved.pieces.isNotEmpty()) {
+                        val absolutePieces = resolved.pieces.map { it.toAbsoluteUrl(cdnBase) }
+                        processMap(resolved.dim, resolved.mode, absolutePieces, resolved.order, resolved.token, pages, seenUrls)
                     }
                 }
-            } catch (e: Exception) { break }
-            pg++
-        }
-    }
-
-    val cdnBase = "https://$cdnPath.procomic.pro"
-    val mapTokens = mutableListOf<String>()
-
-    metadataImages.forEach { imgPath ->
-        val fullUrl = imgPath.toAbsoluteUrl(cdnBase)
-        if (seenUrls.add(fullUrl)) pages.add(Page(pages.size, imageUrl = fullUrl))
-    }
-
-    mapsList.forEach { map ->
-        when {
-            map.token.isNotBlank() && map.pieces.isEmpty() && map.token.isJwt() -> {
-                mapTokens.add(map.token)
-            }
-            map.token.isNotBlank() && map.pieces.isEmpty() -> {
-                val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
-                if (resolved != null && resolved.pieces.isNotEmpty()) {
-                    val absolutePieces = resolved.pieces.map { it.toAbsoluteUrl(cdnBase) }
-                    processMap(resolved.dim, resolved.mode, absolutePieces, resolved.order, resolved.token, pages, seenUrls)
+                map.pieces.isNotEmpty() -> {
+                    val absolutePieces = map.pieces.map { it.toAbsoluteUrl(cdnBase) }
+                    processMap(map.dim, map.mode, absolutePieces, map.order, map.token, pages, seenUrls)
                 }
             }
-            map.pieces.isNotEmpty() -> {
-                val absolutePieces = map.pieces.map { it.toAbsoluteUrl(cdnBase) }
-                processMap(map.dim, map.mode, absolutePieces, map.order, map.token, pages, seenUrls)
-            }
         }
-    }
 
-    for (jwtToken in mapTokens) {
-        try {
-            val newPages = fetchDeferredPages(chapterId, jwtToken, apiHeaders, seenUrls, cdnBase, getSessionKey)
-            pages.addAll(newPages)
-        } catch (e: Exception) { }
-    }
+        for (jwtToken in mapTokens) {
+            try {
+                val newPages = fetchDeferredPages(chapterId, jwtToken, apiHeaders, seenUrls, cdnBase, getSessionKey)
+                pages.addAll(newPages)
+            } catch (e: Exception) { }
+        }
 
-    return pages
-}
+        return pages
+    }
 
     private fun String.isJwt(): Boolean =
         startsWith("eyJhbGci") && count { it == '.' } == 2
@@ -466,8 +450,9 @@ class ProComic : HttpSource() {
 
             if (dec == null || dec.pieces.isEmpty()) {
                 try {
-                    val bodyStr = json.encodeToString(map)
-                    val body = bodyStr.toRequestBody("application/json".toMediaType())
+                    // الإصلاح الأول: إرسال المتغيرات المطلوبة فقط لمنع خطأ 400 من السيرفر
+                    val bodyReq = """{"token":"${map.token}","method":"${map.method}"}"""
+                    val body = bodyReq.toRequestBody("application/json".toMediaType())
                     val proxyReq = POST(
                         "$baseUrl/chapter-map-proxy-plan/$chapterId",
                         apiHeaders.newBuilder()
@@ -485,7 +470,6 @@ class ProComic : HttpSource() {
         return null
     }
 
-    // هنا تكمن معالجة المشكلة: إبقاء الرابط الخارجي قصيراً وحفظ الـ Map كـ Hash محلي متصل بالصفحة
     private fun processMap(
         dim: List<Int>,
         mode: String,
@@ -518,7 +502,6 @@ class ProComic : HttpSource() {
                 json.encodeToString(mapData).toByteArray(Charsets.UTF_8),
                 Base64.URL_SAFE or Base64.NO_WRAP,
             )
-            // نضع الرابط قصيراً جداً لتجنب خطأ السيرفر، ونلحق البيانات بعد علامة # كـ Fragment محلي للتطبيق فقط
             val shortUrl = "$SCRAMBLED_SCHEME${pages.size}_part_$p.jpg#$encoded"
             pages.add(Page(pages.size, url = shortUrl, imageUrl = shortUrl))
         }
@@ -534,7 +517,8 @@ class ProComic : HttpSource() {
             val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
             val basePieceUrl = map.pieces.getOrNull(srcIdx) ?: continue
 
-            val pieceUrl = if (map.signedToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ2IjoxLCJpdiI6IJ")) {
+            // الإصلاح الثاني: تم تصحيح حرف J إلى I لمنع تشويه روابط base64 بإضافة ?token
+            val pieceUrl = if (map.signedToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ2IjoxLCJpdiI6I")) {
                 if (basePieceUrl.contains("?")) "$basePieceUrl&token=${map.signedToken}"
                 else "$basePieceUrl?token=${map.signedToken}"
             } else {
