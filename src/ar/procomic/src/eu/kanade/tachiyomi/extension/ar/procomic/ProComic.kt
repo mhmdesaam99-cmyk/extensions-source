@@ -105,8 +105,7 @@ class ProComic : HttpSource() {
                 val responseBody = response.body
                 if (responseBody != null) {
                     val bytes = responseBody.bytes()
-                    val commaIndex = bytes.indexOf(','.code.toByte())
-                    val isBase64Text = commaIndex != -1 && bytes.size > 20 &&
+                    val isBase64Text = bytes.size > 20 &&
                         bytes[0] == 'd'.code.toByte() &&
                         bytes[1] == 'a'.code.toByte() &&
                         bytes[2] == 't'.code.toByte() &&
@@ -114,9 +113,10 @@ class ProComic : HttpSource() {
                         bytes[4] == ':'.code.toByte()
 
                     if (isBase64Text) {
-                        val base64Bytes = bytes.copyOfRange(commaIndex + 1, bytes.size)
-                        val decodedBytes = Base64.decode(base64Bytes, Base64.DEFAULT)
-                        val mimeType = "image/jpeg".toMediaType() 
+                        val bodyString = String(bytes)
+                        val base64Data = bodyString.substringAfter("base64,")
+                        val decodedBytes = Base64.decode(base64Data, Base64.DEFAULT)
+                        val mimeType = bodyString.substringAfter("data:").substringBefore(";").toMediaType()
                         return@addInterceptor response.newBuilder()
                             .body(decodedBytes.toResponseBody(mimeType))
                             .build()
@@ -138,9 +138,7 @@ class ProComic : HttpSource() {
         val fragmentData = page.url.substringAfter("#", "")
         if (fragmentData.isNotBlank()) {
             try {
-                // إصلاح الـ Padding لضمان عدم فشل Android في فك التشفير
-                val padded = fragmentData.padEnd(fragmentData.length + (4 - fragmentData.length % 4) % 4, '=')
-                val mapJson = String(Base64.decode(padded, Base64.URL_SAFE))
+                val mapJson = String(Base64.decode(fragmentData, Base64.URL_SAFE or Base64.NO_WRAP))
                 val pageMap = json.decodeFromString<ScrambledMap>(mapJson)
                 return request.newBuilder().tag(ScrambledMap::class.java, pageMap).build()
             } catch (e: Exception) {}
@@ -452,8 +450,8 @@ class ProComic : HttpSource() {
 
             if (dec == null || dec.pieces.isEmpty()) {
                 try {
-                    val bodyReq = """{"token":"${map.token}","method":"${map.method}"}"""
-                    val body = bodyReq.toRequestBody("application/json".toMediaType())
+                    val bodyStr = json.encodeToString(map)
+                    val body = bodyStr.toRequestBody("application/json".toMediaType())
                     val proxyReq = POST(
                         "$baseUrl/chapter-map-proxy-plan/$chapterId",
                         apiHeaders.newBuilder()
@@ -471,6 +469,7 @@ class ProComic : HttpSource() {
         return null
     }
 
+    // الدالة المعدلة لاختبار جلب وترتيب القطع بدون دمج
     private fun processMap(
         dim: List<Int>,
         mode: String,
@@ -482,29 +481,20 @@ class ProComic : HttpSource() {
     ) {
         if (pieces.isEmpty() || !seenUrls.add(pieces.first())) return
 
-        val estimatedTotalH = dim.getOrNull(1)?.takeIf { it > 0 } ?: 10000
-        val parts = if (estimatedTotalH > MAX_SAFE_HEIGHT) {
-            ceil(estimatedTotalH.toDouble() / MAX_SAFE_HEIGHT).toInt()
-        } else {
-            1
-        }
+        // تمرير القطع كصفحات منفصلة مباشرة للتطبيق
+        for (targetIdx in 0 until pieces.size) {
+            val srcIdx = if (order.size == pieces.size) order[targetIdx] else targetIdx
+            val basePieceUrl = pieces.getOrNull(srcIdx) ?: continue
 
-        for (p in 0 until parts) {
-            val mapData = ScrambledMap(
-                dim = dim,
-                mode = mode,
-                pieces = pieces,
-                order = order,
-                signedToken = signedToken,
-                splitPart = p,
-                totalParts = parts,
-            )
-            val encoded = Base64.encodeToString(
-                json.encodeToString(mapData).toByteArray(Charsets.UTF_8),
-                Base64.URL_SAFE or Base64.NO_WRAP,
-            )
-            val shortUrl = "$SCRAMBLED_SCHEME${pages.size}_part_$p.jpg#$encoded"
-            pages.add(Page(pages.size, url = shortUrl, imageUrl = shortUrl))
+            val pieceUrl = if (signedToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ2IjoxLCJpdiI6I")) {
+                if (basePieceUrl.contains("?")) "$basePieceUrl&token=$signedToken"
+                else "$basePieceUrl?token=$signedToken"
+            } else {
+                basePieceUrl
+            }.trim()
+
+            // تضاف هنا كصفحة مستقلة يقرأها ويعرضها Mihon فوراً
+            pages.add(Page(pages.size, url = pieceUrl, imageUrl = pieceUrl))
         }
     }
 
@@ -518,26 +508,25 @@ class ProComic : HttpSource() {
             val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
             val basePieceUrl = map.pieces.getOrNull(srcIdx) ?: continue
 
-            val pieceUrl = if (map.signedToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ2IjoxLCJpdiI6I")) {
+            val pieceUrl = if (map.signedToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ2IjoxLCJpdiI6IJ")) {
                 if (basePieceUrl.contains("?")) "$basePieceUrl&token=${map.signedToken}"
                 else "$basePieceUrl?token=${map.signedToken}"
             } else {
                 basePieceUrl
-            }.trim()
+            }
 
-            // تم إضافة ترويسات الإضافة بالكامل لتجنب رفض الطلب من Cloudflare
             val req = Request.Builder()
                 .url(pieceUrl)
-                .headers(headers)
-                .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+                .header("Referer", "$baseUrl/")
+                .header("Accept", "image/avif,image/webp,image/jpeg,*/*")
+                .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
                 .build()
 
             try {
                 client.newCall(req).execute().use { resp ->
                     if (resp.isSuccessful) {
                         val bodyBytes = resp.body.bytes()
-                        val commaIndex = bodyBytes.indexOf(','.code.toByte())
-                        val isBase64Text = commaIndex != -1 && bodyBytes.size > 20 &&
+                        val isBase64Text = bodyBytes.size > 20 &&
                             bodyBytes[0] == 'd'.code.toByte() &&
                             bodyBytes[1] == 'a'.code.toByte() &&
                             bodyBytes[2] == 't'.code.toByte() &&
@@ -545,8 +534,8 @@ class ProComic : HttpSource() {
                             bodyBytes[4] == ':'.code.toByte()
 
                         val finalBytes = if (isBase64Text) {
-                            val base64Bytes = bodyBytes.copyOfRange(commaIndex + 1, bodyBytes.size)
-                            Base64.decode(base64Bytes, Base64.DEFAULT)
+                            val base64Data = String(bodyBytes).substringAfter("base64,")
+                            Base64.decode(base64Data, Base64.DEFAULT)
                         } else {
                             bodyBytes
                         }
@@ -659,14 +648,13 @@ class ProComic : HttpSource() {
     
     private fun decodeAvif(bytes: ByteArray): Bitmap? {
         if (bytes.isEmpty()) return null
-        var decoder: tachiyomi.decoder.ImageDecoder? = null
-        return try {
-            decoder = ImageDecoder.newInstance(bytes.inputStream())
-            decoder?.decode() ?: BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-        } catch (e: Exception) {
+        val decoder = ImageDecoder.newInstance(bytes.inputStream())
+        return if (decoder != null) {
+            try { decoder.decode() } catch (e: Exception) {
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            } finally { decoder.recycle() }
+        } else {
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-        } finally {
-            decoder?.recycle()
         }
     }
 
