@@ -45,9 +45,6 @@ class ProComic : HttpSource() {
     override val lang = "ar"
     override val supportsLatest = true
 
-    // رابط تسجيل الدخول — يفتح WebView في mihon تلقائياً عند الضغط على "تسجيل الدخول"
-    override val loginUrl = "$baseUrl/login"
-
     private val json = Json {
         ignoreUnknownKeys = true
         isLenient = true
