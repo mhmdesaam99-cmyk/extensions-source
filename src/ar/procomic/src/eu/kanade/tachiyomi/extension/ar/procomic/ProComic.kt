@@ -80,6 +80,12 @@ class ProComic : HttpSource() {
         }
     }
 
+    // client منفصل لتحميل القطع — بدون interceptor لتجنب الـ recursive call ولا rateLimit لتجنب الـ deadlock
+    private val pieceClient: OkHttpClient = network.cloudflareClient.newBuilder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(25, TimeUnit.SECONDS)
+        .build()
+
     // الـ Interceptor الآن يقرأ خريطة التفكيك محلياً من كائن الصفحة لمنع الـ 502 تماماً
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .connectTimeout(15, TimeUnit.SECONDS)
@@ -525,8 +531,30 @@ class ProComic : HttpSource() {
                 .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
                 .build()
 
+            // DEBUG: للـ manga/manhua — نُرجع القطعة الأولى خاماً بدون دمج لتشخيص المشكلة
+            if (targetIdx == 0) {
+                return try {
+                    pieceClient.newCall(req).execute().use { resp ->
+                        if (!resp.isSuccessful) return null
+                        val bodyBytes = resp.body.bytes()
+                        val isBase64Text = bodyBytes.size > 20 &&
+                            bodyBytes[0] == 'd'.code.toByte() &&
+                            bodyBytes[1] == 'a'.code.toByte() &&
+                            bodyBytes[2] == 't'.code.toByte() &&
+                            bodyBytes[3] == 'a'.code.toByte() &&
+                            bodyBytes[4] == ':'.code.toByte()
+                        if (isBase64Text) {
+                            val base64Data = String(bodyBytes).substringAfter("base64,")
+                            Base64.decode(base64Data, Base64.DEFAULT)
+                        } else {
+                            bodyBytes
+                        }
+                    }
+                } catch (e: Exception) { null }
+            }
+
             try {
-                client.newCall(req).execute().use { resp ->
+                pieceClient.newCall(req).execute().use { resp ->
                     if (resp.isSuccessful) {
                         val bodyBytes = resp.body.bytes()
                         val isBase64Text = bodyBytes.size > 20 &&
