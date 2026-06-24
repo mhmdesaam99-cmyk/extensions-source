@@ -342,19 +342,6 @@ class ProComic : HttpSource() {
 
         val cdnBase = "https://$cdnPath.procomic.pro"
 
-        // فحص تسجيل الدخول: إذا كانت هناك maps مشفرة وفشل الحصول على الـ cookies
-        // نتحقق بطلب بسيط للـ proxy-plan هل الجلسة نشطة
-        val hasEncryptedMaps = mapsList.any { it.token.isNotBlank() && it.pieces.isEmpty() }
-        if (hasEncryptedMaps && pages.isEmpty() && metadataImages.isEmpty()) {
-            // اختبار الجلسة باستخدام أول map مشفرة
-            val testMap = mapsList.first { it.token.isNotBlank() && it.pieces.isEmpty() }
-            val testResult = resolveMapViaProxy(testMap, chapterId, apiHeaders)
-            if (testResult == null) {
-                // فشل تماماً — المستخدم غير مسجل دخوله
-                throw Exception("يجب تسجيل الدخول إلى ProComic لقراءة هذا الفصل.\nافتح إعدادات المصدر وسجّل دخولك عبر WebView.")
-            }
-        }
-
         metadataImages.forEach { imgPath ->
             val fullUrl = imgPath.toAbsoluteUrl(cdnBase)
             if (seenUrls.add(fullUrl)) pages.add(Page(pages.size, imageUrl = fullUrl))
@@ -368,12 +355,12 @@ class ProComic : HttpSource() {
                         ?: resolveMap(map, chapterId, apiHeaders, getSessionKey)
                     if (resolved != null && resolved.pieces.isNotEmpty()) {
                         val absolutePieces = resolved.pieces.map { it.toAbsoluteUrl(cdnBase) }
-                        processMap(resolved.dim, resolved.mode, absolutePieces, resolved.order, resolved.rects, resolved.token, pages, seenUrls)
+                        processMap(resolved.dim, resolved.mode, absolutePieces, resolved.order, resolved.rects, resolved.token, pages, seenUrls, chapterId)
                     }
                 }
                 map.pieces.isNotEmpty() -> {
                     val absolutePieces = map.pieces.map { it.toAbsoluteUrl(cdnBase) }
-                    processMap(map.dim, map.mode, absolutePieces, map.order, map.rects, map.token, pages, seenUrls)
+                    processMap(map.dim, map.mode, absolutePieces, map.order, map.rects, map.token, pages, seenUrls, chapterId)
                 }
             }
         }
@@ -390,7 +377,6 @@ class ProComic : HttpSource() {
         apiHeaders: Headers,
     ): DeferredPageMap? {
         return try {
-            // نُرسل فقط الحقول غير الفارغة — مثل ما يُرسله المتصفح بالضبط
             val requestBody = ProxyPlanRequestBody(
                 token = map.token.ifBlank { null },
                 method = map.method.ifBlank { null },
@@ -412,10 +398,17 @@ class ProComic : HttpSource() {
                 body,
             )
             val proxyResp = client.newCall(proxyReq).execute()
-            if (!proxyResp.isSuccessful) return null
+            if (!proxyResp.isSuccessful) {
+                throw Exception("proxy-plan فشل: HTTP ${proxyResp.code} — body: ${proxyResp.body.string().take(300)}")
+            }
             val result = proxyResp.parseAs<ProxyPlanResponse>()
-            if (result.success) result.data?.map else null
-        } catch (e: Exception) { null }
+            if (!result.success) {
+                throw Exception("proxy-plan أرجع success=false — body: ${bodyStr.take(200)}")
+            }
+            result.data?.map
+        } catch (e: Exception) {
+            throw Exception("resolveMapViaProxy فشل للفصل $chapterId: ${e.message}")
+        }
     }
 
     private fun resolveMap(
@@ -472,6 +465,7 @@ class ProComic : HttpSource() {
         signedToken: String,
         pages: MutableList<Page>,
         seenUrls: MutableSet<String>,
+        chapterId: String,
     ) {
         if (pieces.isEmpty() || !seenUrls.add(pieces.first())) return
 
@@ -498,9 +492,8 @@ class ProComic : HttpSource() {
                 Base64.URL_SAFE or Base64.NO_WRAP,
             )
             // url يحمل الـ fragment (للتوافق) — imageUrl نظيف لأن OkHttp يحذف الـ fragment
-            val cleanUrl = "$SCRAMBLED_SCHEME${pages.size}_part_$p.jpg"
+            val cleanUrl = "$SCRAMBLED_SCHEME${chapterId}_${pages.size}_part_$p.jpg"
             val urlWithFragment = "$cleanUrl#$encoded"
-            // نخزن الخريطة في الـ cache بالـ URL النظيف لالتقاطها في الـ interceptor
             scrambledMapCache[cleanUrl] = mapData
             pages.add(Page(pages.size, url = urlWithFragment, imageUrl = cleanUrl))
         }
@@ -530,28 +523,6 @@ class ProComic : HttpSource() {
                 .header("Accept", "image/avif,image/webp,image/jpeg,*/*")
                 .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
                 .build()
-
-            // DEBUG: للـ manga/manhua — نُرجع القطعة الأولى خاماً بدون دمج لتشخيص المشكلة
-            if (targetIdx == 0) {
-                return try {
-                    pieceClient.newCall(req).execute().use { resp ->
-                        if (!resp.isSuccessful) return null
-                        val bodyBytes = resp.body.bytes()
-                        val isBase64Text = bodyBytes.size > 20 &&
-                            bodyBytes[0] == 'd'.code.toByte() &&
-                            bodyBytes[1] == 'a'.code.toByte() &&
-                            bodyBytes[2] == 't'.code.toByte() &&
-                            bodyBytes[3] == 'a'.code.toByte() &&
-                            bodyBytes[4] == ':'.code.toByte()
-                        if (isBase64Text) {
-                            val base64Data = String(bodyBytes).substringAfter("base64,")
-                            Base64.decode(base64Data, Base64.DEFAULT)
-                        } else {
-                            bodyBytes
-                        }
-                    }
-                } catch (e: Exception) { null }
-            }
 
             try {
                 pieceClient.newCall(req).execute().use { resp ->
