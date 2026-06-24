@@ -21,7 +21,6 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.decodeFromStream
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
@@ -33,7 +32,6 @@ import tachiyomi.decoder.ImageDecoder
 import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
@@ -56,11 +54,9 @@ class ProComic : HttpSource() {
 
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
-    // ذاكرة كاش داخلية فائقة السرعة وآمنة لمنع تضخم روابط الصور وضمان التقاطها داخل الـ Interceptor
-    private val jitCache = ConcurrentHashMap<String, JitPage>()
-
     companion object {
-        private const val SCRAMBLED_SCHEME = "https://procomic.pro/__jit_asset__/"
+        // scheme وهمي لا يُرسل للشبكة أبداً — يُعترض محلياً فقط
+        private const val SCRAMBLED_SCHEME = "https://127.0.0.1/__scrambled__/"
         private const val MAX_SAFE_HEIGHT = 6000
     }
 
@@ -73,188 +69,92 @@ class ProComic : HttpSource() {
         }
     }
 
+    // الـ Interceptor الآن يقرأ خريطة التفكيك محلياً من كائن الصفحة لمنع الـ 502 تماماً
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
-        .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(2, TimeUnit.SECONDS)
+        .readTimeout(4, TimeUnit.SECONDS)
         .rateLimit(2, 1)
         .addInterceptor { chain ->
             val request = chain.request()
             val url = request.url.toString()
 
-            // التحقق من أن الطلب يخص روابط التجميع التمويهية الخاصة بنا
             if (url.startsWith(SCRAMBLED_SCHEME)) {
-                val cacheKey = url.substringBefore(".jpg").substringAfter(SCRAMBLED_SCHEME, "")
-                val jitPage = request.tag(JitPage::class.java) ?: jitCache[cacheKey]
-
-                if (jitPage == null) {
-                    return@addInterceptor Response.Builder()
+                // محاولة استخراج الخريطة من التاج المحلي الملحق بالطلب إن وجد
+                val pageMap = request.tag(ScrambledMap::class.java)
+                    ?: return@addInterceptor Response.Builder()
                         .request(request).protocol(Protocol.HTTP_1_1)
-                        .code(400).message("Missing JIT Metadata Cache Key")
+                        .code(400).message("Missing Map Metadata")
                         .body("".toResponseBody(null)).build()
-                }
 
-                val apiHeaders = Headers.Builder()
-                    .add("Referer", "$baseUrl/")
-                    .add("Origin", baseUrl)
-                    .add("Accept", "application/json")
-                    .add("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
+                val mergedBytes = reconstructPage(pageMap)
+                    ?: return@addInterceptor Response.Builder()
+                        .request(request).protocol(Protocol.HTTP_1_1)
+                        .code(500).message("Merge Failure")
+                        .body("".toResponseBody(null)).build()
+
+                return@addInterceptor Response.Builder()
+                    .request(request).protocol(Protocol.HTTP_1_1)
+                    .code(200).message("OK")
+                    .body(mergedBytes.toResponseBody("image/jpeg".toMediaType()))
                     .build()
-
-                // الخطوة العبقرية: جلب نسخة طازجة وحية فوراً من الفصل للحصول على توكن لم يمر عليه بايت واحد
-                val freshChapter = fetchFreshChapterDto(jitPage.chapterId, jitPage.seriesType, jitPage.seriesId, apiHeaders, chain)
-                if (freshChapter == null) {
-                    return@addInterceptor Response.Builder()
-                        .request(request).protocol(Protocol.HTTP_1_1)
-                        .code(500).message("Failed to fetch fresh live token from API")
-                        .body("".toResponseBody(null)).build()
-                }
-
-                val fetchedBytes = when (jitPage.sourceType) {
-                    3 -> { // تحميل وفك تشفير الصور العادية فوراً وبثها للتطبيق
-                        try {
-                            val imgReq = Request.Builder().url(jitPage.pageUrl).headers(headers).build()
-                            val imgResp = chain.proceed(imgReq)
-                            if (imgResp.isSuccessful) {
-                                val bodyBytes = imgResp.body.bytes()
-                                val isBase64Text = bodyBytes.size > 20 &&
-                                    bodyBytes[0] == 'd'.code.toByte() &&
-                                    bodyBytes[1] == 'a'.code.toByte() &&
-                                    bodyBytes[2] == 't'.code.toByte() &&
-                                    bodyBytes[3] == 'a'.code.toByte() &&
-                                    bodyBytes[4] == ':'.code.toByte()
-
-                                if (isBase64Text) {
-                                    val bodyString = String(bodyBytes)
-                                    val base64Data = bodyString.substringAfter("base64,")
-                                    Base64.decode(base64Data, Base64.DEFAULT)
-                                } else {
-                                    bodyBytes
-                                }
-                            } else null
-                        } catch (e: Exception) { null }
-                    }
-                    1 -> { // معالجة الخرائط القياسية المباشرة بتوكن جديد تماماً
-                        val freshMap = freshChapter.metadata?.maps?.getOrNull(jitPage.mapIndex)
-                        if (freshMap != null) {
-                            var cachedSessionKey: String? = null
-                            val skProvider = {
-                                if (cachedSessionKey == null) {
-                                    try {
-                                        val req = chain.proceed(Request.Builder().url("$baseUrl/chapter-map-session-key/${jitPage.chapterId}?legacy=1").headers(apiHeaders).build())
-                                        if (req.isSuccessful) cachedSessionKey = json.decodeFromString<SessionKeyResponse>(req.body.string()).data?.key
-                                    } catch (e: Exception) {}
-                                }
-                                cachedSessionKey
-                            }
-                            val freshResolved = resolveMapJit(freshMap, jitPage.chapterId, apiHeaders, skProvider, chain)
-                            if (freshResolved != null && freshResolved.pieces.isNotEmpty()) {
-                                val scrambled = ScrambledMap(
-                                    dim = freshResolved.dim,
-                                    mode = freshResolved.mode,
-                                    pieces = freshResolved.pieces.map { it.toAbsoluteUrl(jitPage.cdnBase) },
-                                    order = freshResolved.order,
-                                    signedToken = freshResolved.token,
-                                    splitPart = jitPage.splitPart,
-                                    totalParts = jitPage.totalParts,
-                                )
-                                reconstructPage(scrambled, chain)
-                            } else null
-                        } else null
-                    }
-                    2 -> { // معالجة الخرائط المؤجلة (Deferred Media) عبر فك توكن الـ JWT الحي
-                        val freshMaps = freshChapter.metadata?.maps ?: emptyList()
-                        val jwtTokens = freshMaps.filter { it.token.isNotBlank() && it.pieces.isEmpty() && it.token.isJwt() }.map { it.token }
-                        val freshJwtToken = jwtTokens.getOrNull(jitPage.jwtTokenIndex)
-
-                        if (freshJwtToken != null) {
-                            var targetMap: DeferredPageMap? = null
-                            try {
-                                val resp = chain.proceed(Request.Builder().url("$baseUrl/chapter-deferred-media/${jitPage.chapterId}?token=$freshJwtToken&split=${jitPage.deferredSplit}").headers(apiHeaders).build())
-                                if (resp.isSuccessful) {
-                                    val parsed = json.decodeFromString<ChapterDeferredResponse>(resp.body.string())
-                                    targetMap = parsed.data?.maps?.getOrNull(jitPage.mapIndex)
-                                }
-                            } catch (e: Exception) {}
-
-                            if (targetMap != null) {
-                                var cachedSessionKey: String? = null
-                                val skProvider = {
-                                    if (cachedSessionKey == null) {
-                                        try {
-                                            val req = chain.proceed(Request.Builder().url("$baseUrl/chapter-map-session-key/${jitPage.chapterId}?legacy=1").headers(apiHeaders).build())
-                                            if (req.isSuccessful) cachedSessionKey = json.decodeFromString<SessionKeyResponse>(req.body.string()).data?.key
-                                        } catch (e: Exception) {}
-                                    }
-                                    cachedSessionKey
-                                }
-                                val freshResolved = resolveMapJit(targetMap, jitPage.chapterId, apiHeaders, skProvider, chain)
-                                if (freshResolved != null && freshResolved.pieces.isNotEmpty()) {
-                                    val scrambled = ScrambledMap(
-                                        dim = freshResolved.dim,
-                                        mode = freshResolved.mode,
-                                        pieces = freshResolved.pieces.map { it.toAbsoluteUrl(jitPage.cdnBase) },
-                                        order = freshResolved.order,
-                                        signedToken = freshResolved.token,
-                                        splitPart = jitPage.splitPart,
-                                        totalParts = jitPage.totalParts,
-                                    )
-                                    reconstructPage(scrambled, chain)
-                                } else null
-                            } else null
-                        } else null
-                    }
-                    else -> null
-                }
-
-                if (fetchedBytes != null) {
-                    return@addInterceptor Response.Builder()
-                        .request(request).protocol(Protocol.HTTP_1_1)
-                        .code(200).message("OK")
-                        .body(fetchedBytes.toResponseBody("image/jpeg".toMediaType()))
-                        .build()
-                } else {
-                    return@addInterceptor Response.Builder()
-                        .request(request).protocol(Protocol.HTTP_1_1)
-                        .code(500).message("JIT Reconstruction Failed Object")
-                        .body("".toResponseBody(null)).build()
-                }
             }
 
-            chain.proceed(request)
+            val response = chain.proceed(request)
+
+            val isPotentialBase64Image = response.isSuccessful && request.method == "GET" &&
+                url.contains("/i/") && url.contains("procomic")
+
+            if (isPotentialBase64Image) {
+                val responseBody = response.body
+                if (responseBody != null) {
+                    val bytes = responseBody.bytes()
+                    val isBase64Text = bytes.size > 20 &&
+                        bytes[0] == 'd'.code.toByte() &&
+                        bytes[1] == 'a'.code.toByte() &&
+                        bytes[2] == 't'.code.toByte() &&
+                        bytes[3] == 'a'.code.toByte() &&
+                        bytes[4] == ':'.code.toByte()
+
+                    if (isBase64Text) {
+                        val bodyString = String(bytes)
+                        val base64Data = bodyString.substringAfter("base64,")
+                        val decodedBytes = Base64.decode(base64Data, Base64.DEFAULT)
+                        val mimeType = bodyString.substringAfter("data:").substringBefore(";").toMediaType()
+                        return@addInterceptor response.newBuilder()
+                            .body(decodedBytes.toResponseBody(mimeType))
+                            .build()
+                    } else {
+                        return@addInterceptor response.newBuilder()
+                            .body(bytes.toResponseBody(responseBody.contentType()))
+                            .build()
+                    }
+                }
+            }
+            response
         }
         .build()
 
-    private fun fetchFreshChapterDto(
-        chapterId: String,
-        seriesType: String,
-        seriesId: String,
-        apiHeaders: Headers,
-        chain: Interceptor.Chain
-    ): ChapterDto? {
-        try {
-            val url = "$baseUrl/api/public/$seriesType/$seriesId/chapters?limit=500&order=desc&_cid=$chapterId"
-            val req = Request.Builder().url(url).headers(apiHeaders).build()
-            val resp = chain.proceed(req)
-            if (resp.isSuccessful) {
-                val data = json.decodeFromString<ChaptersResponse>(resp.body.string())
-                return data.data.find { it.id.toString() == chapterId }
-            }
-        } catch (e: Exception) {}
-        return null
-    }
-
+    // تخصيص دالة طلب الصورة لحقن خريطة الدمج محلياً داخل الـ Tag الخاص بـ OkHttp دون إرسالها للسيرفر
     override fun imageUrlParse(response: Response): String = ""
 
     override fun imageRequest(page: Page): Request {
-        val request = super.imageRequest(page)
-        val cacheKey = page.url.substringBefore(".jpg").substringAfter(SCRAMBLED_SCHEME, "")
-        if (cacheKey.isNotBlank()) {
-            val jitPage = jitCache[cacheKey]
-            if (jitPage != null) {
-                return request.newBuilder().tag(JitPage::class.java, jitPage).build()
-            }
+        val fragmentData = page.url.substringAfter("#", "")
+        if (fragmentData.isNotBlank()) {
+            try {
+                val mapJson = String(Base64.decode(fragmentData, Base64.URL_SAFE or Base64.NO_WRAP))
+                val pageMap = json.decodeFromString<ScrambledMap>(mapJson)
+                // نبني الـ request يدوياً بـ URL ثابت وواضح يُعترض محلياً
+                return Request.Builder()
+                    .url(SCRAMBLED_SCHEME + "page.jpg")
+                    .tag(ScrambledMap::class.java, pageMap)
+                    .build()
+            } catch (e: Exception) {}
         }
-        return request
+        // صورة عادية — نبني الطلب بشكل طبيعي
+        return Request.Builder()
+            .url(page.imageUrl ?: page.url.substringBefore("#"))
+            .headers(headers)
+            .build()
     }
 
     override fun headersBuilder() = super.headersBuilder()
@@ -356,156 +256,171 @@ class ProComic : HttpSource() {
 
     override fun pageListParse(response: Response): List<Page> {
         val chapterId = response.request.url.queryParameter("_cid") ?: return emptyList()
-        val parts = response.request.url.pathSegments
-        val idx = parts.indexOf("public")
-        val seriesType = parts.getOrElse(idx + 1) { "manga" }
-        val seriesId = parts.getOrElse(idx + 2) { "0" }
+        val seriesType = response.request.url.pathSegments.let { parts ->
+            val idx = parts.indexOf("public")
+            parts.getOrElse(idx + 1) { "manga" }
+        }
+        val seriesId = response.request.url.pathSegments.let { parts ->
+            val idx = parts.indexOf("public")
+            parts.getOrElse(idx + 2) { "0" }
+        }
 
         val apiHeaders = headers.newBuilder().set("Accept", "application/json").build()
         val pages = mutableListOf<Page>()
+        val seenUrls = mutableSetOf<String>()
 
-        // تنظيف ذاكرة الـ الكاش الخاصة بهذا الفصل لمنع استهلاك الرام
-        jitCache.keys.removeAll { it.startsWith("$chapterId-") }
+        var cdnPath = "cdn1"
+        var metadataImages = emptyList<String>()
+        val mapsList = mutableListOf<DeferredPageMap>()
+        var found = false
+
+        var cachedSessionKey: String? = null
+        var sessionKeyAttempted = false
+        val getSessionKey = {
+            if (!sessionKeyAttempted) {
+                sessionKeyAttempted = true
+                try {
+                    val req = client.newCall(
+                        GET("$baseUrl/chapter-map-session-key/$chapterId?legacy=1", apiHeaders),
+                    ).execute()
+                    if (req.isSuccessful) {
+                        cachedSessionKey = req.parseAs<SessionKeyResponse>().data?.key
+                    }
+                } catch (e: Exception) { }
+            }
+            cachedSessionKey
+        }
 
         val currentData = try { response.parseAs<ChaptersResponse>() } catch (e: Exception) { ChaptersResponse() }
-        var currentChapter: ChapterDto? = currentData.data.find { it.id.toString() == chapterId }
+        for (ch in currentData.data) {
+            if (ch.id.toString() == chapterId) {
+                cdnPath = ch.cdnPath ?: "cdn1"
+                metadataImages = ch.metadata?.images ?: emptyList()
+                ch.metadata?.maps?.let { mapsList.addAll(it) }
+                found = true
+                break
+            }
+        }
 
-        if (currentChapter == null) {
+        if (!found) {
             var pg = 2
-            while (pg <= 5) {
+            outer@ while (pg <= 10) {
                 try {
-                    val resp = client.newCall(GET("$baseUrl/api/public/$seriesType/$seriesId/chapters?limit=100&page=$pg&order=desc", apiHeaders)).execute()
+                    val resp = client.newCall(
+                        GET(
+                            "$baseUrl/api/public/$seriesType/$seriesId/chapters?limit=600&page=$pg&order=desc",
+                            apiHeaders,
+                        ),
+                    ).execute()
                     if (!resp.isSuccessful) break
                     val data = resp.parseAs<ChaptersResponse>()
-                    val found = data.data.find { it.id.toString() == chapterId }
-                    if (found != null) {
-                        currentChapter = found
-                        break
-                    }
                     if (data.data.isEmpty()) break
+                    for (ch in data.data) {
+                        if (ch.id.toString() == chapterId) {
+                            cdnPath = ch.cdnPath ?: "cdn1"
+                            metadataImages = ch.metadata?.images ?: emptyList()
+                            ch.metadata?.maps?.let { mapsList.addAll(it) }
+                            break@outer
+                        }
+                    }
                 } catch (e: Exception) { break }
                 pg++
             }
         }
 
-        if (currentChapter == null) return emptyList()
-
-        val cdnPath = currentChapter.cdnPath ?: "cdn1"
         val cdnBase = "https://$cdnPath.procomic.pro"
-        val metadataImages = currentChapter.metadata?.images ?: emptyList()
-        val mapsList = currentChapter.metadata?.maps ?: emptyList()
 
-        var pageIndex = 0
+        // فحص تسجيل الدخول: إذا كانت هناك maps مشفرة وفشل الحصول على الـ cookies
+        // نتحقق بطلب بسيط للـ proxy-plan هل الجلسة نشطة
+        val hasEncryptedMaps = mapsList.any { it.token.isNotBlank() && it.pieces.isEmpty() }
+        if (hasEncryptedMaps && pages.isEmpty() && metadataImages.isEmpty()) {
+            // اختبار الجلسة باستخدام أول map مشفرة
+            val testMap = mapsList.first { it.token.isNotBlank() && it.pieces.isEmpty() }
+            val testResult = resolveMapViaProxy(testMap, chapterId, apiHeaders)
+            if (testResult == null) {
+                // فشل تماماً — المستخدم غير مسجل دخوله
+                throw Exception("يجب تسجيل الدخول إلى ProComic لقراءة هذا الفصل.\nافتح إعدادات المصدر وسجّل دخولك عبر WebView.")
+            }
+        }
 
-        // 1. صناعة روابط تمويهية للصور العادية وحفظها في الكاش الداخلي
-        metadataImages.forEachIndexed { imgIdx, imgPath ->
+        metadataImages.forEach { imgPath ->
             val fullUrl = imgPath.toAbsoluteUrl(cdnBase)
-            val cacheKey = "$chapterId-img-$imgIdx"
-            jitCache[cacheKey] = JitPage(chapterId, seriesType, seriesId, cdnBase, sourceType = 3, pageUrl = fullUrl)
-            
-            val shortUrl = "$SCRAMBLED_SCHEME$cacheKey.jpg"
-            pages.add(Page(pageIndex, url = shortUrl, imageUrl = shortUrl))
-            pageIndex++
+            if (seenUrls.add(fullUrl)) pages.add(Page(pages.size, imageUrl = fullUrl))
         }
 
-        // 2. صناعة روابط تمويهية للخرائط العادية وحفظها في الكاش الداخلي
-        mapsList.forEachIndexed { mapIdx, map ->
-            var cachedSessionKey: String? = null
-            val getSessionKey = {
-                if (cachedSessionKey == null) {
-                    try {
-                        val req = client.newCall(GET("$baseUrl/chapter-map-session-key/$chapterId?legacy=1", apiHeaders)).execute()
-                        if (req.isSuccessful) cachedSessionKey = json.decodeFromString<SessionKeyResponse>(req.body.string()).data?.key
-                    } catch (e: Exception) {}
+        mapsList.forEach { map ->
+            when {
+                // JWT tokens من metadata منتهية الصلاحية دائماً — نتجاهلها ونستخدم proxy-plan مباشرة
+                map.token.isNotBlank() && map.pieces.isEmpty() -> {
+                    val resolved = resolveMapViaProxy(map, chapterId, apiHeaders)
+                        ?: resolveMap(map, chapterId, apiHeaders, getSessionKey)
+                    if (resolved != null && resolved.pieces.isNotEmpty()) {
+                        val absolutePieces = resolved.pieces.map { it.toAbsoluteUrl(cdnBase) }
+                        processMap(resolved.dim, resolved.mode, absolutePieces, resolved.prefetchedPieces, resolved.order, resolved.rects, resolved.token, pages, seenUrls)
+                    }
                 }
-                cachedSessionKey
-            }
-            val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey) ?: map
-            val estimatedTotalH = resolved.dim.getOrNull(1)?.takeIf { it > 0 } ?: 8000
-            val parts = if (estimatedTotalH > MAX_SAFE_HEIGHT) ceil(estimatedTotalH.toDouble() / MAX_SAFE_HEIGHT).toInt() else 1
-
-            for (p in 0 until parts) {
-                val cacheKey = "$chapterId-map-$mapIdx-p-$p"
-                jitCache[cacheKey] = JitPage(
-                    chapterId = chapterId, seriesType = seriesType, seriesId = seriesId, cdnBase = cdnBase,
-                    sourceType = 1, mapIndex = mapIdx, splitPart = p, totalParts = parts
-                )
-                val shortUrl = "$SCRAMBLED_SCHEME$cacheKey.jpg"
-                pages.add(Page(pageIndex, url = shortUrl, imageUrl = shortUrl))
-                pageIndex++
+                map.pieces.isNotEmpty() -> {
+                    val absolutePieces = map.pieces.map { it.toAbsoluteUrl(cdnBase) }
+                    // صور مباشرة بدون تشفير — لا حاجة لـ prefetch
+                    processMap(map.dim, map.mode, absolutePieces, emptyList(), map.order, map.rects, map.token, pages, seenUrls)
+                }
             }
         }
 
-        // 3. صناعة روابط تمويهية للخرائط المؤجلة (Deferred Media) وحفظها في الكاش الداخلي
-        val mapTokens = mapsList.filter { it.token.isNotBlank() && it.pieces.isEmpty() && it.token.isJwt() }.map { it.token }
-        var deferredMapGlobalIdx = 0
-
-        mapTokens.forEachIndexed { jwtIdx, jwtToken ->
-            val jwtSplit = jwtSplitValue(jwtToken)
-            for (s in 0..jwtSplit) {
-                try {
-                    val resp = client.newCall(GET("$baseUrl/chapter-deferred-media/$chapterId?token=$jwtToken&split=$s", apiHeaders)).execute()
-                    if (!resp.isSuccessful) continue
-                    val splitData = resp.parseAs<ChapterDeferredResponse>().data ?: continue
-
-                    splitData.images.forEach { imgPath ->
-                        val fullUrl = imgPath.toAbsoluteUrl(cdnBase)
-                        val cacheKey = "$chapterId-defimg-$pageIndex"
-                        jitCache[cacheKey] = JitPage(chapterId, seriesType, seriesId, cdnBase, sourceType = 3, pageUrl = fullUrl)
-                        val shortUrl = "$SCRAMBLED_SCHEME$cacheKey.jpg"
-                        pages.add(Page(pageIndex, url = shortUrl, imageUrl = shortUrl))
-                        pageIndex++
-                    }
-
-                    splitData.maps.forEachIndexed { localMapIdx, map ->
-                        var cachedSessionKey: String? = null
-                        val getSessionKey = {
-                            if (cachedSessionKey == null) {
-                                try {
-                                    val req = client.newCall(GET("$baseUrl/chapter-map-session-key/$chapterId?legacy=1", apiHeaders)).execute()
-                                    if (req.isSuccessful) cachedSessionKey = json.decodeFromString<SessionKeyResponse>(req.body.string()).data?.key
-                                } catch (e: Exception) {}
-                            }
-                            cachedSessionKey
-                        }
-                        val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey) ?: map
-                        val estimatedTotalH = resolved.dim.getOrNull(1)?.takeIf { it > 0 } ?: 8000
-                        val parts = if (estimatedTotalH > MAX_SAFE_HEIGHT) ceil(estimatedTotalH.toDouble() / MAX_SAFE_HEIGHT).toInt() else 1
-
-                        for (p in 0 until parts) {
-                            val cacheKey = "$chapterId-defmap-$deferredMapGlobalIdx-p-$p"
-                            jitCache[cacheKey] = JitPage(
-                                chapterId = chapterId, seriesType = seriesType, seriesId = seriesId, cdnBase = cdnBase,
-                                sourceType = 2, mapIndex = localMapIdx, splitPart = p, totalParts = parts,
-                                deferredSplit = s, jwtTokenIndex = jwtIdx
-                            )
-                            val shortUrl = "$SCRAMBLED_SCHEME$cacheKey.jpg"
-                            pages.add(Page(pageIndex, url = shortUrl, imageUrl = shortUrl))
-                            pageIndex++
-                        }
-                        deferredMapGlobalIdx++
-                    }
-                } catch (e: Exception) {}
-            }
-        }
+        // لم نعد نحتاج fetchDeferredPages لأن proxy-plan يتولى كل شيء مباشرة
 
         return pages
     }
 
-    private fun String.isJwt(): Boolean =
-        startsWith("eyJhbGci") && count { it == '.' } == 2
-    
-    private fun jwtSplitValue(jwtToken: String): Int {
+    // تجلب URLs من proxy-plan وتحمّل bytes القطع فوراً قبل أن تُحرق الروابط
+    private fun resolveMapViaProxy(
+        map: DeferredPageMap,
+        chapterId: String,
+        apiHeaders: Headers,
+    ): DeferredPageMap? {
         return try {
-            val payloadSegment = jwtToken.split(".").getOrNull(1) ?: return DEFAULT_SPLIT
-            val padded = payloadSegment.padEnd(
-                payloadSegment.length + (4 - payloadSegment.length % 4) % 4,
-                '=',
+            val bodyStr = json.encodeToString(map)
+            val body = bodyStr.toRequestBody("application/json".toMediaType())
+            val reqHeaders = apiHeaders.newBuilder()
+                .set("Origin", baseUrl)
+                .set("Referer", "$baseUrl/")
+                .set("Content-Type", "application/json")
+                .set("Accept", "application/json")
+                .build()
+            val proxyReq = POST(
+                "$baseUrl/chapter-map-proxy-plan/$chapterId",
+                reqHeaders,
+                body,
             )
-            val payloadJson = String(Base64.decode(padded, Base64.URL_SAFE))
-            json.decodeFromString<JwtPayload>(payloadJson).split
-        } catch (e: Exception) {
-            DEFAULT_SPLIT
+            val proxyResp = client.newCall(proxyReq).execute()
+            if (!proxyResp.isSuccessful) return null
+            val result = proxyResp.parseAs<ProxyPlanResponse>()
+            if (!result.success) return null
+            val resolvedMap = result.data?.map ?: return null
+
+            // نحمّل bytes كل قطعة فوراً لأن URLs تُحرق بعد أول استخدام
+            val prefetched = prefetchPieces(resolvedMap.pieces, apiHeaders)
+            resolvedMap.copy(prefetchedPieces = prefetched)
+        } catch (e: Exception) { null }
+    }
+
+    // تحميل bytes القطع فوراً وتخزينها كـ Base64
+    private fun prefetchPieces(pieces: List<String>, apiHeaders: Headers): List<String> {
+        return pieces.map { pieceUrl ->
+            try {
+                val req = Request.Builder()
+                    .url(pieceUrl)
+                    .header("Referer", "$baseUrl/")
+                    .header("Accept", "image/avif,image/webp,image/jpeg,*/*")
+                    .header("User-Agent", apiHeaders["User-Agent"] ?: headers["User-Agent"] ?: "Mozilla/5.0")
+                    .build()
+                client.newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val bytes = resp.body.bytes()
+                        Base64.encodeToString(bytes, Base64.NO_WRAP)
+                    } else ""
+                }
+            } catch (e: Exception) { "" }
         }
     }
 
@@ -516,15 +431,25 @@ class ProComic : HttpSource() {
         getSessionKey: () -> String?,
     ): DeferredPageMap? {
         if (map.pieces.isNotEmpty()) return map
+
         if (map.token.isNotBlank()) {
             var dec: DeferredPageMap? = null
+
             val sk = getSessionKey()
             if (sk != null) dec = decryptMap(map.token, sk)
+
             if (dec == null || dec.pieces.isEmpty()) {
                 try {
                     val bodyStr = json.encodeToString(map)
                     val body = bodyStr.toRequestBody("application/json".toMediaType())
-                    val proxyReq = POST("$baseUrl/chapter-map-proxy-plan/$chapterId", apiHeaders, body)
+                    val proxyReq = POST(
+                        "$baseUrl/chapter-map-proxy-plan/$chapterId",
+                        apiHeaders.newBuilder()
+                            .set("Origin", baseUrl)
+                            .set("Referer", "$baseUrl/")
+                            .build(),
+                        body,
+                    )
                     val proxyResp = client.newCall(proxyReq).execute()
                     if (proxyResp.isSuccessful) dec = proxyResp.parseAs<ProxyPlanResponse>().data?.map
                 } catch (e: Exception) { }
@@ -534,150 +459,170 @@ class ProComic : HttpSource() {
         return null
     }
 
-    private fun resolveMapJit(
-        map: DeferredPageMap,
-        chapterId: String,
-        apiHeaders: Headers,
-        skProvider: () -> String?,
-        chain: Interceptor.Chain
-    ): DeferredPageMap? {
-        if (map.token.isNotBlank()) {
-            val sk = skProvider()
-            var dec = if (sk != null) decryptMap(map.token, sk) else null
-            if (dec == null || dec.pieces.isEmpty()) {
-                try {
-                    val bodyStr = json.encodeToString(map)
-                    val body = bodyStr.toRequestBody("application/json".toMediaType())
-                    val proxyReq = Request.Builder()
-                        .url("$baseUrl/chapter-map-proxy-plan/$chapterId")
-                        .post(body)
-                        .headers(apiHeaders)
-                        .build()
-                    val proxyResp = chain.proceed(proxyReq)
-                    if (proxyResp.isSuccessful) {
-                        dec = json.decodeFromString<ProxyPlanResponse>(proxyResp.body.string()).data?.map
-                    }
-                } catch (e: Exception) {}
-            }
-            return dec
+    // هنا تكمن معالجة المشكلة: إبقاء الرابط الخارجي قصيراً وحفظ الـ Map كـ Hash محلي متصل بالصفحة
+    private fun processMap(
+        dim: List<Int>,
+        mode: String,
+        pieces: List<String>,
+        prefetchedPieces: List<String>,
+        order: List<Int>,
+        rects: List<RectDto>,
+        signedToken: String,
+        pages: MutableList<Page>,
+        seenUrls: MutableSet<String>,
+    ) {
+        if (pieces.isEmpty() || !seenUrls.add(pieces.first())) return
+
+        val estimatedTotalH = dim.getOrNull(1)?.takeIf { it > 0 } ?: 10000
+        val parts = if (estimatedTotalH > MAX_SAFE_HEIGHT) {
+            ceil(estimatedTotalH.toDouble() / MAX_SAFE_HEIGHT).toInt()
+        } else {
+            1
         }
-        return map
+
+        for (p in 0 until parts) {
+            val mapData = ScrambledMap(
+                dim = dim,
+                mode = mode,
+                pieces = pieces,
+                prefetchedPieces = prefetchedPieces,
+                order = order,
+                rects = rects,
+                signedToken = signedToken,
+                splitPart = p,
+                totalParts = parts,
+            )
+            val encoded = Base64.encodeToString(
+                json.encodeToString(mapData).toByteArray(Charsets.UTF_8),
+                Base64.URL_SAFE or Base64.NO_WRAP,
+            )
+            val shortUrl = "$SCRAMBLED_SCHEME${pages.size}_part_$p.jpg#$encoded"
+            pages.add(Page(pages.size, url = shortUrl, imageUrl = shortUrl))
+        }
     }
 
-    private fun reconstructPage(map: ScrambledMap, chain: Interceptor.Chain): ByteArray? {
+    private fun reconstructPage(map: ScrambledMap): ByteArray? {
         if (map.pieces.isEmpty()) return null
 
-        val (cols, rows) = parseMode(map.mode, map.pieces.size)
+        val useRects = map.rects.size == map.pieces.size
+        val (cols, rows) = if (!useRects) parseMode(map.mode, map.pieces.size) else Pair(1, 1)
         val bitmaps = arrayOfNulls<Bitmap>(map.pieces.size)
+        val hasPrefetched = map.prefetchedPieces.size == map.pieces.size
 
         for (targetIdx in 0 until map.pieces.size) {
             val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
-            val basePieceUrl = map.pieces.getOrNull(srcIdx) ?: continue
 
-            val pieceUrl = if (map.signedToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ2IjoxLCJpdiI6IJ")) {
-                if (basePieceUrl.contains("?")) "$basePieceUrl&token=${map.signedToken}"
-                else "$basePieceUrl?token=${map.signedToken}"
+            val bitmap = if (hasPrefetched) {
+                // استخدام bytes المُحمَّلة مسبقاً مباشرة — لا نحتاج تحميل من الشبكة
+                val b64 = map.prefetchedPieces.getOrNull(srcIdx) ?: ""
+                if (b64.isNotBlank()) {
+                    try {
+                        val bytes = Base64.decode(b64, Base64.NO_WRAP)
+                        decodeAvif(bytes)
+                    } catch (e: Exception) { null }
+                } else null
             } else {
-                basePieceUrl
+                // صور مباشرة بدون تشفير — نحملها من الشبكة عادي
+                val basePieceUrl = map.pieces.getOrNull(srcIdx)
+                if (basePieceUrl == null) {
+                    null
+                } else {
+                    val pieceUrl = if (map.signedToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ2IjoxLCJpdiI6IJ")) {
+                        if (basePieceUrl.contains("?")) "$basePieceUrl&token=${map.signedToken}"
+                        else "$basePieceUrl?token=${map.signedToken}"
+                    } else basePieceUrl
+
+                    try {
+                        val req = Request.Builder()
+                            .url(pieceUrl)
+                            .header("Referer", "$baseUrl/")
+                            .header("Accept", "image/avif,image/webp,image/jpeg,*/*")
+                            .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
+                            .build()
+                        client.newCall(req).execute().use { resp ->
+                            if (resp.isSuccessful) {
+                                val bytes = resp.body.bytes()
+                                val isBase64 = bytes.size > 20 &&
+                                    bytes[0] == 'd'.code.toByte() && bytes[1] == 'a'.code.toByte() &&
+                                    bytes[2] == 't'.code.toByte() && bytes[3] == 'a'.code.toByte() &&
+                                    bytes[4] == ':'.code.toByte()
+                                val finalBytes = if (isBase64) {
+                                    Base64.decode(String(bytes).substringAfter("base64,"), Base64.DEFAULT)
+                                } else bytes
+                                decodeAvif(finalBytes)
+                            } else null
+                        }
+                    } catch (e: Exception) { null }
+                }
             }
 
-            val req = Request.Builder()
-                .url(pieceUrl)
-                .header("Referer", "$baseUrl/")
-                .header("Accept", "image/avif,image/webp,image/jpeg,*/*")
-                .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
-                .build()
-
-            try {
-                val resp = chain.proceed(req)
-                if (resp.isSuccessful) {
-                    val bodyBytes = resp.body.bytes()
-                    val isBase64Text = bodyBytes.size > 20 &&
-                        bodyBytes[0] == 'd'.code.toByte() &&
-                        bodyBytes[1] == 'a'.code.toByte() &&
-                        bodyBytes[2] == 't'.code.toByte() &&
-                        bodyBytes[3] == 'a'.code.toByte() &&
-                        bodyBytes[4] == ':'.code.toByte()
-
-                    val finalBytes = if (isBase64Text) {
-                        val base64Data = String(bodyBytes).substringAfter("base64,")
-                        Base64.decode(base64Data, Base64.DEFAULT)
-                    } else {
-                        bodyBytes
-                    }
-                    bitmaps[targetIdx] = decodeAvif(finalBytes)
-                }
-            } catch (e: Exception) { }
+            bitmaps[targetIdx] = bitmap
         }
 
         return try {
             val validBitmaps = bitmaps.filterNotNull()
             if (validBitmaps.isEmpty()) return null
 
-            var calcTotalW: Int
-            var calcTotalH: Int
-
-            when {
-                cols == 1 -> {
-                    calcTotalW = map.dim.getOrNull(0)?.takeIf { it > 0 } ?: validBitmaps.maxOf { it.width }
-                    calcTotalH = map.dim.getOrNull(1)?.takeIf { it > 0 } ?: validBitmaps.sumOf { it.height }
-                }
-                rows == 1 -> {
-                    calcTotalW = map.dim.getOrNull(0)?.takeIf { it > 0 } ?: validBitmaps.sumOf { it.width }
-                    calcTotalH = map.dim.getOrNull(1)?.takeIf { it > 0 } ?: validBitmaps.maxOf { it.height }
-                }
-                else -> {
-                    val firstBmp = validBitmaps.first()
-                    calcTotalW = map.dim.getOrNull(0)?.takeIf { it > 0 } ?: (firstBmp.width * cols)
-                    calcTotalH = map.dim.getOrNull(1)?.takeIf { it > 0 } ?: (firstBmp.height * rows)
-                }
-            }
+            val totalW = map.dim.getOrNull(0)?.takeIf { it > 0 }
+                ?: if (useRects) map.rects.maxOf { it.left + it.width } else validBitmaps.maxOf { it.width }
+            val totalH = map.dim.getOrNull(1)?.takeIf { it > 0 }
+                ?: if (useRects) map.rects.maxOf { it.top + it.height } else validBitmaps.sumOf { it.height }
 
             val totalParts = map.totalParts ?: 1
             val splitPart = map.splitPart ?: 0
-            val partH = calcTotalH / totalParts
-            val actualPartH = if (splitPart == totalParts - 1) calcTotalH - (partH * splitPart) else partH
+            val partH = totalH / totalParts
+            val actualPartH = if (splitPart == totalParts - 1) totalH - (partH * splitPart) else partH
 
-            if (calcTotalW <= 0 || actualPartH <= 0) return null
+            if (totalW <= 0 || actualPartH <= 0) return null
 
             val result = try {
-                Bitmap.createBitmap(calcTotalW, actualPartH, Bitmap.Config.ARGB_8888)
+                Bitmap.createBitmap(totalW, actualPartH, Bitmap.Config.ARGB_8888)
             } catch (e: OutOfMemoryError) {
-                Bitmap.createBitmap(calcTotalW, actualPartH, Bitmap.Config.RGB_565)
+                Bitmap.createBitmap(totalW, actualPartH, Bitmap.Config.RGB_565)
             }
             val canvas = Canvas(result)
             canvas.translate(0f, -(splitPart * partH).toFloat())
 
-            when {
-                cols == 1 -> {
-                    var currentY = 0f
-                    for (bmp in bitmaps) {
-                        if (bmp != null) {
-                            canvas.drawBitmap(bmp, 0f, currentY, null)
-                            currentY += bmp.height
-                            bmp.recycle()
+            if (useRects) {
+                // استخدام الـ rects للموضع الدقيق لكل قطعة
+                for (targetIdx in bitmaps.indices) {
+                    val bmp = bitmaps[targetIdx] ?: continue
+                    val rect = map.rects[targetIdx]
+                    canvas.drawBitmap(bmp, rect.left.toFloat(), rect.top.toFloat(), null)
+                    bmp.recycle()
+                }
+            } else {
+                when {
+                    cols == 1 -> {
+                        var currentY = 0f
+                        for (bmp in bitmaps) {
+                            if (bmp != null) {
+                                canvas.drawBitmap(bmp, 0f, currentY, null)
+                                currentY += bmp.height
+                                bmp.recycle()
+                            }
                         }
                     }
-                }
-                rows == 1 -> {
-                    var currentX = 0f
-                    for (bmp in bitmaps) {
-                        if (bmp != null) {
-                            canvas.drawBitmap(bmp, currentX, 0f, null)
-                            currentX += bmp.width
-                            bmp.recycle()
+                    rows == 1 -> {
+                        var currentX = 0f
+                        for (bmp in bitmaps) {
+                            if (bmp != null) {
+                                canvas.drawBitmap(bmp, currentX, 0f, null)
+                                currentX += bmp.width
+                                bmp.recycle()
+                            }
                         }
                     }
-                }
-                else -> {
-                    val tileW = validBitmaps.first().width
-                    val tileH = validBitmaps.first().height
-                    for (targetIdx in bitmaps.indices) {
-                        val bmp = bitmaps[targetIdx] ?: continue
-                        val col = targetIdx % cols
-                        val row = targetIdx / cols
-                        canvas.drawBitmap(bmp, (col * tileW).toFloat(), (row * tileH).toFloat(), null)
-                        bmp.recycle()
+                    else -> {
+                        val tileW = validBitmaps.first().width
+                        val tileH = validBitmaps.first().height
+                        for (targetIdx in bitmaps.indices) {
+                            val bmp = bitmaps[targetIdx] ?: continue
+                            val col = targetIdx % cols
+                            val row = targetIdx / cols
+                            canvas.drawBitmap(bmp, (col * tileW).toFloat(), (row * tileH).toFloat(), null)
+                            bmp.recycle()
+                        }
                     }
                 }
             }
@@ -695,6 +640,8 @@ class ProComic : HttpSource() {
         return try {
             val tokenJsonStr = String(Base64.decode(tokenStr, Base64.URL_SAFE or Base64.DEFAULT))
             val tokenData = json.decodeFromString<EncryptedToken>(tokenJsonStr)
+            // browser_session tokens لا يمكن فك تشفيرها محلياً - تحتاج proxy-plan
+            if (tokenData.method == "browser_session" || tokenData.m == "browser_session") return null
 
             val keyBytes = Base64.decode(sessionKeyBase64, Base64.URL_SAFE)
             val secretKey = SecretKeySpec(keyBytes, "AES")
@@ -738,30 +685,6 @@ class ProComic : HttpSource() {
         json.decodeFromStream(body.byteStream())
 }
 
-private const val DEFAULT_SPLIT = 3
-
-@Serializable
-data class JitPage(
-    val chapterId: String,
-    val seriesType: String,
-    val seriesId: String,
-    val cdnBase: String,
-    val sourceType: Int, // 1 = خارطة مباشرة، 2 = خارطة مؤجلة، 3 = صورة ثابتة
-    val mapIndex: Int = -1,
-    val pageUrl: String = "",
-    val splitPart: Int = 0,
-    val totalParts: Int = 1,
-    val deferredSplit: Int = 0,
-    val jwtTokenIndex: Int = 0
-)
-
-@Serializable
-data class JwtPayload(
-    val split: Int = DEFAULT_SPLIT,
-    val cid: Int = 0,
-    val p: String = "",
-)
-
 @Serializable
 data class SessionKeyResponse(
     val success: Boolean = false,
@@ -775,6 +698,7 @@ data class SessionKeyData(val key: String = "")
 data class EncryptedToken(
     val v: Int = 3,
     val m: String = "",
+    val method: String = "",
     val cid: Int = 0,
     val iv: String = "",
     val tag: String = "",
@@ -782,11 +706,22 @@ data class EncryptedToken(
 )
 
 @Serializable
+data class RectDto(
+    val left: Int = 0,
+    val top: Int = 0,
+    val width: Int = 0,
+    val height: Int = 0,
+)
+
+@Serializable
 data class ScrambledMap(
     val dim: List<Int> = emptyList(),
     val mode: String = "",
     val pieces: List<String> = emptyList(),
+    // قطع محمّلة مسبقاً كـ Base64 لتجنب URLs التي تُحرق بعد أول استخدام
+    val prefetchedPieces: List<String> = emptyList(),
     val order: List<Int> = emptyList(),
+    val rects: List<RectDto> = emptyList(),
     val signedToken: String = "",
     val splitPart: Int? = null,
     val totalParts: Int? = null,
@@ -858,25 +793,13 @@ data class ChapterMetadataDto(
 )
 
 @Serializable
-data class ChapterDeferredResponse(
-    val success: Boolean = false,
-    val data: ChapterDeferredData? = null,
-)
-
-@Serializable
-data class ChapterDeferredData(
-    val chapterId: Int = 0,
-    val splitIndex: Int = 0,
-    val images: List<String> = emptyList(),
-    val maps: List<DeferredPageMap> = emptyList(),
-)
-
-@Serializable
 data class DeferredPageMap(
     val dim: List<Int> = emptyList(),
     val mode: String = "",
     val pieces: List<String> = emptyList(),
+    val prefetchedPieces: List<String> = emptyList(),
     val order: List<Int> = emptyList(),
+    val rects: List<RectDto> = emptyList(),
     val token: String = "",
     val method: String = "",
 )
