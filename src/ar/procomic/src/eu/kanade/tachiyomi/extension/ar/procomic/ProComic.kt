@@ -66,6 +66,9 @@ class ProComic : HttpSource() {
         // تم تغيير البنية لمنع إرسال روابط طويلة عبر الشبكة
         private const val SCRAMBLED_SCHEME = "https://procomic.pro/__scrambled_asset__/"
         private const val MAX_SAFE_HEIGHT = 6000
+
+        // cache مشتركة: cleanUrl → ScrambledMap — تُملأ في processMap وتُقرأ في الـ interceptor
+        private val scrambledMapCache = java.util.concurrent.ConcurrentHashMap<String, ScrambledMap>()
     }
 
     private fun String.toAbsoluteUrl(cdnBase: String): String {
@@ -87,8 +90,9 @@ class ProComic : HttpSource() {
             val url = request.url.toString()
 
             if (url.startsWith(SCRAMBLED_SCHEME)) {
-                // محاولة استخراج الخريطة من التاج المحلي الملحق بالطلب إن وجد
-                val pageMap = request.tag(ScrambledMap::class.java)
+                // قراءة الخريطة من الـ cache بالـ URL النظيف (بدون fragment)
+                val cleanUrl = url.substringBefore("#")
+                val pageMap = scrambledMapCache[cleanUrl]
                     ?: return@addInterceptor Response.Builder()
                         .request(request).protocol(Protocol.HTTP_1_1)
                         .code(400).message("Missing Map Metadata")
@@ -487,9 +491,12 @@ class ProComic : HttpSource() {
                 json.encodeToString(mapData).toByteArray(Charsets.UTF_8),
                 Base64.URL_SAFE or Base64.NO_WRAP,
             )
-            // نضع الرابط قصيراً جداً لتجنب خطأ السيرفر، ونلحق البيانات بعد علامة # كـ Fragment محلي للتطبيق فقط
-            val shortUrl = "$SCRAMBLED_SCHEME${pages.size}_part_$p.jpg#$encoded"
-            pages.add(Page(pages.size, url = shortUrl, imageUrl = shortUrl))
+            // url يحمل الـ fragment (للتوافق) — imageUrl نظيف لأن OkHttp يحذف الـ fragment
+            val cleanUrl = "$SCRAMBLED_SCHEME${pages.size}_part_$p.jpg"
+            val urlWithFragment = "$cleanUrl#$encoded"
+            // نخزن الخريطة في الـ cache بالـ URL النظيف لالتقاطها في الـ interceptor
+            scrambledMapCache[cleanUrl] = mapData
+            pages.add(Page(pages.size, url = urlWithFragment, imageUrl = cleanUrl))
         }
     }
 
