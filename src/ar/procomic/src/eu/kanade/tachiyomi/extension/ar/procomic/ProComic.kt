@@ -62,36 +62,84 @@ class ProComic : HttpSource() {
         .rateLimit(2, 1)
         .addInterceptor { chain ->
             val request = chain.request()
-            val response = chain.proceed(request)
-            val url = request.url.toString()
+            val url = request.url
+
+            var response = chain.proceed(request)
 
             val isPotentialBase64Image = response.isSuccessful && request.method == "GET" &&
-                url.contains("/i/") && url.contains("procomic")
+                url.encodedPath.contains("/i/") && url.host.contains("procomic")
 
             if (isPotentialBase64Image) {
-                val responseBody = response.body
-                if (responseBody != null) {
-                    val bytes = responseBody.bytes()
-                    val isBase64Text = bytes.size > 20 &&
-                        bytes[0] == 'd'.code.toByte() &&
-                        bytes[1] == 'a'.code.toByte() &&
-                        bytes[2] == 't'.code.toByte() &&
-                        bytes[3] == 'a'.code.toByte() &&
-                        bytes[4] == ':'.code.toByte()
+                var responseBody = response.body
+                var bytes = responseBody?.bytes() ?: ByteArray(0)
 
-                    if (isBase64Text) {
-                        val bodyString = String(bytes)
-                        val base64Data = bodyString.substringAfter("base64,")
-                        val decodedBytes = Base64.decode(base64Data, Base64.DEFAULT)
-                        val mimeType = bodyString.substringAfter("data:").substringBefore(";").toMediaType()
-                        return@addInterceptor response.newBuilder()
-                            .body(decodedBytes.toResponseBody(mimeType))
-                            .build()
-                    } else {
-                        return@addInterceptor response.newBuilder()
-                            .body(bytes.toResponseBody(responseBody.contentType()))
-                            .build()
-                    }
+                var isBase64Text = bytes.size > 20 &&
+                    bytes[0] == 'd'.code.toByte() &&
+                    bytes[1] == 'a'.code.toByte() &&
+                    bytes[2] == 't'.code.toByte() &&
+                    bytes[3] == 'a'.code.toByte() &&
+                    bytes[4] == ':'.code.toByte()
+
+                // إذا لم يكن النص Base64 (أي أن الرابط انتهت صلاحيته وعاد بصورة الخطأ)
+                val fragmentParts = url.fragment?.split("||")
+                if (!isBase64Text && fragmentParts != null && fragmentParts.size == 3) {
+                    val chapterId = fragmentParts[0]
+                    val mapBase64 = fragmentParts[1]
+                    val srcIdx = fragmentParts[2].toIntOrNull() ?: 0
+
+                    val mapJson = String(Base64.decode(mapBase64, Base64.URL_SAFE))
+                    
+                    // طلب رابط جديد وتحديث الصلاحية
+                    val proxyReq = POST(
+                        "$baseUrl/chapter-map-proxy-plan/$chapterId",
+                        headersBuilder()
+                            .set("Origin", baseUrl)
+                            .set("Referer", "$baseUrl/")
+                            .set("Content-Type", "application/json")
+                            .set("Accept", "application/json")
+                            .build(),
+                        mapJson.toRequestBody("application/json".toMediaType())
+                    )
+
+                    try {
+                        val proxyResp = chain.proceed(proxyReq)
+                        if (proxyResp.isSuccessful) {
+                            val proxyData = json.decodeFromStream<ProxyPlanResponse>(proxyResp.body!!.byteStream())
+                            val newPieces = proxyData.data?.map?.pieces
+                            if (!newPieces.isNullOrEmpty() && srcIdx < newPieces.size) {
+                                val newPieceUrl = newPieces[srcIdx].let {
+                                    if (it.startsWith("http")) it else "https://${url.host}$it"
+                                }
+                                
+                                // تحميل الرابط الجديد
+                                val newReq = GET(newPieceUrl, request.headers)
+                                val newResp = chain.proceed(newReq)
+                                if (newResp.isSuccessful) {
+                                    bytes = newResp.body?.bytes() ?: bytes
+                                    isBase64Text = bytes.size > 20 &&
+                                        bytes[0] == 'd'.code.toByte() &&
+                                        bytes[1] == 'a'.code.toByte() &&
+                                        bytes[2] == 't'.code.toByte() &&
+                                        bytes[3] == 'a'.code.toByte() &&
+                                        bytes[4] == ':'.code.toByte()
+                                }
+                            }
+                        }
+                    } catch (e: Exception) { }
+                }
+
+                if (isBase64Text) {
+                    val bodyString = String(bytes)
+                    val base64Data = bodyString.substringAfter("base64,")
+                    val decodedBytes = Base64.decode(base64Data, Base64.DEFAULT)
+                    val mimeType = bodyString.substringAfter("data:").substringBefore(";").toMediaType()
+                    return@addInterceptor response.newBuilder()
+                        .body(decodedBytes.toResponseBody(mimeType))
+                        .build()
+                } else {
+                    return@addInterceptor response.newBuilder()
+                        .body(bytes.toResponseBody(responseBody?.contentType()))
+                        .build()
                 }
             }
             response
@@ -285,15 +333,16 @@ class ProComic : HttpSource() {
                     mapTokens.add(map.token)
                 }
                 map.token.isNotBlank() && map.pieces.isEmpty() -> {
+                    val originalMapBase64 = Base64.encodeToString(json.encodeToString(map).toByteArray(), Base64.NO_WRAP or Base64.URL_SAFE)
                     val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
                     if (resolved != null && resolved.pieces.isNotEmpty()) {
                         val absolutePieces = resolved.pieces.map { it.toAbsoluteUrl(cdnBase) }
-                        processMap(resolved.order, absolutePieces, resolved.token, pages, seenUrls)
+                        processMap(originalMapBase64, chapterId, resolved.order, absolutePieces, resolved.token, pages, seenUrls)
                     }
                 }
                 map.pieces.isNotEmpty() -> {
                     val absolutePieces = map.pieces.map { it.toAbsoluteUrl(cdnBase) }
-                    processMap(map.order, absolutePieces, map.token, pages, seenUrls)
+                    processMap("", chapterId, map.order, absolutePieces, map.token, pages, seenUrls)
                 }
             }
         }
@@ -356,17 +405,18 @@ class ProComic : HttpSource() {
         }
 
         for (splitData in splitResponses) {
-            val decryptedMaps = mutableListOf<DeferredPageMap>()
             val absolutePieceUrls = mutableSetOf<String>()
 
             splitData.maps.forEach { map ->
                 when {
                     map.token.isNotBlank() && map.pieces.isEmpty() && map.token.isJwt() -> { }
                     else -> {
+                        val originalMapBase64 = Base64.encodeToString(json.encodeToString(map).toByteArray(), Base64.NO_WRAP or Base64.URL_SAFE)
                         val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
                         if (resolved != null && resolved.pieces.isNotEmpty()) {
-                            decryptedMaps.add(resolved)
-                            absolutePieceUrls.addAll(resolved.pieces.map { it.toAbsoluteUrl(cdnBase) })
+                            val absolutePieces = resolved.pieces.map { it.toAbsoluteUrl(cdnBase) }
+                            absolutePieceUrls.addAll(absolutePieces)
+                            processMap(originalMapBase64, chapterId, resolved.order, absolutePieces, resolved.token, pages, seenUrls)
                         }
                     }
                 }
@@ -377,11 +427,6 @@ class ProComic : HttpSource() {
                 if (fullUrl !in absolutePieceUrls && seenUrls.add(fullUrl)) {
                     pages.add(Page(pages.size, imageUrl = fullUrl))
                 }
-            }
-
-            decryptedMaps.forEach { map ->
-                val absolutePieces = map.pieces.map { it.toAbsoluteUrl(cdnBase) }
-                processMap(map.order, absolutePieces, map.token, pages, seenUrls)
             }
         }
 
@@ -423,8 +468,9 @@ class ProComic : HttpSource() {
         return null
     }
 
-    // تم التعديل هنا: الآن نرسل القطع مباشرة كصفحات عادية للتطبيق بدلاً من إرسالها للدمج
     private fun processMap(
+        originalMapBase64: String,
+        chapterId: String,
         order: List<Int>,
         pieces: List<String>,
         signedToken: String,
@@ -434,19 +480,25 @@ class ProComic : HttpSource() {
         if (pieces.isEmpty()) return
 
         for (targetIdx in pieces.indices) {
-            // نطبق الترتيب إذا كان موجوداً
             val srcIdx = if (order.size == pieces.size) order[targetIdx] else targetIdx
             val basePieceUrl = pieces.getOrNull(srcIdx) ?: continue
 
-            val pieceUrl = if (signedToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ2IjoxLCJpdiI6IJ")) {
+            val pieceUrl = if (signedToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ2IjoxLCJpdiI6I")) {
                 if (basePieceUrl.contains("?")) "$basePieceUrl&token=$signedToken"
                 else "$basePieceUrl?token=$signedToken"
             } else {
                 basePieceUrl
             }
 
-            if (seenUrls.add(pieceUrl)) {
-                pages.add(Page(pages.size, url = pieceUrl, imageUrl = pieceUrl))
+            // تضمين البيانات اللازمة للتجديد التلقائي إذا انتهت صلاحية الرابط
+            val finalUrl = if (originalMapBase64.isNotEmpty() && pieceUrl.contains("/i/")) {
+                "$pieceUrl#$chapterId||$originalMapBase64||$srcIdx"
+            } else {
+                pieceUrl
+            }
+
+            if (seenUrls.add(finalUrl)) {
+                pages.add(Page(pages.size, url = finalUrl, imageUrl = finalUrl))
             }
         }
     }
