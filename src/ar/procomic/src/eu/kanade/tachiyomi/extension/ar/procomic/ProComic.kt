@@ -1,13 +1,19 @@
 package eu.kanade.tachiyomi.extension.ar.procomic
 
+import android.app.Application
+import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.util.Base64
 import android.util.LruCache
+import android.widget.Toast
+import androidx.preference.ListPreference
+import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
+import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -30,6 +36,8 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import tachiyomi.decoder.ImageDecoder
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
 import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -40,7 +48,8 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.math.ceil
 
-class ProComic : HttpSource() {
+// إضافة ConfigurableSource للكلاس
+class ProComic : HttpSource(), ConfigurableSource {
 
     override val name = "ProComic"
     override val baseUrl = "https://procomic.pro"
@@ -56,17 +65,56 @@ class ProComic : HttpSource() {
 
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
+    // استدعاء قاعدة البيانات المحلية لحفظ تفضيلات المستخدم
+    private val preferences: SharedPreferences by lazy {
+        Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
+    }
+
     companion object {
         private const val SCRAMBLED_SCHEME = "https://procomic.pro/__scrambled_asset__/"
         private const val MAX_SAFE_HEIGHT = 6000
 
-        // ذاكرة لتخزين القطع المحملة مسبقاً (50 ميجابايت تكفي لفصل كامل)
         private val pieceCache = object : LruCache<String, ByteArray>(50 * 1024 * 1024) {
             override fun sizeOf(key: String, value: ByteArray): Int = value.size
         }
         
-        // سجل أقفال ذكي: يضع قفلاً لكل رابط قطعة على حدة لمنع التحميل المزدوج
         private val pieceLocks = ConcurrentHashMap<String, Any>()
+
+        // ثوابت الإعدادات الجديدة لاختيار النوع
+        private const val TYPE_PREF = "TypePref"
+        private val TYPE_PREF_ENTRIES = arrayOf("الكل", "مانجا", "مانهوا", "مانهوا صينية (Manhua)", "كوميكس")
+        private val TYPE_PREF_ENTRY_VALUES = arrayOf("all", "manga", "manhwa", "manhua", "comic")
+        private const val TYPE_PREF_DEFAULT = "all"
+    }
+
+    // بناء واجهة الإعدادات داخل التطبيق (إضافة الخيار)
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        ListPreference(screen.context).apply {
+            key = TYPE_PREF
+            title = "تصفية نوع السلاسل"
+            summary = "حدد النوع الذي تريد عرضه في أقسام التطبيق (الأحدث/الشائع)"
+            entries = TYPE_PREF_ENTRIES
+            entryValues = TYPE_PREF_ENTRY_VALUES
+            setDefaultValue(TYPE_PREF_DEFAULT)
+            
+            // إضافة Toast ينبه المستخدم بتحديث الصفحة عند تغيير الخيار
+            setOnPreferenceChangeListener { _, newValue ->
+                val selected = newValue as String
+                val index = findIndexOfValue(selected)
+                val entryTitle = entries[index]
+                Toast.makeText(
+                    screen.context,
+                    "قم بتحديث الصفحة لتطبيق عرض: $entryTitle",
+                    Toast.LENGTH_LONG,
+                ).show()
+                true
+            }
+        }.also(screen::addPreference)
+    }
+
+    // دالة مساعدة لقراءة النوع المختار
+    private fun getSelectedType(): String {
+        return preferences.getString(TYPE_PREF, TYPE_PREF_DEFAULT) ?: TYPE_PREF_DEFAULT
     }
 
     private fun String.toAbsoluteUrl(cdnBase: String): String {
@@ -141,7 +189,6 @@ class ProComic : HttpSource() {
         }
         .build()
 
-    // استعادة دالة imageRequest الأصلية الخاصة بك لأنها كانت تعمل بكفاءة
     override fun imageRequest(page: Page): Request {
         val request = super.imageRequest(page)
         val fragmentData = page.url.substringAfter("#", "")
@@ -168,10 +215,18 @@ class ProComic : HttpSource() {
         headers,
     )
 
+    // هنا يتم تصفية البيانات بناءً على النوع المختار من الإعدادات
     override fun popularMangaParse(response: Response): MangasPage {
         val data = response.parseAs<LatestUpdatesResponse>()
-        val mangas = data.data.filter { it.type != "novel" }.map { it.toSManga() }
-        return MangasPage(mangas, mangas.size >= 30)
+        val selectedType = getSelectedType()
+        
+        val mangas = data.data
+            .filter { it.type != "novel" } // استبعاد الروايات دائماً
+            .filter { selectedType == "all" || it.type.equals(selectedType, ignoreCase = true) } // تصفية حسب الاختيار
+            .map { it.toSManga() }
+            
+        // نستخدم حجم البيانات الأصلية (data.data) لمعرفة إذا ما كانت هناك صفحات أخرى أم لا
+        return MangasPage(mangas, data.data.size >= 30)
     }
 
     override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
@@ -529,8 +584,6 @@ class ProComic : HttpSource() {
 
             var finalBytes: ByteArray? = null
 
-            // تعيين قفل مخصص لكل رابط لوحده. 
-            // إذا جاء جزء ثاني يطلب نفس الرابط، فإنه سينتظر الجزء الأول حتى ينهي تحميله ويأخذه من الذاكرة فوراً!
             val lock = pieceLocks.getOrPut(basePieceUrl) { Any() }
 
             synchronized(lock) {
