@@ -56,16 +56,16 @@ class ProComic : HttpSource() {
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
     companion object {
-        // تم تغيير البنية لمنع إرسال روابط طويلة عبر الشبكة
         private const val SCRAMBLED_SCHEME = "https://procomic.pro/__scrambled_asset__/"
         private const val MAX_SAFE_HEIGHT = 6000
 
-        // إضافة ذاكرة تخزين مؤقت للقطع بحجم 50 ميجابايت لمنع إعادة الطلب وحل مشكلة احتراق الروابط
+        // ذاكرة الكاش للقطع
         private val pieceCache = object : LruCache<String, ByteArray>(50 * 1024 * 1024) {
-            override fun sizeOf(key: String, value: ByteArray): Int {
-                return value.size
-            }
+            override fun sizeOf(key: String, value: ByteArray): Int = value.size
         }
+        
+        // قفل لمنع التطبيق من طلب نفس الروابط في نفس اللحظة (يحل مشكلة احتراق الروابط)
+        private val pieceLock = Any()
     }
 
     private fun String.toAbsoluteUrl(cdnBase: String): String {
@@ -77,7 +77,6 @@ class ProComic : HttpSource() {
         }
     }
 
-    // الـ Interceptor الآن يقرأ خريطة التفكيك محلياً من كائن الصفحة لمنع الـ 502 تماماً
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(25, TimeUnit.SECONDS)
@@ -86,13 +85,23 @@ class ProComic : HttpSource() {
             val request = chain.request()
             val url = request.url.toString()
 
+            // التقاط الروابط الوهمية الخاصة بالتجميع
             if (url.startsWith(SCRAMBLED_SCHEME)) {
-                // محاولة استخراج الخريطة من التاج المحلي الملحق بالطلب إن وجد
-                val pageMap = request.tag(ScrambledMap::class.java)
+                val payload = request.url.queryParameter("payload")
                     ?: return@addInterceptor Response.Builder()
                         .request(request).protocol(Protocol.HTTP_1_1)
-                        .code(400).message("Missing Map Metadata")
+                        .code(400).message("Missing Payload")
                         .body("".toResponseBody(null)).build()
+
+                val pageMap = try {
+                    val mapJson = String(Base64.decode(payload, Base64.URL_SAFE or Base64.NO_WRAP))
+                    json.decodeFromString<ScrambledMap>(mapJson)
+                } catch (e: Exception) {
+                    return@addInterceptor Response.Builder()
+                        .request(request).protocol(Protocol.HTTP_1_1)
+                        .code(400).message("Invalid Payload")
+                        .body("".toResponseBody(null)).build()
+                }
 
                 val mergedBytes = reconstructPage(pageMap)
                     ?: return@addInterceptor Response.Builder()
@@ -141,23 +150,6 @@ class ProComic : HttpSource() {
             response
         }
         .build()
-
-    // تخصيص دالة طلب الصورة لحقن خريطة الدمج محلياً داخل الـ Tag الخاص بـ OkHttp دون إرسالها للسيرفر
-    override fun imageUrlParse(response: Response): String = ""
-
-    override fun imageRequest(page: Page): Request {
-        val request = super.imageRequest(page)
-        val fragmentData = page.url.substringAfter("#", "")
-        if (fragmentData.isNotBlank()) {
-            try {
-                val mapJson = String(Base64.decode(fragmentData, Base64.URL_SAFE or Base64.NO_WRAP))
-                val pageMap = json.decodeFromString<ScrambledMap>(mapJson)
-                // نربط الخريطة كـ Tag محلي بالطلب لكي تلتقطها دالة الـ Interceptor
-                return request.newBuilder().tag(ScrambledMap::class.java, pageMap).build()
-            } catch (e: Exception) {}
-        }
-        return request
-    }
 
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
@@ -369,7 +361,7 @@ class ProComic : HttpSource() {
 
     private fun String.isJwt(): Boolean =
         startsWith("eyJhbGci") && count { it == '.' } == 2
-    
+
     private fun jwtSplitValue(jwtToken: String): Int {
         return try {
             val payloadSegment = jwtToken.split(".").getOrNull(1) ?: return DEFAULT_SPLIT
@@ -482,7 +474,7 @@ class ProComic : HttpSource() {
         return null
     }
 
-    // هنا تكمن معالجة المشكلة: إبقاء الرابط الخارجي قصيراً وحفظ الـ Map كـ Hash محلي متصل بالصفحة
+    // تم تغيير طريقة إرسال البيانات لتصبح ضمن الرابط نفسه لمنع ضياعها في Mihon
     private fun processMap(
         dim: List<Int>,
         mode: String,
@@ -515,8 +507,8 @@ class ProComic : HttpSource() {
                 json.encodeToString(mapData).toByteArray(Charsets.UTF_8),
                 Base64.URL_SAFE or Base64.NO_WRAP,
             )
-            // نضع الرابط قصيراً جداً لتجنب خطأ السيرفر، ونلحق البيانات بعد علامة # كـ Fragment محلي للتطبيق فقط
-            val shortUrl = "$SCRAMBLED_SCHEME${pages.size}_part_$p.jpg#$encoded"
+            // إضافة البيانات كـ Query Parameter بدلاً من Fragment
+            val shortUrl = "$SCRAMBLED_SCHEME${pages.size}_part_$p.jpg?payload=$encoded"
             pages.add(Page(pages.size, url = shortUrl, imageUrl = shortUrl))
         }
     }
@@ -531,55 +523,56 @@ class ProComic : HttpSource() {
             val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
             val basePieceUrl = map.pieces.getOrNull(srcIdx) ?: continue
 
-            // 1. محاولة جلب القطعة من الكاش أولاً
-            var finalBytes = pieceCache.get(basePieceUrl)
+            var finalBytes: ByteArray? = null
 
-            // 2. إذا لم تكن موجودة، نقوم بتحميلها
-            if (finalBytes == null) {
-                val pieceUrl = if (map.signedToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ2IjoxLCJpdiI6IJ")) {
-                    if (basePieceUrl.contains("?")) "$basePieceUrl&token=${map.signedToken}"
-                    else "$basePieceUrl?token=${map.signedToken}"
-                } else {
-                    basePieceUrl
-                }
+            // القفل السحري الذي سيجبر جميع الأجزاء المتزامنة على الانتظار حتى يتم توفير القطعة في الذاكرة
+            synchronized(pieceLock) {
+                finalBytes = pieceCache.get(basePieceUrl)
 
-                val req = Request.Builder()
-                    .url(pieceUrl)
-                    .header("Referer", "$baseUrl/")
-                    .header("Accept", "image/avif,image/webp,image/jpeg,*/*")
-                    .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
-                    .build()
+                if (finalBytes == null) {
+                    val pieceUrl = if (map.signedToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ2IjoxLCJpdiI6IJ")) {
+                        if (basePieceUrl.contains("?")) "$basePieceUrl&token=${map.signedToken}"
+                        else "$basePieceUrl?token=${map.signedToken}"
+                    } else {
+                        basePieceUrl
+                    }
 
-                try {
-                    client.newCall(req).execute().use { resp ->
-                        if (resp.isSuccessful) {
-                            val bodyBytes = resp.body.bytes()
-                            val isBase64Text = bodyBytes.size > 20 &&
-                                bodyBytes[0] == 'd'.code.toByte() &&
-                                bodyBytes[1] == 'a'.code.toByte() &&
-                                bodyBytes[2] == 't'.code.toByte() &&
-                                bodyBytes[3] == 'a'.code.toByte() &&
-                                bodyBytes[4] == ':'.code.toByte()
+                    val req = Request.Builder()
+                        .url(pieceUrl)
+                        .header("Referer", "$baseUrl/")
+                        .header("Accept", "image/avif,image/webp,image/jpeg,*/*")
+                        .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
+                        .build()
 
-                            finalBytes = if (isBase64Text) {
-                                val base64Data = String(bodyBytes).substringAfter("base64,")
-                                Base64.decode(base64Data, Base64.DEFAULT)
-                            } else {
-                                bodyBytes
-                            }
+                    try {
+                        client.newCall(req).execute().use { resp ->
+                            if (resp.isSuccessful) {
+                                val bodyBytes = resp.body.bytes()
+                                val isBase64Text = bodyBytes.size > 20 &&
+                                    bodyBytes[0] == 'd'.code.toByte() &&
+                                    bodyBytes[1] == 'a'.code.toByte() &&
+                                    bodyBytes[2] == 't'.code.toByte() &&
+                                    bodyBytes[3] == 'a'.code.toByte() &&
+                                    bodyBytes[4] == ':'.code.toByte()
 
-                            // 3. حفظ القطعة في الكاش لاستخدامها في الأجزاء الأخرى المقطوعة
-                            if (finalBytes != null) {
-                                pieceCache.put(basePieceUrl, finalBytes)
+                                finalBytes = if (isBase64Text) {
+                                    val base64Data = String(bodyBytes).substringAfter("base64,")
+                                    Base64.decode(base64Data, Base64.DEFAULT)
+                                } else {
+                                    bodyBytes
+                                }
+
+                                if (finalBytes != null) {
+                                    pieceCache.put(basePieceUrl, finalBytes)
+                                }
                             }
                         }
-                    }
-                } catch (e: Exception) { }
+                    } catch (e: Exception) { }
+                }
             }
 
-            // تحويل البايتات إلى Bitmap لتجهيزها للدمج
             if (finalBytes != null) {
-                bitmaps[targetIdx] = decodeAvif(finalBytes)
+                bitmaps[targetIdx] = decodeAvif(finalBytes!!)
             }
         }
 
@@ -683,7 +676,7 @@ class ProComic : HttpSource() {
             null
         }
     }
-    
+
     private fun decodeAvif(bytes: ByteArray): Bitmap? {
         if (bytes.isEmpty()) return null
         val decoder = ImageDecoder.newInstance(bytes.inputStream())
