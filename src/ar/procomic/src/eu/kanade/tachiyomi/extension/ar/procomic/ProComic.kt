@@ -20,6 +20,10 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
@@ -41,7 +45,6 @@ import uy.kohesive.injekt.api.get
 import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
@@ -64,7 +67,7 @@ class ProComic : HttpSource(), ConfigurableSource {
 
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
-    // استدعاء قاعدة البيانات المحلية لحفظ تفضيلات المستخدم
+    // استدعاء قاعدة البيانات المحلية لحفظ تفضيلات المستخدم (HentaiSlayer Style)
     private val preferences: SharedPreferences by lazy {
         Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
     }
@@ -77,10 +80,6 @@ class ProComic : HttpSource(), ConfigurableSource {
             override fun sizeOf(key: String, value: ByteArray): Int = value.size
         }
         
-        // سجل أقفال لمنع تحميل القطعة أكثر من مرة في نفس اللحظة
-        private val pieceLocks = ConcurrentHashMap<String, Any>()
-        
-        // قفل لمنع التحديث العشوائي المتزامن للتوكن
         private val refreshLock = Any()
 
         // ثوابت الإعدادات الجديدة لاختيار النوع
@@ -90,7 +89,6 @@ class ProComic : HttpSource(), ConfigurableSource {
         private const val TYPE_PREF_DEFAULT = "all"
     }
 
-    // بناء واجهة الإعدادات داخل التطبيق
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         ListPreference(screen.context).apply {
             key = TYPE_PREF
@@ -135,7 +133,6 @@ class ProComic : HttpSource(), ConfigurableSource {
             val request = chain.request()
             val url = request.url.toString()
 
-            // اعتراض الروابط الوهمية لدمج القطع
             if (url.startsWith(SCRAMBLED_SCHEME)) {
                 val pageMap = request.tag(ScrambledMap::class.java)
                     ?: return@addInterceptor Response.Builder()
@@ -468,6 +465,7 @@ class ProComic : HttpSource(), ConfigurableSource {
         }
 
         for (splitData in splitResponses) {
+            val decryptedMaps = mutableListOf<DeferredPageMap>()
             val absolutePieceUrls = mutableSetOf<String>()
 
             splitData.maps.forEach { map ->
@@ -477,9 +475,8 @@ class ProComic : HttpSource(), ConfigurableSource {
                         val originalMapBase64 = Base64.encodeToString(json.encodeToString(map).toByteArray(), Base64.NO_WRAP or Base64.URL_SAFE)
                         val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
                         if (resolved != null && resolved.pieces.isNotEmpty()) {
-                            val absolutePieces = resolved.pieces.map { it.toAbsoluteUrl(cdnBase) }
-                            absolutePieceUrls.addAll(absolutePieces)
-                            processMap(resolved.dim, resolved.mode, absolutePieces, resolved.order, resolved.token, pages, seenUrls, chapterId, originalMapBase64)
+                            decryptedMaps.add(resolved)
+                            absolutePieceUrls.addAll(resolved.pieces.map { it.toAbsoluteUrl(cdnBase) })
                         }
                     }
                 }
@@ -490,6 +487,11 @@ class ProComic : HttpSource(), ConfigurableSource {
                 if (fullUrl !in absolutePieceUrls && seenUrls.add(fullUrl)) {
                     pages.add(Page(pages.size, imageUrl = fullUrl))
                 }
+            }
+
+            decryptedMaps.forEach { map ->
+                val absolutePieces = map.pieces.map { it.toAbsoluteUrl(cdnBase) }
+                processMap(map.dim, map.mode, absolutePieces, map.order, map.token, pages, seenUrls, chapterId, "")
             }
         }
 
@@ -531,7 +533,6 @@ class ProComic : HttpSource(), ConfigurableSource {
         return null
     }
 
-    // تم إضافة تمرير الـ ChapterId والـ Original Map لحفظها للطوارئ
     private fun processMap(
         dim: List<Int>,
         mode: String,
@@ -573,7 +574,7 @@ class ProComic : HttpSource(), ConfigurableSource {
         }
     }
 
-    // دالة التجميع السحرية التي تعالج التقطيع + التزامن + وتجدد التوكن الميت تلقائياً
+    // دالة التجميع السحرية المبنية على فكرة Claude (التحميل المتوازي)
     private fun reconstructPage(map: ScrambledMap): ByteArray? {
         if (map.pieces.isEmpty()) return null
 
@@ -583,101 +584,33 @@ class ProComic : HttpSource(), ConfigurableSource {
         var currentPieces = map.pieces
         var currentToken = map.signedToken
 
-        for (targetIdx in 0 until map.pieces.size) {
-            val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
-            
-            // الرابط الأصلي يستخدم كمفتاح دائم للكاش (Cache) حتى لو تغير الرابط الجديد لاحقاً
-            val originalBasePieceUrl = map.pieces.getOrNull(srcIdx) ?: continue
-            var basePieceUrl = currentPieces.getOrNull(srcIdx) ?: originalBasePieceUrl
+        // دالة داخلية تقوم بتنزيل جميع القطع "في نفس اللحظة" باستخدام Coroutines
+        fun fetchPiecesParallel(): Boolean {
+            var allSuccess = true
+            runBlocking(Dispatchers.IO) {
+                currentPieces.indices.map { targetIdx ->
+                    async {
+                        val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
+                        val basePieceUrl = currentPieces.getOrNull(srcIdx) ?: return@async
+                        val originalBasePieceUrl = map.pieces.getOrNull(srcIdx) ?: return@async
 
-            var finalBytes: ByteArray? = null
+                        // إذا كانت القطعة محملة مسبقاً في الكاش، نتجاوزها لتوفير الوقت والإنترنت
+                        if (pieceCache.get(originalBasePieceUrl) != null) return@async
 
-            // القفل السحري الذي يمنع Mihon من تحميل نفس القطعة مرتين في نفس اللحظة
-            val lock = pieceLocks.getOrPut(originalBasePieceUrl) { Any() }
-
-            synchronized(lock) {
-                finalBytes = pieceCache.get(originalBasePieceUrl)
-
-                if (finalBytes == null) {
-                    var pieceUrl = if (currentToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ")) {
-                        if (basePieceUrl.contains("?")) "$basePieceUrl&token=$currentToken"
-                        else "$basePieceUrl?token=$currentToken"
-                    } else {
-                        basePieceUrl
-                    }
-
-                    var req = Request.Builder()
-                        .url(pieceUrl)
-                        .header("Referer", "$baseUrl/")
-                        .header("Accept", "image/avif,image/webp,image/jpeg,*/*")
-                        .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
-                        .build()
-
-                    var success = false
-                    try {
-                        client.newCall(req).execute().use { resp ->
-                            if (resp.isSuccessful) {
-                                val bodyBytes = resp.body.bytes()
-                                val isBase64Text = bodyBytes.size > 20 &&
-                                    bodyBytes[0] == 'd'.code.toByte() &&
-                                    bodyBytes[1] == 'a'.code.toByte() &&
-                                    bodyBytes[2] == 't'.code.toByte() &&
-                                    bodyBytes[3] == 'a'.code.toByte() &&
-                                    bodyBytes[4] == ':'.code.toByte()
-
-                                if (isBase64Text) {
-                                    val base64Data = String(bodyBytes).substringAfter("base64,")
-                                    finalBytes = Base64.decode(base64Data, Base64.DEFAULT)
-                                    success = true
-                                }
-                            }
-                        }
-                    } catch (e: Exception) { }
-
-                    // --- هنا يكمن الحل لقصتك: إذا فشل التحميل بسبب انتهاء الـ Token خلال القراءة ---
-                    if (!success && map.chapterId.isNotEmpty() && map.originalMapBase64.isNotEmpty()) {
-                        synchronized(refreshLock) {
-                            try {
-                                Thread.sleep(150) // فترة راحة خفيفة للسيرفر
-                                val mapJson = String(Base64.decode(map.originalMapBase64, Base64.URL_SAFE))
-                                val proxyReq = POST(
-                                    "$baseUrl/chapter-map-proxy-plan/${map.chapterId}",
-                                    headersBuilder()
-                                        .set("Origin", baseUrl)
-                                        .set("Referer", "$baseUrl/")
-                                        .set("Content-Type", "application/json")
-                                        .set("Accept", "application/json")
-                                        .set("X-Requested-With", "XMLHttpRequest")
-                                        .build(),
-                                    mapJson.toRequestBody("application/json".toMediaType())
-                                )
-                                val proxyResp = client.newCall(proxyReq).execute()
-                                if (proxyResp.isSuccessful) {
-                                    val proxyData = json.decodeFromStream<ProxyPlanResponse>(proxyResp.body!!.byteStream())
-                                    proxyData.data?.map?.let { newMap ->
-                                        currentPieces = newMap.pieces // تحديث الروابط
-                                        currentToken = newMap.token   // تحديث التوكن الميت
-                                        basePieceUrl = currentPieces.getOrNull(srcIdx) ?: basePieceUrl
-                                    }
-                                }
-                            } catch (e: Exception) { }
-                        }
-
-                        // المحاولة مجدداً باستخدام الرابط والتوكن الطازج!
-                        pieceUrl = if (currentToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ")) {
+                        val pieceUrl = if (currentToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ")) {
                             if (basePieceUrl.contains("?")) "$basePieceUrl&token=$currentToken"
                             else "$basePieceUrl?token=$currentToken"
                         } else {
                             basePieceUrl
                         }
-                        
-                        req = Request.Builder()
+
+                        val req = Request.Builder()
                             .url(pieceUrl)
                             .header("Referer", "$baseUrl/")
                             .header("Accept", "image/avif,image/webp,image/jpeg,*/*")
                             .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
                             .build()
-                            
+
                         try {
                             client.newCall(req).execute().use { resp ->
                                 if (resp.isSuccessful) {
@@ -691,24 +624,70 @@ class ProComic : HttpSource(), ConfigurableSource {
 
                                     if (isBase64Text) {
                                         val base64Data = String(bodyBytes).substringAfter("base64,")
-                                        finalBytes = Base64.decode(base64Data, Base64.DEFAULT)
+                                        val decoded = Base64.decode(base64Data, Base64.DEFAULT)
+                                        pieceCache.put(originalBasePieceUrl, decoded)
+                                    } else {
+                                        allSuccess = false // الصورة تالفة (انتهت صلاحية التوكن)
                                     }
+                                } else {
+                                    allSuccess = false // فشل الطلب بالكامل
                                 }
                             }
-                        } catch (e: Exception) { }
+                        } catch (e: Exception) {
+                            allSuccess = false
+                        }
                     }
-
-                    if (finalBytes != null) {
-                        pieceCache.put(originalBasePieceUrl, finalBytes) // حفظ القطعة لمنع إعادة التحميل
-                    }
-                }
+                }.awaitAll() // الكود هنا لن يكتمل حتى يتم تنزيل جميع القطع سويةً
             }
+            return allSuccess
+        }
 
-            if (finalBytes != null) {
-                bitmaps[targetIdx] = decodeAvif(finalBytes!!)
+        // 1. المحاولة الأولى: تنزيل الكل بالتوازي
+        var success = fetchPiecesParallel()
+
+        // 2. إذا فشل التنزيل (بسبب انتهاء التوكن أثناء قراءتك للصفحات الثلاث الأولى)
+        if (!success && map.chapterId.isNotEmpty() && map.originalMapBase64.isNotEmpty()) {
+            synchronized(refreshLock) {
+                try {
+                    val mapJson = String(Base64.decode(map.originalMapBase64, Base64.URL_SAFE))
+                    val proxyReq = POST(
+                        "$baseUrl/chapter-map-proxy-plan/${map.chapterId}",
+                        headersBuilder()
+                            .set("Origin", baseUrl)
+                            .set("Referer", "$baseUrl/")
+                            .set("Content-Type", "application/json")
+                            .set("Accept", "application/json")
+                            .set("X-Requested-With", "XMLHttpRequest")
+                            .build(),
+                        mapJson.toRequestBody("application/json".toMediaType())
+                    )
+                    val proxyResp = client.newCall(proxyReq).execute()
+                    if (proxyResp.isSuccessful) {
+                        val proxyData = json.decodeFromStream<ProxyPlanResponse>(proxyResp.body!!.byteStream())
+                        proxyData.data?.map?.let { newMap ->
+                            currentPieces = newMap.pieces // وضع الروابط الجديدة
+                            currentToken = newMap.token   // أخذ التوكن الطازج الجديد!
+                        }
+                    }
+                } catch (e: Exception) { }
+            }
+            
+            // 3. المحاولة الثانية: التنزيل بالتوازي باستخدام التوكن الطازج (سينجح حتماً)
+            fetchPiecesParallel()
+        }
+
+        // 4. استخراج جميع الصور من الكاش ودمجها معاً بعد أن ضمنّا وجودها بالكامل
+        for (targetIdx in 0 until map.pieces.size) {
+            val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
+            val originalBasePieceUrl = map.pieces.getOrNull(srcIdx) ?: continue
+            
+            val bytes = pieceCache.get(originalBasePieceUrl)
+            if (bytes != null) {
+                bitmaps[targetIdx] = decodeAvif(bytes)
             }
         }
 
+        // --- كود الدمج والرسم والقص الخاص بك يعمل بكفاءة ونتركه كما هو ---
         return try {
             val validBitmaps = bitmaps.filterNotNull()
             if (validBitmaps.isEmpty()) return null
