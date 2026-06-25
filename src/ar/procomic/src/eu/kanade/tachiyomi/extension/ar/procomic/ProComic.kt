@@ -47,6 +47,11 @@ class ProComic : HttpSource() {
 
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
+    companion object {
+        // قفل التزامن لمنع تداخل طلبات التجديد
+        private val refreshLock = Any()
+    }
+
     private fun String.toAbsoluteUrl(cdnBase: String): String {
         return when {
             this.startsWith("http") -> this
@@ -80,52 +85,60 @@ class ProComic : HttpSource() {
                     bytes[3] == 'a'.code.toByte() &&
                     bytes[4] == ':'.code.toByte()
 
-                // إذا لم يكن النص Base64 (أي أن الرابط انتهت صلاحيته وعاد بصورة الخطأ)
+                // إذا اكتشفنا أن الرابط تالف (الصورة ليست Base64)
                 val fragmentParts = url.fragment?.split("||")
                 if (!isBase64Text && fragmentParts != null && fragmentParts.size == 3) {
-                    val chapterId = fragmentParts[0]
-                    val mapBase64 = fragmentParts[1]
-                    val srcIdx = fragmentParts[2].toIntOrNull() ?: 0
-
-                    val mapJson = String(Base64.decode(mapBase64, Base64.URL_SAFE))
                     
-                    // طلب رابط جديد وتحديث الصلاحية
-                    val proxyReq = POST(
-                        "$baseUrl/chapter-map-proxy-plan/$chapterId",
-                        headersBuilder()
-                            .set("Origin", baseUrl)
-                            .set("Referer", "$baseUrl/")
-                            .set("Content-Type", "application/json")
-                            .set("Accept", "application/json")
-                            .build(),
-                        mapJson.toRequestBody("application/json".toMediaType())
-                    )
+                    // هنا تكمن فكرتك الذكية: وضع الطابور للقطع لكي لا تتداخل الطلبات
+                    synchronized(refreshLock) {
+                        try {
+                            // فترة انتظار بسيطة (150 جزء من الثانية) لتهدئة السيرفر وضمان الترتيب
+                            Thread.sleep(150)
+                            
+                            val chapterId = fragmentParts[0]
+                            val mapBase64 = fragmentParts[1]
+                            val srcIdx = fragmentParts[2].toIntOrNull() ?: 0
 
-                    try {
-                        val proxyResp = chain.proceed(proxyReq)
-                        if (proxyResp.isSuccessful) {
-                            val proxyData = json.decodeFromStream<ProxyPlanResponse>(proxyResp.body!!.byteStream())
-                            val newPieces = proxyData.data?.map?.pieces
-                            if (!newPieces.isNullOrEmpty() && srcIdx < newPieces.size) {
-                                val newPieceUrl = newPieces[srcIdx].let {
-                                    if (it.startsWith("http")) it else "https://${url.host}$it"
-                                }
-                                
-                                // تحميل الرابط الجديد
-                                val newReq = GET(newPieceUrl, request.headers)
-                                val newResp = chain.proceed(newReq)
-                                if (newResp.isSuccessful) {
-                                    bytes = newResp.body?.bytes() ?: bytes
-                                    isBase64Text = bytes.size > 20 &&
-                                        bytes[0] == 'd'.code.toByte() &&
-                                        bytes[1] == 'a'.code.toByte() &&
-                                        bytes[2] == 't'.code.toByte() &&
-                                        bytes[3] == 'a'.code.toByte() &&
-                                        bytes[4] == ':'.code.toByte()
+                            val mapJson = String(Base64.decode(mapBase64, Base64.URL_SAFE))
+                            
+                            val proxyReq = POST(
+                                "$baseUrl/chapter-map-proxy-plan/$chapterId",
+                                headersBuilder()
+                                    .set("Origin", baseUrl)
+                                    .set("Referer", "$baseUrl/")
+                                    .set("Content-Type", "application/json")
+                                    .set("Accept", "application/json")
+                                    .build(),
+                                mapJson.toRequestBody("application/json".toMediaType())
+                            )
+
+                            val proxyResp = chain.proceed(proxyReq)
+                            if (proxyResp.isSuccessful) {
+                                val proxyData = json.decodeFromStream<ProxyPlanResponse>(proxyResp.body!!.byteStream())
+                                val newPieces = proxyData.data?.map?.pieces
+                                if (!newPieces.isNullOrEmpty() && srcIdx < newPieces.size) {
+                                    val newPieceUrl = newPieces[srcIdx].let {
+                                        if (it.startsWith("http")) it else "https://${url.host}$it"
+                                    }
+                                    
+                                    // تحميل القطعة برابطها الجديد والطازج
+                                    val newReq = GET(newPieceUrl, request.headers)
+                                    val newResp = chain.proceed(newReq)
+                                    if (newResp.isSuccessful) {
+                                        bytes = newResp.body?.bytes() ?: bytes
+                                        isBase64Text = bytes.size > 20 &&
+                                            bytes[0] == 'd'.code.toByte() &&
+                                            bytes[1] == 'a'.code.toByte() &&
+                                            bytes[2] == 't'.code.toByte() &&
+                                            bytes[3] == 'a'.code.toByte() &&
+                                            bytes[4] == ':'.code.toByte()
+                                    }
                                 }
                             }
+                        } catch (e: Exception) { 
+                            // تجاهل الأخطاء لكي لا ينهار التطبيق
                         }
-                    } catch (e: Exception) { }
+                    } // نهاية قفل التزامن (يسمح للقطعة التالية بالبدء)
                 }
 
                 if (isBase64Text) {
@@ -490,7 +503,6 @@ class ProComic : HttpSource() {
                 basePieceUrl
             }
 
-            // تضمين البيانات اللازمة للتجديد التلقائي إذا انتهت صلاحية الرابط
             val finalUrl = if (originalMapBase64.isNotEmpty() && pieceUrl.contains("/i/")) {
                 "$pieceUrl#$chapterId||$originalMapBase64||$srcIdx"
             } else {
