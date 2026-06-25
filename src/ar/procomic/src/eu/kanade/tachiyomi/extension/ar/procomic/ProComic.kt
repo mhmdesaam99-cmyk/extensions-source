@@ -547,7 +547,6 @@ data class ChapterMetadataDto(
 )
 
 @Serializable
-@Serializable
 data class RectDto(
     val left: Int = 0,
     val top: Int = 0,
