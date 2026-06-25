@@ -48,7 +48,6 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.math.ceil
 
-// إضافة ConfigurableSource للكلاس
 class ProComic : HttpSource(), ConfigurableSource {
 
     override val name = "ProComic"
@@ -78,7 +77,11 @@ class ProComic : HttpSource(), ConfigurableSource {
             override fun sizeOf(key: String, value: ByteArray): Int = value.size
         }
         
+        // سجل أقفال لمنع تحميل القطعة أكثر من مرة في نفس اللحظة
         private val pieceLocks = ConcurrentHashMap<String, Any>()
+        
+        // قفل لمنع التحديث العشوائي المتزامن للتوكن
+        private val refreshLock = Any()
 
         // ثوابت الإعدادات الجديدة لاختيار النوع
         private const val TYPE_PREF = "TypePref"
@@ -87,7 +90,7 @@ class ProComic : HttpSource(), ConfigurableSource {
         private const val TYPE_PREF_DEFAULT = "all"
     }
 
-    // بناء واجهة الإعدادات داخل التطبيق (إضافة الخيار)
+    // بناء واجهة الإعدادات داخل التطبيق
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         ListPreference(screen.context).apply {
             key = TYPE_PREF
@@ -97,7 +100,6 @@ class ProComic : HttpSource(), ConfigurableSource {
             entryValues = TYPE_PREF_ENTRY_VALUES
             setDefaultValue(TYPE_PREF_DEFAULT)
             
-            // إضافة Toast ينبه المستخدم بتحديث الصفحة عند تغيير الخيار
             setOnPreferenceChangeListener { _, newValue ->
                 val selected = newValue as String
                 val index = findIndexOfValue(selected)
@@ -112,7 +114,6 @@ class ProComic : HttpSource(), ConfigurableSource {
         }.also(screen::addPreference)
     }
 
-    // دالة مساعدة لقراءة النوع المختار
     private fun getSelectedType(): String {
         return preferences.getString(TYPE_PREF, TYPE_PREF_DEFAULT) ?: TYPE_PREF_DEFAULT
     }
@@ -134,6 +135,7 @@ class ProComic : HttpSource(), ConfigurableSource {
             val request = chain.request()
             val url = request.url.toString()
 
+            // اعتراض الروابط الوهمية لدمج القطع
             if (url.startsWith(SCRAMBLED_SCHEME)) {
                 val pageMap = request.tag(ScrambledMap::class.java)
                     ?: return@addInterceptor Response.Builder()
@@ -155,7 +157,6 @@ class ProComic : HttpSource(), ConfigurableSource {
             }
 
             val response = chain.proceed(request)
-
             val isPotentialBase64Image = response.isSuccessful && request.method == "GET" &&
                 url.contains("/i/") && url.contains("procomic")
 
@@ -215,17 +216,15 @@ class ProComic : HttpSource(), ConfigurableSource {
         headers,
     )
 
-    // هنا يتم تصفية البيانات بناءً على النوع المختار من الإعدادات
     override fun popularMangaParse(response: Response): MangasPage {
         val data = response.parseAs<LatestUpdatesResponse>()
         val selectedType = getSelectedType()
         
         val mangas = data.data
-            .filter { it.type != "novel" } // استبعاد الروايات دائماً
-            .filter { selectedType == "all" || it.type.equals(selectedType, ignoreCase = true) } // تصفية حسب الاختيار
+            .filter { it.type != "novel" }
+            .filter { selectedType == "all" || it.type.equals(selectedType, ignoreCase = true) }
             .map { it.toSManga() }
             
-        // نستخدم حجم البيانات الأصلية (data.data) لمعرفة إذا ما كانت هناك صفحات أخرى أم لا
         return MangasPage(mangas, data.data.size >= 30)
     }
 
@@ -397,15 +396,16 @@ class ProComic : HttpSource(), ConfigurableSource {
                     mapTokens.add(map.token)
                 }
                 map.token.isNotBlank() && map.pieces.isEmpty() -> {
+                    val originalMapBase64 = Base64.encodeToString(json.encodeToString(map).toByteArray(), Base64.NO_WRAP or Base64.URL_SAFE)
                     val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
                     if (resolved != null && resolved.pieces.isNotEmpty()) {
                         val absolutePieces = resolved.pieces.map { it.toAbsoluteUrl(cdnBase) }
-                        processMap(resolved.dim, resolved.mode, absolutePieces, resolved.order, resolved.token, pages, seenUrls)
+                        processMap(resolved.dim, resolved.mode, absolutePieces, resolved.order, resolved.token, pages, seenUrls, chapterId, originalMapBase64)
                     }
                 }
                 map.pieces.isNotEmpty() -> {
                     val absolutePieces = map.pieces.map { it.toAbsoluteUrl(cdnBase) }
-                    processMap(map.dim, map.mode, absolutePieces, map.order, map.token, pages, seenUrls)
+                    processMap(map.dim, map.mode, absolutePieces, map.order, map.token, pages, seenUrls, chapterId, "")
                 }
             }
         }
@@ -468,17 +468,18 @@ class ProComic : HttpSource(), ConfigurableSource {
         }
 
         for (splitData in splitResponses) {
-            val decryptedMaps = mutableListOf<DeferredPageMap>()
             val absolutePieceUrls = mutableSetOf<String>()
 
             splitData.maps.forEach { map ->
                 when {
                     map.token.isNotBlank() && map.pieces.isEmpty() && map.token.isJwt() -> { }
                     else -> {
+                        val originalMapBase64 = Base64.encodeToString(json.encodeToString(map).toByteArray(), Base64.NO_WRAP or Base64.URL_SAFE)
                         val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
                         if (resolved != null && resolved.pieces.isNotEmpty()) {
-                            decryptedMaps.add(resolved)
-                            absolutePieceUrls.addAll(resolved.pieces.map { it.toAbsoluteUrl(cdnBase) })
+                            val absolutePieces = resolved.pieces.map { it.toAbsoluteUrl(cdnBase) }
+                            absolutePieceUrls.addAll(absolutePieces)
+                            processMap(resolved.dim, resolved.mode, absolutePieces, resolved.order, resolved.token, pages, seenUrls, chapterId, originalMapBase64)
                         }
                     }
                 }
@@ -489,11 +490,6 @@ class ProComic : HttpSource(), ConfigurableSource {
                 if (fullUrl !in absolutePieceUrls && seenUrls.add(fullUrl)) {
                     pages.add(Page(pages.size, imageUrl = fullUrl))
                 }
-            }
-
-            decryptedMaps.forEach { map ->
-                val absolutePieces = map.pieces.map { it.toAbsoluteUrl(cdnBase) }
-                processMap(map.dim, map.mode, absolutePieces, map.order, map.token, pages, seenUrls)
             }
         }
 
@@ -535,6 +531,7 @@ class ProComic : HttpSource(), ConfigurableSource {
         return null
     }
 
+    // تم إضافة تمرير الـ ChapterId والـ Original Map لحفظها للطوارئ
     private fun processMap(
         dim: List<Int>,
         mode: String,
@@ -543,6 +540,8 @@ class ProComic : HttpSource(), ConfigurableSource {
         signedToken: String,
         pages: MutableList<Page>,
         seenUrls: MutableSet<String>,
+        chapterId: String,
+        originalMapBase64: String
     ) {
         if (pieces.isEmpty() || !seenUrls.add(pieces.first())) return
 
@@ -562,6 +561,8 @@ class ProComic : HttpSource(), ConfigurableSource {
                 signedToken = signedToken,
                 splitPart = p,
                 totalParts = parts,
+                chapterId = chapterId,
+                originalMapBase64 = originalMapBase64
             )
             val encoded = Base64.encodeToString(
                 json.encodeToString(mapData).toByteArray(Charsets.UTF_8),
@@ -572,38 +573,47 @@ class ProComic : HttpSource(), ConfigurableSource {
         }
     }
 
+    // دالة التجميع السحرية التي تعالج التقطيع + التزامن + وتجدد التوكن الميت تلقائياً
     private fun reconstructPage(map: ScrambledMap): ByteArray? {
         if (map.pieces.isEmpty()) return null
 
         val (cols, rows) = parseMode(map.mode, map.pieces.size)
         val bitmaps = arrayOfNulls<Bitmap>(map.pieces.size)
 
+        var currentPieces = map.pieces
+        var currentToken = map.signedToken
+
         for (targetIdx in 0 until map.pieces.size) {
             val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
-            val basePieceUrl = map.pieces.getOrNull(srcIdx) ?: continue
+            
+            // الرابط الأصلي يستخدم كمفتاح دائم للكاش (Cache) حتى لو تغير الرابط الجديد لاحقاً
+            val originalBasePieceUrl = map.pieces.getOrNull(srcIdx) ?: continue
+            var basePieceUrl = currentPieces.getOrNull(srcIdx) ?: originalBasePieceUrl
 
             var finalBytes: ByteArray? = null
 
-            val lock = pieceLocks.getOrPut(basePieceUrl) { Any() }
+            // القفل السحري الذي يمنع Mihon من تحميل نفس القطعة مرتين في نفس اللحظة
+            val lock = pieceLocks.getOrPut(originalBasePieceUrl) { Any() }
 
             synchronized(lock) {
-                finalBytes = pieceCache.get(basePieceUrl)
+                finalBytes = pieceCache.get(originalBasePieceUrl)
 
                 if (finalBytes == null) {
-                    val pieceUrl = if (map.signedToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ")) {
-                        if (basePieceUrl.contains("?")) "$basePieceUrl&token=${map.signedToken}"
-                        else "$basePieceUrl?token=${map.signedToken}"
+                    var pieceUrl = if (currentToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ")) {
+                        if (basePieceUrl.contains("?")) "$basePieceUrl&token=$currentToken"
+                        else "$basePieceUrl?token=$currentToken"
                     } else {
                         basePieceUrl
                     }
 
-                    val req = Request.Builder()
+                    var req = Request.Builder()
                         .url(pieceUrl)
                         .header("Referer", "$baseUrl/")
                         .header("Accept", "image/avif,image/webp,image/jpeg,*/*")
                         .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
                         .build()
 
+                    var success = false
                     try {
                         client.newCall(req).execute().use { resp ->
                             if (resp.isSuccessful) {
@@ -615,19 +625,82 @@ class ProComic : HttpSource(), ConfigurableSource {
                                     bodyBytes[3] == 'a'.code.toByte() &&
                                     bodyBytes[4] == ':'.code.toByte()
 
-                                finalBytes = if (isBase64Text) {
+                                if (isBase64Text) {
                                     val base64Data = String(bodyBytes).substringAfter("base64,")
-                                    Base64.decode(base64Data, Base64.DEFAULT)
-                                } else {
-                                    bodyBytes
-                                }
-
-                                if (finalBytes != null) {
-                                    pieceCache.put(basePieceUrl, finalBytes)
+                                    finalBytes = Base64.decode(base64Data, Base64.DEFAULT)
+                                    success = true
                                 }
                             }
                         }
                     } catch (e: Exception) { }
+
+                    // --- هنا يكمن الحل لقصتك: إذا فشل التحميل بسبب انتهاء الـ Token خلال القراءة ---
+                    if (!success && map.chapterId.isNotEmpty() && map.originalMapBase64.isNotEmpty()) {
+                        synchronized(refreshLock) {
+                            try {
+                                Thread.sleep(150) // فترة راحة خفيفة للسيرفر
+                                val mapJson = String(Base64.decode(map.originalMapBase64, Base64.URL_SAFE))
+                                val proxyReq = POST(
+                                    "$baseUrl/chapter-map-proxy-plan/${map.chapterId}",
+                                    headersBuilder()
+                                        .set("Origin", baseUrl)
+                                        .set("Referer", "$baseUrl/")
+                                        .set("Content-Type", "application/json")
+                                        .set("Accept", "application/json")
+                                        .set("X-Requested-With", "XMLHttpRequest")
+                                        .build(),
+                                    mapJson.toRequestBody("application/json".toMediaType())
+                                )
+                                val proxyResp = client.newCall(proxyReq).execute()
+                                if (proxyResp.isSuccessful) {
+                                    val proxyData = json.decodeFromStream<ProxyPlanResponse>(proxyResp.body!!.byteStream())
+                                    proxyData.data?.map?.let { newMap ->
+                                        currentPieces = newMap.pieces // تحديث الروابط
+                                        currentToken = newMap.token   // تحديث التوكن الميت
+                                        basePieceUrl = currentPieces.getOrNull(srcIdx) ?: basePieceUrl
+                                    }
+                                }
+                            } catch (e: Exception) { }
+                        }
+
+                        // المحاولة مجدداً باستخدام الرابط والتوكن الطازج!
+                        pieceUrl = if (currentToken.isNotBlank() && !basePieceUrl.contains("/i/eyJ")) {
+                            if (basePieceUrl.contains("?")) "$basePieceUrl&token=$currentToken"
+                            else "$basePieceUrl?token=$currentToken"
+                        } else {
+                            basePieceUrl
+                        }
+                        
+                        req = Request.Builder()
+                            .url(pieceUrl)
+                            .header("Referer", "$baseUrl/")
+                            .header("Accept", "image/avif,image/webp,image/jpeg,*/*")
+                            .header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
+                            .build()
+                            
+                        try {
+                            client.newCall(req).execute().use { resp ->
+                                if (resp.isSuccessful) {
+                                    val bodyBytes = resp.body.bytes()
+                                    val isBase64Text = bodyBytes.size > 20 &&
+                                        bodyBytes[0] == 'd'.code.toByte() &&
+                                        bodyBytes[1] == 'a'.code.toByte() &&
+                                        bodyBytes[2] == 't'.code.toByte() &&
+                                        bodyBytes[3] == 'a'.code.toByte() &&
+                                        bodyBytes[4] == ':'.code.toByte()
+
+                                    if (isBase64Text) {
+                                        val base64Data = String(bodyBytes).substringAfter("base64,")
+                                        finalBytes = Base64.decode(base64Data, Base64.DEFAULT)
+                                    }
+                                }
+                            }
+                        } catch (e: Exception) { }
+                    }
+
+                    if (finalBytes != null) {
+                        pieceCache.put(originalBasePieceUrl, finalBytes) // حفظ القطعة لمنع إعادة التحميل
+                    }
                 }
             }
 
@@ -801,6 +874,8 @@ data class ScrambledMap(
     val signedToken: String = "",
     val splitPart: Int? = null,
     val totalParts: Int? = null,
+    val chapterId: String = "",
+    val originalMapBase64: String = ""
 )
 
 @Serializable
