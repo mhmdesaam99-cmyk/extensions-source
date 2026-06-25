@@ -307,19 +307,6 @@ class ProComic : HttpSource() {
 
         val cdnBase = "https://$cdnPath.procomic.pro"
 
-        // فحص تسجيل الدخول: إذا كانت هناك maps مشفرة وفشل الحصول على الـ cookies
-        // نتحقق بطلب بسيط للـ proxy-plan هل الجلسة نشطة
-        val hasEncryptedMaps = mapsList.any { it.token.isNotBlank() && it.pieces.isEmpty() }
-        if (hasEncryptedMaps && pages.isEmpty() && metadataImages.isEmpty()) {
-            // اختبار الجلسة باستخدام أول map مشفرة
-            val testMap = mapsList.first { it.token.isNotBlank() && it.pieces.isEmpty() }
-            val testResult = resolveMapViaProxy(testMap, chapterId, apiHeaders)
-            if (testResult == null) {
-                // فشل تماماً — المستخدم غير مسجل دخوله
-                throw Exception("يجب تسجيل الدخول إلى ProComic لقراءة هذا الفصل.\nافتح إعدادات المصدر وسجّل دخولك عبر WebView.")
-            }
-        }
-
         metadataImages.forEach { imgPath ->
             val fullUrl = imgPath.toAbsoluteUrl(cdnBase)
             if (seenUrls.add(fullUrl)) pages.add(Page(pages.size, imageUrl = fullUrl))
@@ -424,10 +411,10 @@ class ProComic : HttpSource() {
         if (validBitmaps.isEmpty()) return null
 
         val useRects = map.rects.size == map.pieces.size
-        val totalW = map.dim.getOrNull(0)?.takeIf { it > 0 }
-            ?: if (useRects) map.rects.maxOf { it.left + it.width } else validBitmaps.maxOf { it.width }
-        val totalH = map.dim.getOrNull(1)?.takeIf { it > 0 }
-            ?: if (useRects) map.rects.maxOf { it.top + it.height } else validBitmaps.sumOf { it.height }
+        val totalW = map.dim.getOrNull(0)?.takeIf { w -> w > 0 }
+            ?: if (useRects) map.rects.maxOf { r -> r.left + r.width } else validBitmaps.maxOf { b -> b.width }
+        val totalH = map.dim.getOrNull(1)?.takeIf { h -> h > 0 }
+            ?: if (useRects) map.rects.maxOf { r -> r.top + r.height } else validBitmaps.sumOf { b -> b.height }
         if (totalW <= 0 || totalH <= 0) return null
 
         val result = try {
@@ -557,6 +544,15 @@ data class ChapterDto(
 data class ChapterMetadataDto(
     val images: List<String> = emptyList(),
     val maps: List<DeferredPageMap> = emptyList(),
+)
+
+@Serializable
+@Serializable
+data class RectDto(
+    val left: Int = 0,
+    val top: Int = 0,
+    val width: Int = 0,
+    val height: Int = 0,
 )
 
 @Serializable
