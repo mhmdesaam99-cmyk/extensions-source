@@ -151,6 +151,9 @@ class ProComic : HttpSource() {
         }
         .build()
 
+    // الدالة المطلوبة برمجياً من Mihon حتى لو لم نستخدمها
+    override fun imageUrlParse(response: Response): String = ""
+
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
         .add("Origin", baseUrl)
@@ -474,7 +477,6 @@ class ProComic : HttpSource() {
         return null
     }
 
-    // تم تغيير طريقة إرسال البيانات لتصبح ضمن الرابط نفسه لمنع ضياعها في Mihon
     private fun processMap(
         dim: List<Int>,
         mode: String,
@@ -507,7 +509,6 @@ class ProComic : HttpSource() {
                 json.encodeToString(mapData).toByteArray(Charsets.UTF_8),
                 Base64.URL_SAFE or Base64.NO_WRAP,
             )
-            // إضافة البيانات كـ Query Parameter بدلاً من Fragment
             val shortUrl = "$SCRAMBLED_SCHEME${pages.size}_part_$p.jpg?payload=$encoded"
             pages.add(Page(pages.size, url = shortUrl, imageUrl = shortUrl))
         }
@@ -525,7 +526,6 @@ class ProComic : HttpSource() {
 
             var finalBytes: ByteArray? = null
 
-            // القفل السحري الذي سيجبر جميع الأجزاء المتزامنة على الانتظار حتى يتم توفير القطعة في الذاكرة
             synchronized(pieceLock) {
                 finalBytes = pieceCache.get(basePieceUrl)
 
