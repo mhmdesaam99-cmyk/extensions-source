@@ -71,36 +71,37 @@ class ProComic : HttpSource() {
 
             var response = chain.proceed(request)
 
-            val isPotentialBase64Image = response.isSuccessful && request.method == "GET" &&
+            // نتحقق إذا كان الطلب يخص قطعة مشفرة بغض النظر عن نجاحه (لكي نلتقط الـ 403)
+            val isPieceRequest = request.method == "GET" && 
                 url.encodedPath.contains("/i/") && url.host.contains("procomic")
 
-            if (isPotentialBase64Image) {
+            if (isPieceRequest) {
                 var responseBody = response.body
                 var bytes = responseBody?.bytes() ?: ByteArray(0)
 
-                var isBase64Text = bytes.size > 20 &&
+                // هل القطعة سليمة ومشفرة بـ Base64؟
+                var isBase64Text = response.isSuccessful && bytes.size > 20 &&
                     bytes[0] == 'd'.code.toByte() &&
                     bytes[1] == 'a'.code.toByte() &&
                     bytes[2] == 't'.code.toByte() &&
                     bytes[3] == 'a'.code.toByte() &&
                     bytes[4] == ':'.code.toByte()
 
-                // إذا اكتشفنا أن الرابط تالف (الصورة ليست Base64)
+                // إذا اكتشفنا أن الرابط تالف (الصورة ليست Base64 أو الرد 403 Forbidden)
                 val fragmentParts = url.fragment?.split("||")
                 if (!isBase64Text && fragmentParts != null && fragmentParts.size == 3) {
                     
-                    // هنا تكمن فكرتك الذكية: وضع الطابور للقطع لكي لا تتداخل الطلبات
                     synchronized(refreshLock) {
                         try {
-                            // فترة انتظار بسيطة (150 جزء من الثانية) لتهدئة السيرفر وضمان الترتيب
+                            // فترة انتظار بسيطة لتجنب حظر السيرفر للطلبات المتزامنة
                             Thread.sleep(150)
                             
                             val chapterId = fragmentParts[0]
                             val mapBase64 = fragmentParts[1]
                             val srcIdx = fragmentParts[2].toIntOrNull() ?: 0
-
                             val mapJson = String(Base64.decode(mapBase64, Base64.URL_SAFE))
                             
+                            // طلب تجديد الخريطة
                             val proxyReq = POST(
                                 "$baseUrl/chapter-map-proxy-plan/$chapterId",
                                 headersBuilder()
@@ -108,22 +109,34 @@ class ProComic : HttpSource() {
                                     .set("Referer", "$baseUrl/")
                                     .set("Content-Type", "application/json")
                                     .set("Accept", "application/json")
+                                    .set("X-Requested-With", "XMLHttpRequest")
                                     .build(),
                                 mapJson.toRequestBody("application/json".toMediaType())
                             )
 
-                            val proxyResp = chain.proceed(proxyReq)
+                            // استخدام client.newCall أفضل لتجنب أخطاء OkHttp
+                            val proxyResp = client.newCall(proxyReq).execute()
                             if (proxyResp.isSuccessful) {
                                 val proxyData = json.decodeFromStream<ProxyPlanResponse>(proxyResp.body!!.byteStream())
-                                val newPieces = proxyData.data?.map?.pieces
+                                val newMap = proxyData.data?.map
+                                val newPieces = newMap?.pieces
+                                val newToken = newMap?.token ?: "" // التقاط التوكن الجديد
+
                                 if (!newPieces.isNullOrEmpty() && srcIdx < newPieces.size) {
-                                    val newPieceUrl = newPieces[srcIdx].let {
+                                    var newPieceUrl = newPieces[srcIdx].let {
                                         if (it.startsWith("http")) it else "https://${url.host}$it"
                                     }
                                     
-                                    // تحميل القطعة برابطها الجديد والطازج
+                                    // الخطوة السحرية المفقودة: إلصاق التوكن الجديد بالرابط!
+                                    if (newToken.isNotBlank() && !newPieceUrl.contains("/i/eyJ2IjoxLCJpdiI6I")) {
+                                        newPieceUrl = if (newPieceUrl.contains("?")) "$newPieceUrl&token=$newToken"
+                                                      else "$newPieceUrl?token=$newToken"
+                                    }
+
+                                    // تحميل القطعة برابطها الجديد وتوكنها الطازج
                                     val newReq = GET(newPieceUrl, request.headers)
-                                    val newResp = chain.proceed(newReq)
+                                    val newResp = client.newCall(newReq).execute()
+                                    
                                     if (newResp.isSuccessful) {
                                         bytes = newResp.body?.bytes() ?: bytes
                                         isBase64Text = bytes.size > 20 &&
@@ -132,21 +145,25 @@ class ProComic : HttpSource() {
                                             bytes[2] == 't'.code.toByte() &&
                                             bytes[3] == 'a'.code.toByte() &&
                                             bytes[4] == ':'.code.toByte()
+                                        
+                                        response = newResp
+                                        responseBody = newResp.body
                                     }
                                 }
                             }
-                        } catch (e: Exception) { 
-                            // تجاهل الأخطاء لكي لا ينهار التطبيق
-                        }
-                    } // نهاية قفل التزامن (يسمح للقطعة التالية بالبدء)
+                        } catch (e: Exception) { }
+                    } // نهاية الطابور
                 }
 
+                // تجهيز الصورة النهائية للتطبيق
                 if (isBase64Text) {
                     val bodyString = String(bytes)
                     val base64Data = bodyString.substringAfter("base64,")
                     val decodedBytes = Base64.decode(base64Data, Base64.DEFAULT)
                     val mimeType = bodyString.substringAfter("data:").substringBefore(";").toMediaType()
                     return@addInterceptor response.newBuilder()
+                        .code(200) // إجبار الكود على اعتبار الطلب ناجحاً حتى لو كان الأصل 403
+                        .message("OK")
                         .body(decodedBytes.toResponseBody(mimeType))
                         .build()
                 } else {
