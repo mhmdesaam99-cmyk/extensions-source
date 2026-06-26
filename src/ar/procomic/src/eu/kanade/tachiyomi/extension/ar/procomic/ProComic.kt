@@ -21,6 +21,10 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
@@ -84,6 +88,10 @@ class ProComic : HttpSource(), ConfigurableSource {
         private val mapLocks = ConcurrentHashMap<String, Any>()
     }
 
+    // ════════════════════════════════════════════════════════════════════════
+    // Preferences
+    // ════════════════════════════════════════════════════════════════════════
+
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         ListPreference(screen.context).apply {
             key = TYPE_PREF
@@ -111,15 +119,12 @@ class ProComic : HttpSource(), ConfigurableSource {
     private fun getSelectedType(): String =
         preferences.getString(TYPE_PREF, TYPE_PREF_DEFAULT) ?: TYPE_PREF_DEFAULT
 
-    private fun getSessionCookie(): String {
-        val url = baseUrl.toHttpUrl()
-        val cookies = client.cookieJar.loadForRequest(url)
-        return if (cookies.isNotEmpty()) {
-            cookies.joinToString("; ") { "${it.name}=${it.value}" }
-        } else {
-            preferences.getString(COOKIE_PREF, "") ?: ""
-        }
-    }
+    private fun getSessionCookie(): String =
+        preferences.getString(COOKIE_PREF, "") ?: ""
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Clients
+    // ════════════════════════════════════════════════════════════════════════
 
     private val innerClient: OkHttpClient = network.cloudflareClient.newBuilder()
         .connectTimeout(20, TimeUnit.SECONDS)
@@ -174,11 +179,15 @@ class ProComic : HttpSource(), ConfigurableSource {
             response
         }.build()
 
+    // ════════════════════════════════════════════════════════════════════════
+    // Headers
+    // ════════════════════════════════════════════════════════════════════════
+
     override fun headersBuilder() = super.headersBuilder()
-        .set("Referer", "$baseUrl/")
-        .set("Origin", baseUrl)
-        .set("Accept-Language", "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7")
-        .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        .add("Referer", "$baseUrl/")
+        .add("Origin", baseUrl)
+        .add("Accept-Language", "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7")
+        .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
     private fun pieceRequestHeaders(): Headers {
         return headersBuilder()
@@ -191,6 +200,10 @@ class ProComic : HttpSource(), ConfigurableSource {
                 if (cookie.isNotBlank()) set("Cookie", cookie)
             }.build()
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Image Helpers
+    // ════════════════════════════════════════════════════════════════════════
 
     private fun extractBase64Image(bytes: ByteArray): ByteArray? {
         if (bytes.size < 10) return null
@@ -210,6 +223,15 @@ class ProComic : HttpSource(), ConfigurableSource {
     private fun extractMimeType(bytes: ByteArray): String {
         val prefix = String(bytes, 0, minOf(100, bytes.size), Charsets.US_ASCII)
         return prefix.substringAfter("data:", "image/jpeg").substringBefore(";", "image/jpeg").trim().ifBlank { "image/jpeg" }
+    }
+
+    private fun isRawImageBytes(bytes: ByteArray): Boolean {
+        if (bytes.size < 12) return false
+        if (bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte()) return true
+        if (bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte()) return true
+        if (bytes.size > 8 && String(bytes, 4, 4, Charsets.US_ASCII) == "ftyp") return true
+        if (bytes.size > 12 && String(bytes, 0, 4, Charsets.US_ASCII) == "RIFF") return true
+        return false
     }
 
     private fun downloadAndCachePiece(
@@ -239,11 +261,10 @@ class ProComic : HttpSource(), ConfigurableSource {
                     resp.body?.bytes()
                 } ?: continue
 
-                if (rawBytes.size > 10 && String(rawBytes, 0, 10).contains("<html", ignoreCase = true)) {
-                    continue
-                }
+                val imageBytes = extractBase64Image(rawBytes)
+                    ?: if (isRawImageBytes(rawBytes)) rawBytes else null
+                    ?: continue
 
-                val imageBytes = extractBase64Image(rawBytes) ?: rawBytes
                 pieceCache.put(cacheKey, imageBytes)
                 return true
             } catch (_: Exception) {
@@ -252,6 +273,10 @@ class ProComic : HttpSource(), ConfigurableSource {
         }
         return false
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Image Request
+    // ════════════════════════════════════════════════════════════════════════
 
     override fun imageRequest(page: Page): Request {
         val request = super.imageRequest(page)
@@ -267,6 +292,10 @@ class ProComic : HttpSource(), ConfigurableSource {
     }
 
     override fun imageUrlParse(response: Response): String = ""
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Manga Browsing
+    // ════════════════════════════════════════════════════════════════════════
 
     override fun popularMangaRequest(page: Int) =
         GET("$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page", headers)
@@ -288,6 +317,10 @@ class ProComic : HttpSource(), ConfigurableSource {
         GET("$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page" + if (query.isNotBlank()) "&q=$query" else "", headers)
 
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Manga Details
+    // ════════════════════════════════════════════════════════════════════════
 
     override fun mangaDetailsRequest(manga: SManga): Request {
         val p = manga.url.split("/")
@@ -316,6 +349,10 @@ class ProComic : HttpSource(), ConfigurableSource {
         } catch (_: Exception) { SManga.create() }
     }
 
+    // ════════════════════════════════════════════════════════════════════════
+    // Chapters
+    // ════════════════════════════════════════════════════════════════════════
+
     override fun chapterListRequest(manga: SManga): Request {
         val p = manga.url.split("/")
         return GET("$baseUrl/api/public/${p[0]}/${p[1]}/chapters?page=1&limit=600&order=desc", headers)
@@ -336,6 +373,10 @@ class ProComic : HttpSource(), ConfigurableSource {
             }
         }
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Page List
+    // ════════════════════════════════════════════════════════════════════════
 
     override fun pageListParse(response: Response): List<Page> {
         val chapterId = response.request.url.queryParameter("_cid") ?: return emptyList()
@@ -386,14 +427,23 @@ class ProComic : HttpSource(), ConfigurableSource {
         }
 
         val currentData = try { response.parseAs<ChaptersResponse>() } catch (_: Exception) { ChaptersResponse() }
-        if (!extractChapterData(currentData)) {
-            for (pg in 2..10) {
+        val foundInInitial = extractChapterData(currentData)
+        
+        // إصلاح الخلل: إذا لم يُعثر على الفصل، أو تم العثور عليه ولكن مصفوفة الخرائط فارغة للـ مانهوا/مانها (بسبب حماية الـ 3 صفحات المجانية).
+        if (!foundInInitial || (mapsList.isEmpty() && seriesType != "manga")) {
+            mapsList.clear() // تصفير البيانات الناقصة لعدم دمج صفحات تالفة
+            
+            // تبدأ الحلقة البرمجية من الصفحة 1 لتحديث البيانات بالـ Cookie الصحيح
+            for (pg in 1..10) {
                 try {
                     val resp = innerClient.newCall(GET("$baseUrl/api/public/$seriesType/$seriesId/chapters?limit=600&page=$pg&order=desc", apiHeaders)).execute()
                     if (!resp.isSuccessful) break
                     val data = resp.parseAs<ChaptersResponse>()
                     if (data.data.isEmpty()) break
-                    if (extractChapterData(data)) break
+                    if (extractChapterData(data)) {
+                        // التوقف الفوري إذا تم استخراج الخرائط بنجاح أو لو كان العمل مانجا عادية لا تشترط حماية
+                        if (mapsList.isNotEmpty() || seriesType == "manga") break
+                    }
                 } catch (_: Exception) { break }
             }
         }
@@ -439,14 +489,30 @@ class ProComic : HttpSource(), ConfigurableSource {
             .addQueryParameter("order", "desc")
             .addQueryParameter("_cid", chapterId)
             .build()
-        return GET(url, headers.newBuilder().set("Accept", "application/json").build())
+            
+        // إصلاح الخلل: بناء هيدرز الطلب الأولي وتضمين كوكيز الجلسة للتصريح ببيانات الفصل كاملة من البداية
+        val requestHeaders = headers.newBuilder()
+            .set("Accept", "application/json")
+            .apply {
+                val cookie = getSessionCookie()
+                if (cookie.isNotBlank()) {
+                    set("Cookie", cookie)
+                }
+            }
+            .build()
+            
+        return GET(url, requestHeaders)
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Deferred / Proxy
+    // ════════════════════════════════════════════════════════════════════════
 
     private fun String.isJwt(): Boolean = startsWith("eyJhbGci") && count { it == '.' } == 2
 
     private fun jwtSplitValue(jwtToken: String): Int {
         return try {
-            val payload = jwtToken.split(".").getOrNull(1) ?: return 20
+            val payload = jwtToken.split(".").getOrNull(1) ?: return 20 
             val padLen = (4 - payload.length % 4) % 4
             val padded = payload + "=".repeat(padLen)
             json.decodeFromString<JwtPayload>(String(Base64.decode(padded, Base64.URL_SAFE))).split
@@ -472,7 +538,9 @@ class ProComic : HttpSource(), ConfigurableSource {
                 
                 val parsed = resp.parseAs<ChapterDeferredResponse>()
                 if (parsed.success && parsed.data != null) splitResponses.add(parsed.data)
-            } catch (_: Exception) { break }
+            } catch (_: Exception) { 
+                break 
+            }
         }
 
         for (splitData in splitResponses) {
@@ -530,6 +598,10 @@ class ProComic : HttpSource(), ConfigurableSource {
             pages.add(Page(pages.size, url = shortUrl, imageUrl = shortUrl))
         }
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Reconstruct Page
+    // ════════════════════════════════════════════════════════════════════════
 
     private fun reconstructPage(map: ScrambledMap): ByteArray? {
         if (map.pieces.isEmpty()) return null
@@ -595,16 +667,21 @@ class ProComic : HttpSource(), ConfigurableSource {
         token: String,
         cacheKeys: List<String>,
     ): Boolean {
-        var allSuccess = true
-        for (idx in pieces.indices) {
-            val cacheKey = cacheKeys.getOrNull(idx) ?: continue
-            if (pieceCache.get(cacheKey) != null) continue
-            val pieceUrl = pieces.getOrNull(idx) ?: continue
-            val success = downloadAndCachePiece(pieceUrl, token, cacheKey)
-            if (!success) allSuccess = false
+        return runBlocking(Dispatchers.IO) {
+            pieces.indices.map { idx ->
+                async {
+                    val cacheKey = cacheKeys.getOrNull(idx) ?: return@async false
+                    if (pieceCache.get(cacheKey) != null) return@async true
+                    val pieceUrl = pieces.getOrNull(idx) ?: return@async false
+                    downloadAndCachePiece(pieceUrl, token, cacheKey)
+                }
+            }.awaitAll().all { it }
         }
-        return allSuccess
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Bitmap Assembly
+    // ════════════════════════════════════════════════════════════════════════
 
     private fun assembleBitmaps(bitmaps: Array<Bitmap?>, map: ScrambledMap, cols: Int, rows: Int): ByteArray? {
         return try {
@@ -671,6 +748,10 @@ class ProComic : HttpSource(), ConfigurableSource {
         } catch (_: Exception) { null }
     }
 
+    // ════════════════════════════════════════════════════════════════════════
+    // Crypto & Decode
+    // ════════════════════════════════════════════════════════════════════════
+
     private fun decryptMap(tokenStr: String, sessionKeyBase64: String): DeferredPageMap? {
         return try {
             val tokenData = json.decodeFromString<EncryptedToken>(String(Base64.decode(tokenStr, Base64.URL_SAFE or Base64.DEFAULT)))
@@ -711,6 +792,10 @@ class ProComic : HttpSource(), ConfigurableSource {
 
     private inline fun <reified T> Response.parseAs(): T = json.decodeFromStream(body.byteStream())
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Constants & Data Classes
+// ════════════════════════════════════════════════════════════════════════════
 
 @Serializable data class JwtPayload(val split: Int = 20, val cid: Int = 0, val p: String = "")
 @Serializable data class SessionKeyResponse(val success: Boolean = false, val data: SessionKeyData? = null)
