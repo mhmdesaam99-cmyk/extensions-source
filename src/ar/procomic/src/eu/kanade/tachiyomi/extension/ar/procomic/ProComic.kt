@@ -78,8 +78,8 @@ class ProComic : HttpSource(), ConfigurableSource {
         private const val MAX_SAFE_HEIGHT = 6000
         private const val TYPE_PREF = "TypePref"
         private const val COOKIE_PREF = "SessionCookie"
-        private val TYPE_PREF_ENTRIES = arrayOf("الكل", "مانجا", "مانهوا", "مانهوا صينية (Manhua)", "كوميكس")
-        private val TYPE_PREF_ENTRY_VALUES = arrayOf("all", "manga", "manhwa", "manhua", "comic")
+        private val TYPE_PREF_ENTRIES = arrayOf("الكل", "مانجا", "مانهوا", "مانهوا صينية (Manhua)")
+        private val TYPE_PREF_ENTRY_VALUES = arrayOf("all", "manga", "manhwa", "manhua")
         private const val TYPE_PREF_DEFAULT = "all"
 
         private val pieceCache = object : LruCache<String, ByteArray>(50 * 1024 * 1024) {
@@ -119,8 +119,15 @@ class ProComic : HttpSource(), ConfigurableSource {
     private fun getSelectedType(): String =
         preferences.getString(TYPE_PREF, TYPE_PREF_DEFAULT) ?: TYPE_PREF_DEFAULT
 
-    private fun getSessionCookie(): String =
-        preferences.getString(COOKIE_PREF, "") ?: ""
+        private fun getSessionCookie(): String {
+        val url = baseUrl.toHttpUrl()
+        val cookies = client.cookieJar.loadForRequest(url)
+        return if (cookies.isNotEmpty()) {
+            cookies.joinToString("; ") { "${it.name}=${it.value}" }
+        } else {
+            preferences.getString(COOKIE_PREF, "") ?: ""
+        }
+    }
 
     // ════════════════════════════════════════════════════════════════════════
     // Clients
