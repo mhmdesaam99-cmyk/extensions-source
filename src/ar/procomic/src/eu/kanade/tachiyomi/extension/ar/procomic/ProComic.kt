@@ -30,19 +30,28 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.decodeFromStream
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
-import java.io.ByteArrayOutputStream
-import java.io.IOException
+import tachiyomi.decoder.ImageDecoder
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import java.io.ByteArrayOutputStream
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
+import kotlin.math.ceil
 
 class ProComic : HttpSource(), ConfigurableSource {
 
@@ -51,308 +60,760 @@ class ProComic : HttpSource(), ConfigurableSource {
     override val lang = "ar"
     override val supportsLatest = true
 
-    private val json: Json = Injekt.get()
+    private val json = Json {
+        ignoreUnknownKeys = true
+        isLenient = true
+        explicitNulls = false
+        encodeDefaults = true
+    }
+
+    private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
     private val preferences: SharedPreferences by lazy {
-        Injekt.get<Application>().getSharedPreferences("source_$id", Application.MODE_PRIVATE)
+        Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
     }
 
-    // الحفاظ على عميل الشبكة المزدوج مع دمج معترض الصور اللحظي لمنع تلف الروابط
-    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
-        .rateLimit(2)
-        .addInterceptor(::lazyImageInterceptor)
+    companion object {
+        private const val SCRAMBLED_SCHEME = "https://procomic.pro/__scrambled_asset__/"
+        private const val MAX_SAFE_HEIGHT = 6000
+        private const val TYPE_PREF = "TypePref"
+        private const val COOKIE_PREF = "SessionCookie"
+        private val TYPE_PREF_ENTRIES = arrayOf("الكل", "مانجا", "مانهوا", "مانهوا صينية (Manhua)", "كوميكس")
+        private val TYPE_PREF_ENTRY_VALUES = arrayOf("all", "manga", "manhwa", "manhua", "comic")
+        private const val TYPE_PREF_DEFAULT = "all"
+
+        private val pieceCache = object : LruCache<String, ByteArray>(50 * 1024 * 1024) {
+            override fun sizeOf(key: String, value: ByteArray): Int = value.size
+        }
+        private val mapLocks = ConcurrentHashMap<String, Any>()
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Preferences
+    // ════════════════════════════════════════════════════════════════════════
+
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        ListPreference(screen.context).apply {
+            key = TYPE_PREF
+            title = "تصفية نوع السلاسل"
+            summary = "حدد النوع الذي تريد عرضه في أقسام التطبيق (الأحدث/الشائع)"
+            entries = TYPE_PREF_ENTRIES
+            entryValues = TYPE_PREF_ENTRY_VALUES
+            setDefaultValue(TYPE_PREF_DEFAULT)
+            setOnPreferenceChangeListener { _, newValue ->
+                val index = findIndexOfValue(newValue as String)
+                Toast.makeText(screen.context, "قم بتحديث الصفحة لتطبيق عرض: ${entries[index]}", Toast.LENGTH_LONG).show()
+                true
+            }
+        }.also(screen::addPreference)
+
+        EditTextPreference(screen.context).apply {
+            key = COOKIE_PREF
+            title = "🍪 Cookie الجلسة (مطلوب للمانهوا)"
+            summary = "١. افتح procomic.pro في المتصفح وسجّل دخول\n٢. افتح فصل مانهوا → F12 → Network\n٣. اضغط على أي طلب صورة → انسخ قيمة cookie\n٤. الصقها هنا"
+            dialogTitle = "قيمة الـ Cookie كاملةً"
+            setDefaultValue("")
+        }.also(screen::addPreference)
+    }
+
+    private fun getSelectedType(): String =
+        preferences.getString(TYPE_PREF, TYPE_PREF_DEFAULT) ?: TYPE_PREF_DEFAULT
+
+    private fun getSessionCookie(): String =
+        preferences.getString(COOKIE_PREF, "") ?: ""
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Clients
+    // ════════════════════════════════════════════════════════════════════════
+
+    private val innerClient: OkHttpClient = network.cloudflareClient.newBuilder()
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .dispatcher(okhttp3.Dispatcher().apply {
+            maxRequests = 100
+            maxRequestsPerHost = 40
+        })
         .build()
 
-    override fun headersBuilder(): Headers.Builder = Headers.Builder()
-        .add("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+    override val client: OkHttpClient = innerClient.newBuilder()
+        .rateLimit(2)
+        .addInterceptor { chain ->
+            val request = chain.request()
+            val url = request.url.toString()
+
+            if (url.startsWith(SCRAMBLED_SCHEME)) {
+                val pageMap = request.tag(ScrambledMap::class.java)
+                    ?: return@addInterceptor Response.Builder()
+                        .request(request).protocol(Protocol.HTTP_1_1)
+                        .code(400).message("Missing Map Metadata")
+                        .body("".toResponseBody(null)).build()
+
+                val mergedBytes = reconstructPage(pageMap)
+                    ?: return@addInterceptor Response.Builder()
+                        .request(request).protocol(Protocol.HTTP_1_1)
+                        .code(500).message("Merge Failure")
+                        .body("".toResponseBody(null)).build()
+
+                return@addInterceptor Response.Builder()
+                    .request(request).protocol(Protocol.HTTP_1_1)
+                    .code(200).message("OK")
+                    .body(mergedBytes.toResponseBody("image/jpeg".toMediaType()))
+                    .build()
+            }
+
+            val response = chain.proceed(request)
+            if (response.isSuccessful && request.method == "GET" && url.contains("procomic")) {
+                val body = response.body ?: return@addInterceptor response
+                val bytes = body.bytes()
+                val decoded = extractBase64Image(bytes)
+                if (decoded != null) {
+                    val mime = extractMimeType(bytes)
+                    return@addInterceptor response.newBuilder()
+                        .body(decoded.toResponseBody(mime.toMediaType()))
+                        .build()
+                }
+                return@addInterceptor response.newBuilder()
+                    .body(bytes.toResponseBody(body.contentType()))
+                    .build()
+            }
+            response
+        }.build()
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Headers
+    // ════════════════════════════════════════════════════════════════════════
+
+    override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
         .add("Origin", baseUrl)
-        .apply {
-            val session = getSessionCookie()
-            if (session.isNotEmpty()) {
-                add("Cookie", "procomic_session=$session")
-            }
-        }
+        .add("Accept-Language", "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7")
+        .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
-    private fun pieceRequestHeaders(): Headers = Headers.Builder()
-        .add("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
-        .add("Referer", "$baseUrl/")
-        .add("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
-        .add("Sec-Fetch-Dest", "image")
-        .add("Sec-Fetch-Mode", "no-cors")
-        .add("Sec-Fetch-Site", "same-site")
-        .build()
-
-    // --- الحفاظ على جميع دوال جلب القوائم والبحث والتفاصيل الأصلية بدقة ---
-    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/api/manga?page=$page&sort=views", headers)
-    override fun popularMangaParse(response: Response): MangasPage = parseMangaList(response)
-
-    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/api/manga?page=$page&sort=latest", headers)
-    override fun latestUpdatesParse(response: Response): MangasPage = parseMangaList(response)
-
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val url = "$baseUrl/api/manga?page=$page&search=$query"
-        return GET(url, headers)
+    private fun pieceRequestHeaders(): Headers {
+        return headersBuilder()
+            .set("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+            .set("Sec-Fetch-Dest", "image")
+            .set("Sec-Fetch-Mode", "no-cors")
+            .set("Sec-Fetch-Site", "same-site")
+            .apply {
+                val cookie = getSessionCookie()
+                if (cookie.isNotBlank()) set("Cookie", cookie)
+            }.build()
     }
-    override fun searchMangaParse(response: Response): MangasPage = parseMangaList(response)
 
-    private fun parseMangaList(response: Response): MangasPage {
-        val res = json.decodeFromString<MangaListResponse>(response.body.string())
-        val mangas = res.data.map { dto ->
-            SManga.create().apply {
-                url = "/manga/${dto.id}"
-                title = dto.title ?: "عنوان غير معروف"
-                thumbnail_url = dto.coverImageApp?.url ?: dto.coverImage
+    // ════════════════════════════════════════════════════════════════════════
+    // Image Helpers
+    // ════════════════════════════════════════════════════════════════════════
+
+    private fun extractBase64Image(bytes: ByteArray): ByteArray? {
+        if (bytes.size < 10) return null
+        val prefixLen = minOf(150, bytes.size)
+        val prefix = String(bytes, 0, prefixLen, Charsets.US_ASCII)
+        val marker = prefix.indexOf("base64,")
+        if (marker == -1) return null
+        val start = marker + 7
+        var end = bytes.size
+        while (end > start) {
+            val c = bytes[end - 1].toInt().toChar()
+            if (c == '"' || c == '\'' || c == '\n' || c == '\r' || c == ' ') end-- else break
+        }
+        return try { Base64.decode(bytes, start, end - start, Base64.DEFAULT) } catch (_: Exception) { null }
+    }
+
+    private fun extractMimeType(bytes: ByteArray): String {
+        val prefix = String(bytes, 0, minOf(100, bytes.size), Charsets.US_ASCII)
+        return prefix.substringAfter("data:", "image/jpeg").substringBefore(";", "image/jpeg").trim().ifBlank { "image/jpeg" }
+    }
+
+    private fun isRawImageBytes(bytes: ByteArray): Boolean {
+        if (bytes.size < 12) return false
+        if (bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte()) return true
+        if (bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte()) return true
+        if (bytes.size > 8 && String(bytes, 4, 4, Charsets.US_ASCII) == "ftyp") return true
+        if (bytes.size > 12 && String(bytes, 0, 4, Charsets.US_ASCII) == "RIFF") return true
+        return false
+    }
+
+    private fun downloadAndCachePiece(
+        pieceUrl: String,
+        token: String,
+        cacheKey: String,
+    ): Boolean {
+        val urlsToTry = buildList {
+            if (token.isNotBlank() && !pieceUrl.contains("/i/eyJ")) {
+                add(if (pieceUrl.contains("?")) "$pieceUrl&token=$token" else "$pieceUrl?token=$token")
+            }
+            add(pieceUrl)
+            if (!pieceUrl.contains("/i/") && pieceUrl.contains(".procomic.pro/")) {
+                add(pieceUrl.replace(".procomic.pro/", ".procomic.pro/i/"))
             }
         }
-        return MangasPage(mangas, res.total > mangas.size)
+
+        for (url in urlsToTry) {
+            try {
+                val req = Request.Builder()
+                    .url(url)
+                    .headers(pieceRequestHeaders())
+                    .build()
+
+                val rawBytes = innerClient.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use null
+                    resp.body?.bytes()
+                } ?: continue
+
+                val imageBytes = extractBase64Image(rawBytes)
+                    ?: if (isRawImageBytes(rawBytes)) rawBytes else null
+                    ?: continue
+
+                pieceCache.put(cacheKey, imageBytes)
+                return true
+            } catch (_: Exception) {
+                continue
+            }
+        }
+        return false
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Image Request
+    // ════════════════════════════════════════════════════════════════════════
+
+    override fun imageRequest(page: Page): Request {
+        val request = super.imageRequest(page)
+        val fragment = page.url.substringAfter("#", "")
+        if (fragment.isNotBlank()) {
+            try {
+                val mapJson = String(Base64.decode(fragment, Base64.URL_SAFE or Base64.NO_WRAP))
+                val pageMap = json.decodeFromString<ScrambledMap>(mapJson)
+                return request.newBuilder().tag(ScrambledMap::class.java, pageMap).build()
+            } catch (_: Exception) {}
+        }
+        return request
+    }
+
+    override fun imageUrlParse(response: Response): String = ""
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Manga Browsing
+    // ════════════════════════════════════════════════════════════════════════
+
+    override fun popularMangaRequest(page: Int) =
+        GET("$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page", headers)
+
+    override fun popularMangaParse(response: Response): MangasPage {
+        val data = response.parseAs<LatestUpdatesResponse>()
+        val selectedType = getSelectedType()
+        val mangas = data.data
+            .filter { it.type != "novel" }
+            .filter { selectedType == "all" || it.type.equals(selectedType, ignoreCase = true) }
+            .map { it.toSManga() }
+        return MangasPage(mangas, data.data.size >= 30)
+    }
+
+    override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
+    override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
+
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList) =
+        GET("$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page" + if (query.isNotBlank()) "&q=$query" else "", headers)
+
+    override fun searchMangaParse(response: Response) = popularMangaParse(response)
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Manga Details
+    // ════════════════════════════════════════════════════════════════════════
+
+    override fun mangaDetailsRequest(manga: SManga): Request {
+        val p = manga.url.split("/")
+        return GET("$baseUrl/api/public/${p[0]}/${p[1]}", headers)
     }
 
     override fun mangaDetailsParse(response: Response): SManga {
-        val dto = json.decodeFromString<MangaDetailResponse>(response.body.string()).data
-        return SManga.create().apply {
-            title = dto.title ?: ""
-            author = dto.author
-            artist = dto.artist
-            description = dto.synopsis ?: dto.description
-            status = when (dto.status) {
-                "ongoing" -> SManga.ONGOING
-                "completed" -> SManga.COMPLETED
-                else -> SManga.UNKNOWN
+        return try {
+            val data = response.parseAs<SeriesDetailResponse>()
+            val parts = response.request.url.pathSegments
+            val idx = parts.indexOf("public")
+            SManga.create().apply {
+                url = "${parts.getOrElse(idx + 1) { "manga" }}/${parts.getOrElse(idx + 2) { "0" }}/${data.slug ?: ""}"
+                title = data.title ?: ""
+                thumbnail_url = data.coverImageApp?.card?.mobile ?: data.coverImageApp?.desktop ?: data.coverImage
+                author = data.author
+                artist = data.artist
+                description = data.synopsis ?: data.description
+                status = when (data.status?.lowercase()) {
+                    "ongoing", "مستمر" -> SManga.ONGOING
+                    "completed", "مكتمل" -> SManga.COMPLETED
+                    "hiatus" -> SManga.ON_HIATUS
+                    else -> SManga.UNKNOWN
+                }
             }
-            thumbnail_url = dto.coverImageApp?.url ?: dto.coverImage
-        }
+        } catch (_: Exception) { SManga.create() }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Chapters
+    // ════════════════════════════════════════════════════════════════════════
+
+    override fun chapterListRequest(manga: SManga): Request {
+        val p = manga.url.split("/")
+        return GET("$baseUrl/api/public/${p[0]}/${p[1]}/chapters?page=1&limit=600&order=desc", headers)
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val res = json.decodeFromString<ChaptersResponse>(response.body.string())
-        return res.data.map { dto ->
+        val parts = response.request.url.pathSegments
+        val idx = parts.indexOf("public")
+        val seriesType = parts.getOrElse(idx + 1) { "manga" }
+        val seriesId = parts.getOrElse(idx + 2) { "0" }
+        return response.parseAs<ChaptersResponse>().data.map { ch ->
             SChapter.create().apply {
-                url = "/chapter/${dto.id}"
-                name = "الفصل ${dto.chapterNumber}" + (if (dto.title.isNullOrEmpty()) "" else " - ${dto.title}")
-                date_upload = 0L // يمكن تحسين الطابع الزمني لاحقاً إذا لزم الأمر
+                url = "$seriesType/$seriesId/${ch.id}/${ch.chapterNumber}"
+                name = "الفصل ${ch.chapterNumber}" + if (!ch.title.isNullOrBlank()) " - ${ch.title}" else ""
+                date_upload = runCatching { dateFormat.parse(ch.publishedAt ?: "")?.time }.getOrNull() ?: 0L
+                chapter_number = ch.chapterNumber.toFloatOrNull() ?: 0f
+                scanlator = if (ch.lockedByCoins == true) "🔒 مدفوع" else null
             }
         }
     }
 
-    // --- دالة الفصول المعدلة برمجياً لمنع تلف الروابط (Lazy Architecture) ---
-    override fun pageListParse(response: Response): List<Page> {
-        val chapterId = response.request.url.pathSegments.lastOrNull() ?: throw IOException("تعذر تحديد معرف الفصل")
-        val responseBody = response.body.string()
+    // ════════════════════════════════════════════════════════════════════════
+    // Page List
+    // ════════════════════════════════════════════════════════════════════════
 
-        val jwtToken = extractJwtToken(responseBody) ?: throw IOException("لم يتم العثور على توكن الحماية الأساسي")
-        val totalSplits = jwtSplitValue(jwtToken)
+    override fun pageListParse(response: Response): List<Page> {
+        val chapterId = response.request.url.queryParameter("_cid") ?: return emptyList()
+        val pathParts = response.request.url.pathSegments
+        val pubIdx = pathParts.indexOf("public")
+        val seriesType = pathParts.getOrElse(pubIdx + 1) { "manga" }
+        val seriesId = pathParts.getOrElse(pubIdx + 2) { "0" }
+        
+        val apiHeaders = headers.newBuilder()
+            .set("Accept", "application/json")
+            .apply {
+                val cookie = getSessionCookie()
+                if (cookie.isNotBlank()) {
+                    set("Cookie", cookie)
+                }
+            }
+            .build()
 
         val pages = mutableListOf<Page>()
-        var overallPageIndex = 0
+        val seenUrls = mutableSetOf<String>()
+        var cdnPath = "cdn1"
+        var metadataImages = emptyList<String>()
+        val mapsList = mutableListOf<DeferredPageMap>()
+        var cachedSessionKey: String? = null
+        var sessionKeyAttempted = false
 
-        // نقوم بالمرور السريع على الـ Splits لحساب عدد الصفحات فقط دون تحميل بايتات الصور لحمايتها من التلف المبكر
-        for (splitIndex in 0 until totalSplits) {
-            val splitUrl = "$baseUrl/chapter-deferred-media/$chapterId?token=$jwtToken&split=$splitIndex"
-            val splitResponse = client.newCall(GET(splitUrl, headers)).execute()
-            if (!splitResponse.isSuccessful) continue
+        val getSessionKey: () -> String? = {
+            if (!sessionKeyAttempted) {
+                sessionKeyAttempted = true
+                try {
+                    val req = innerClient.newCall(GET("$baseUrl/chapter-map-session-key/$chapterId?legacy=1", apiHeaders)).execute()
+                    if (req.isSuccessful) cachedSessionKey = req.parseAs<SessionKeyResponse>().data?.key
+                } catch (_: Exception) {}
+            }
+            cachedSessionKey
+        }
 
-            val splitData = json.decodeFromString<ChapterDeferredResponse>(splitResponse.body.string()).data ?: continue
+        fun extractChapterData(data: ChaptersResponse): Boolean {
+            for (ch in data.data) {
+                if (ch.id.toString() == chapterId) {
+                    cdnPath = ch.cdnPath ?: "cdn1"
+                    metadataImages = ch.metadata?.images ?: emptyList()
+                    ch.metadata?.maps?.let { mapsList.addAll(it) }
+                    return true
+                }
+            }
+            return false
+        }
 
-            for (indexInSplit in splitData.maps.indices) {
-                // ننشئ رابط داخلي وهمي مشفر يحمل البارامترات المطلوبة للبناء اللحظي عند التمرير
-                val lazyUrl = "https://procomic.pro/lazy-page"
-                    .toHttpUrl().newBuilder()
-                    .addQueryParameter("chapterId", chapterId)
-                    .addQueryParameter("splitIndex", splitIndex.toString())
-                    .addQueryParameter("indexInSplit", indexInSplit.toString())
-                    .addQueryParameter("jwt", jwtToken)
-                    .build().toString()
+        val currentData = try { response.parseAs<ChaptersResponse>() } catch (_: Exception) { ChaptersResponse() }
+        val foundInInitial = extractChapterData(currentData)
 
-                pages.add(Page(overallPageIndex, "", lazyUrl))
-                overallPageIndex++
+        // الإصلاح المدمج: كشف فخ الـ 3 صفحات للمانهوا وتكرار الطلب بالكوكيز من الصفحة الأولى
+        if (!foundInInitial || (mapsList.isEmpty() && seriesType != "manga")) {
+            metadataImages = emptyList()
+            mapsList.clear()
+            
+            // حلقة الدوران تبدأ من 1 بدلاً من 2 لتغطية الصفحة الأولى بالـ Cookie الصحيح
+            for (pg in 1..10) {
+                try {
+                    val resp = innerClient.newCall(GET("$baseUrl/api/public/$seriesType/$seriesId/chapters?limit=600&page=$pg&order=desc", apiHeaders)).execute()
+                    if (!resp.isSuccessful) break
+                    val data = resp.parseAs<ChaptersResponse>()
+                    if (data.data.isEmpty()) break
+                    
+                    cdnPath = "cdn1"
+                    metadataImages = emptyList()
+                    mapsList.clear()
+                    
+                    if (extractChapterData(data)) {
+                        if (mapsList.isNotEmpty() || seriesType == "manga") break
+                    }
+                } catch (_: Exception) { break }
+            }
+        }
+
+        val cdnBase = "https://$cdnPath.procomic.pro"
+        val jwtTokens = mutableListOf<String>()
+
+        metadataImages.forEach { imgPath ->
+            val fullUrl = imgPath.toAbsoluteUrl(cdnBase)
+            if (seenUrls.add(fullUrl)) pages.add(Page(pages.size, imageUrl = fullUrl))
+        }
+
+        mapsList.forEach { map ->
+            when {
+                map.token.isNotBlank() && map.pieces.isEmpty() && map.token.isJwt() ->
+                    jwtTokens.add(map.token)
+                map.token.isNotBlank() && map.pieces.isEmpty() -> {
+                    val originalMapBase64 = Base64.encodeToString(json.encodeToString(map).toByteArray(), Base64.NO_WRAP or Base64.URL_SAFE)
+                    val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
+                    if (resolved != null && resolved.pieces.isNotEmpty()) {
+                        processMap(resolved.dim, resolved.mode, resolved.pieces.map { it.toAbsoluteUrl(cdnBase) }, resolved.order, resolved.token, pages, seenUrls, chapterId, originalMapBase64)
+                    }
+                }
+                map.pieces.isNotEmpty() ->
+                    processMap(map.dim, map.mode, map.pieces.map { it.toAbsoluteUrl(cdnBase) }, map.order, map.token, pages, seenUrls, chapterId, "")
+            }
+        }
+
+        for (jwtToken in jwtTokens) {
+            try { pages.addAll(fetchDeferredPages(chapterId, jwtToken, apiHeaders, seenUrls, cdnBase, getSessionKey)) } catch (_: Exception) {}
+        }
+        return pages
+    }
+
+    // الإصلاح المدمج: حقن الكوكيز منذ الطلب الأول لدالة pageListRequest
+    override fun pageListRequest(chapter: SChapter): Request {
+        val parts = chapter.url.split("/")
+        val seriesType = parts.getOrElse(0) { "manga" }
+        val seriesId = parts.getOrElse(1) { "0" }
+        val chapterId = parts.getOrElse(2) { "0" }
+        val url = "$baseUrl/api/public/$seriesType/$seriesId/chapters".toHttpUrl().newBuilder()
+            .addQueryParameter("page", "1")
+            .addQueryParameter("limit", "500")
+            .addQueryParameter("order", "desc")
+            .addQueryParameter("_cid", chapterId)
+            .build()
+            
+        val requestHeaders = headers.newBuilder()
+            .set("Accept", "application/json")
+            .apply {
+                val cookie = getSessionCookie()
+                if (cookie.isNotBlank()) {
+                    set("Cookie", cookie)
+                }
+            }
+            .build()
+            
+        return GET(url, requestHeaders)
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Deferred / Proxy
+    // ════════════════════════════════════════════════════════════════════════
+
+    private fun String.isJwt(): Boolean = startsWith("eyJhbGci") && count { it == '.' } == 2
+
+    private fun jwtSplitValue(jwtToken: String): Int {
+        return try {
+            val payload = jwtToken.split(".").getOrNull(1) ?: return 20 
+            val padLen = (4 - payload.length % 4) % 4
+            val padded = payload + "=".repeat(padLen)
+            json.decodeFromString<JwtPayload>(String(Base64.decode(padded, Base64.URL_SAFE))).split
+        } catch (_: Exception) { 20 }
+    }
+
+    private fun fetchDeferredPages(
+        chapterId: String,
+        jwtToken: String,
+        apiHeaders: Headers,
+        seenUrls: MutableSet<String>,
+        cdnBase: String,
+        getSessionKey: () -> String?,
+    ): List<Page> {
+        val pages = mutableListOf<Page>()
+        val splitResponses = mutableListOf<ChapterDeferredData>()
+
+        val maxSplit = jwtSplitValue(jwtToken)
+        for (s in 0..maxSplit) {
+            try {
+                val resp = innerClient.newCall(GET("$baseUrl/chapter-deferred-media/$chapterId?token=$jwtToken&split=$s", apiHeaders)).execute()
+                if (!resp.isSuccessful) break 
+                
+                val parsed = resp.parseAs<ChapterDeferredResponse>()
+                if (parsed.success && parsed.data != null) splitResponses.add(parsed.data)
+            } catch (_: Exception) { 
+                break 
+            }
+        }
+
+        for (splitData in splitResponses) {
+            val absolutePieceUrls = mutableSetOf<String>()
+            splitData.maps.forEach { map ->
+                if (map.token.isNotBlank() && map.pieces.isEmpty() && map.token.isJwt()) return@forEach
+                val originalMapBase64 = Base64.encodeToString(json.encodeToString(map).toByteArray(), Base64.NO_WRAP or Base64.URL_SAFE)
+                val resolved = resolveMap(map, chapterId, apiHeaders, getSessionKey)
+                if (resolved != null && resolved.pieces.isNotEmpty()) {
+                    val absPieces = resolved.pieces.map { it.toAbsoluteUrl(cdnBase) }
+                    absolutePieceUrls.addAll(absPieces)
+                    processMap(resolved.dim, resolved.mode, absPieces, resolved.order, resolved.token, pages, seenUrls, chapterId, originalMapBase64)
+                }
+            }
+            splitData.images.forEach { url ->
+                val fullUrl = url.toAbsoluteUrl(cdnBase)
+                if (fullUrl !in absolutePieceUrls && seenUrls.add(fullUrl)) pages.add(Page(pages.size, imageUrl = fullUrl))
             }
         }
         return pages
     }
 
-    // المعترض الاحترافي المسؤول عن التقاط طلب الصفحة الحالية وتوليد روابط وقطع "طازجة" فوراً
-    private fun lazyImageInterceptor(chain: Interceptor.Chain): Response {
-        val request = chain.request()
-        val url = request.url
+    private fun resolveMap(map: DeferredPageMap, chapterId: String, apiHeaders: Headers, getSessionKey: () -> String?): DeferredPageMap? {
+        if (map.pieces.isNotEmpty()) return map
+        if (map.token.isBlank()) return null
 
-        if (url.host == "procomic.pro" && url.encodedPath == "/lazy-page") {
-            val chapterId = url.queryParameter("chapterId") ?: throw IOException("Missing chapterId")
-            val splitIndex = url.queryParameter("splitIndex") ?: throw IOException("Missing splitIndex")
-            val indexInSplit = url.queryParameter("indexInSplit")?.toIntOrNull() ?: throw IOException("Missing indexInSplit")
-            val jwtToken = url.queryParameter("jwt") ?: throw IOException("Missing jwt")
+        var dec = getSessionKey()?.let { decryptMap(map.token, it) }
+        if (dec != null && dec.pieces.isNotEmpty()) return dec
 
-            // 1. جلب خريطة حية من السيرفر في جزء الثانية الحالي لمنع أي خطأ انتهاء صلاحية (Expiration)
-            val freshSplitUrl = "$baseUrl/chapter-deferred-media/$chapterId?token=$jwtToken&split=$splitIndex"
-            val freshResponse = client.newCall(GET(freshSplitUrl, headers)).execute()
-            if (!freshResponse.isSuccessful) throw IOException("فشل جلب خريطة الصفحة الحية من السيرفر")
+        try {
+            val body = json.encodeToString(map).toRequestBody("application/json".toMediaType())
+            val proxyResp = innerClient.newCall(
+                POST("$baseUrl/chapter-map-proxy-plan/$chapterId", apiHeaders.newBuilder().set("Origin", baseUrl).set("Referer", "$baseUrl/").build(), body)
+            ).execute()
+            if (proxyResp.isSuccessful) dec = proxyResp.parseAs<ProxyPlanResponse>().data?.map
+        } catch (_: Exception) {}
 
-            val splitData = json.decodeFromString<ChapterDeferredResponse>(freshResponse.body.string()).data
-                ?: throw IOException("بيانات الخريطة فارغة")
-
-            val targetMap = splitData.maps.getOrNull(indexInSplit)
-                ?: throw IOException("تعذر العثور على خريطة التوزيع للصفحة المطلوبة")
-
-            // 2. إعادة بناء وتجميع الصورة عبر الـ Canvas
-            val bitmap = reconstructPageWithFallbacks(chapterId, targetMap)
-
-            // 3. ضخ البايتات للمستعرض مباشرة
-            val outputStream = ByteArrayOutputStream()
-            bitmap.compress(Bitmap.CompressFormat.JPEG, 90, outputStream)
-            val imageBytes = outputStream.toByteArray()
-            bitmap.recycle() // تفريغ الذاكرة فوراً لمنع الـ OOM في الأجهزة الضعيفة
-
-            return Response.Builder()
-                .request(request)
-                .protocol(Protocol.HTTP_1_1)
-                .code(200)
-                .message("OK")
-                .body(imageBytes.toResponseBody("image/jpeg".toMediaType()))
-                .build()
-        }
-
-        return chain.proceed(request)
+        return dec
     }
 
-    // دالة التجميع مع الحفاظ على آليات الـ Proxy Plan الأصلية في حال حدوث أي تلف شبكي طارئ
-    private fun reconstructPageWithFallbacks(chapterId: String, initialMap: DeferredPageMap): Bitmap {
-        var map = initialMap
-        var piecesBitmaps = downloadAllPieces(map)
-
-        // إذا فشل تحميل أي قطعة، نقوم بتفعيل خط الدفاع الاحترافي الأصلي الخاص بك (Proxy Plan) لإعادة إحياء التوكنات
-        if (piecesBitmaps.any { it == null }) {
-            val updatedMap = resolveMapViaProxyPlan(chapterId, map)
-            if (updatedMap != null) {
-                map = updatedMap
-                piecesBitmaps = downloadAllPieces(map)
-            }
+    private fun processMap(
+        dim: List<Int>, mode: String, pieces: List<String>, order: List<Int>,
+        signedToken: String, pages: MutableList<Page>, seenUrls: MutableSet<String>,
+        chapterId: String, originalMapBase64: String,
+    ) {
+        val mapKey = pieces.joinToString(",")
+        if (pieces.isEmpty() || !seenUrls.add(mapKey)) return
+        
+        val estimatedTotalH = dim.getOrNull(1)?.takeIf { it > 0 } ?: 10000
+        val parts = if (estimatedTotalH > MAX_SAFE_HEIGHT) ceil(estimatedTotalH.toDouble() / MAX_SAFE_HEIGHT).toInt() else 1
+        for (p in 0 until parts) {
+            val mapData = ScrambledMap(dim, mode, pieces, order, signedToken, p, parts, chapterId, originalMapBase64)
+            val encoded = Base64.encodeToString(json.encodeToString(mapData).toByteArray(Charsets.UTF_8), Base64.URL_SAFE or Base64.NO_WRAP)
+            val shortUrl = "$SCRAMBLED_SCHEME${pages.size}_part_$p.jpg#$encoded"
+            pages.add(Page(pages.size, url = shortUrl, imageUrl = shortUrl))
         }
-
-        if (piecesBitmaps.any { it == null }) {
-            throw IOException("تعذر فك تشفير الصفحة وتحميل قطعها الأمنية")
-        }
-
-        return assembleBitmaps(piecesBitmaps.filterNotNull(), map)
     }
 
-    private fun downloadAllPieces(map: DeferredPageMap): List<Bitmap?> {
-        return runBlocking(Dispatchers.IO) {
-            map.pieces.map { pieceUrl ->
-                async {
-                    val fullUrl = if (map.token.isNotEmpty()) "$pieceUrl?token=${map.token}" else pieceUrl
-                    val request = Request.Builder().url(fullUrl).headers(pieceRequestHeaders()).build()
-                    try {
-                        client.newCall(request).execute().use { response ->
-                            if (response.isSuccessful) BitmapFactory.decodeStream(response.body.byteStream()) else null
+    // ════════════════════════════════════════════════════════════════════════
+    // Reconstruct Page
+    // ════════════════════════════════════════════════════════════════════════
+
+    private fun reconstructPage(map: ScrambledMap): ByteArray? {
+        if (map.pieces.isEmpty()) return null
+
+        val mapKey = map.pieces.first()
+        val mapLock = mapLocks.getOrPut(mapKey) { Any() }
+
+        synchronized(mapLock) {
+            val needsDownload = map.pieces.any { pieceCache.get(it) == null }
+            if (!needsDownload) return@synchronized
+
+            var pieces = map.pieces
+            var token = map.signedToken
+
+            val success = downloadAllPieces(pieces, token, map.pieces)
+
+            if (!success && map.chapterId.isNotEmpty() && map.originalMapBase64.isNotEmpty()) {
+                runCatching {
+                    val mapJson = String(Base64.decode(map.originalMapBase64, Base64.URL_SAFE))
+                    
+                    val proxyHeaders = headersBuilder()
+                        .set("Origin", baseUrl).set("Referer", "$baseUrl/")
+                        .set("Content-Type", "application/json")
+                        .apply {
+                            val cookie = getSessionCookie()
+                            if (cookie.isNotBlank()) {
+                                set("Cookie", cookie)
+                            }
                         }
-                    } catch (e: Exception) {
-                        null
+                        .build()
+                        
+                    innerClient.newCall(
+                        POST("$baseUrl/chapter-map-proxy-plan/${map.chapterId}", proxyHeaders,
+                            mapJson.toRequestBody("application/json".toMediaType()))
+                    ).execute().use { resp ->
+                        if (resp.isSuccessful) {
+                            json.decodeFromStream<ProxyPlanResponse>(resp.body!!.byteStream()).data?.map?.let { newMap ->
+                                pieces = newMap.pieces
+                                token = newMap.token
+                            }
+                        }
                     }
                 }
-            }.awaitAll()
-        }
-    }
-
-    // الحفاظ على دالة الـ Proxy Plan الأصلية الخاصة بك بالكامل دون أي تبسيط
-    private fun resolveMapViaProxyPlan(chapterId: String, failedMap: DeferredPageMap): DeferredPageMap? {
-        return try {
-            val rawMapJson = json.encodeToString(failedMap)
-            val base64Map = Base64.encodeToString(rawMapJson.toByteArray(), Base64.DEFAULT or Base64.NO_WRAP)
-            
-            val proxyUrl = "$baseUrl/chapter-map-proxy-plan/$chapterId"
-            val payload = "{\"map\":\"$base64Map\"}"
-            val request = Request.Builder()
-                .url(proxyUrl)
-                .post(payload.toResponseBody("application/json".toMediaType()))
-                .headers(headers)
-                .build()
-
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return null
-                val resData = json.decodeFromString<ProxyPlanResponse>(response.body.string())
-                if (resData.success) resData.data?.map else null
-            }
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    // دالة الـ Canvas والهندسة الرياضية لترتيب القطع المبعثرة (مستوحاة من ملفات الـ Smali للتطبيق)
-    private fun assembleBitmaps(pieces: List<Bitmap>, map: DeferredPageMap): Bitmap {
-        val width = map.dim.getOrNull(0) ?: 800
-        val height = map.dim.getOrNull(1) ?: 1200
-
-        val resultBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(resultBitmap)
-
-        val cols = 5
-        val rows = if (pieces.isNotEmpty()) (pieces.size + cols - 1) / cols else 1
-
-        val tileWidth = width / cols
-        val tileHeight = height / rows
-
-        for (i in pieces.indices) {
-            val correctIndex = map.order.getOrNull(i) ?: i
-            val srcX = (i % cols) * tileWidth
-            val srcY = (i / cols) * tileHeight
-
-            val destX = (correctIndex % cols) * tileWidth
-            val destY = (correctIndex / cols) * tileHeight
-
-            val piece = pieces.getOrNull(i) ?: continue
-            canvas.drawBitmap(piece, srcX.toFloat(), srcY.toFloat(), null)
-        }
-        return resultBitmap
-    }
-
-    // --- الحفاظ على دالات استخراج البيانات والتوكنات المساعدة ---
-    private fun extractJwtToken(html: String): String? {
-        val regex = """\"token\"\s*:\s*\"([^\"]+)\"""".toRegex()
-        return regex.find(html)?.groupValues?.get(1)
-    }
-
-    private fun jwtSplitValue(token: String): Int {
-        return try {
-            val parts = token.split(".")
-            if (parts.size < 2) return 1
-            val payload = String(Base64.decode(parts[1], Base64.DEFAULT or Base64.NO_WRAP))
-            if (payload.contains("\"split\":")) {
-                val regex = """\"split\"\s*:\s*(\d+)""".toRegex()
-                regex.find(payload)?.groupValues?.get(1)?.toIntOrNull() ?: 1
-            } else 1
-        } catch (e: Exception) {
-            1
-        }
-    }
-
-    private fun getSessionCookie(): String {
-        return preferences.getString("session_cookie", "") ?: ""
-    }
-
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException("Not used")
-
-    // --- الحفاظ على شاشة الإعدادات وحفظ الجلسات الأصلية الخاصة بك كاملة ---
-    override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        val sessionPref = EditTextPreference(screen.context).apply {
-            key = "session_cookie"
-            title = "Session Cookie (procomic_session)"
-            summary = "أدخل قيمة الكوكيز يدوياً للوصول للفصول المحمية والمدفوعة الخاصة بحسابك"
-            dialogTitle = "procomic_session"
-            setOnPreferenceChangeListener { _, newValue ->
-                Toast.makeText(screen.context, "تم حفظ الجلسة بنجاح، يرجى تحديث القائمة", Toast.LENGTH_SHORT).show()
-                true
+                downloadAllPieces(pieces, token, map.pieces)
             }
         }
-        screen.addPreference(sessionPref)
+
+        val (cols, rows) = parseMode(map.mode, map.pieces.size)
+        val bitmaps = arrayOfNulls<Bitmap>(map.pieces.size)
+
+        for (targetIdx in map.pieces.indices) {
+            val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
+            val cacheKey = map.pieces.getOrNull(srcIdx) ?: continue
+            val bytes = pieceCache.get(cacheKey) ?: continue
+            bitmaps[targetIdx] = decodeAvif(bytes)
+        }
+
+        return assembleBitmaps(bitmaps, map, cols, rows)
     }
+
+    private fun downloadAllPieces(
+        pieces: List<String>,
+        token: String,
+        cacheKeys: List<String>,
+    ): Boolean {
+        return runBlocking(Dispatchers.IO) {
+            pieces.indices.map { idx ->
+                async {
+                    val cacheKey = cacheKeys.getOrNull(idx) ?: return@async false
+                    if (pieceCache.get(cacheKey) != null) return@async true
+                    val pieceUrl = pieces.getOrNull(idx) ?: return@async false
+                    downloadAndCachePiece(pieceUrl, token, cacheKey)
+                }
+            }.awaitAll().all { it }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Bitmap Assembly
+    // ════════════════════════════════════════════════════════════════════════
+
+    private fun assembleBitmaps(bitmaps: Array<Bitmap?>, map: ScrambledMap, cols: Int, rows: Int): ByteArray? {
+        return try {
+            val valid = bitmaps.filterNotNull()
+            if (valid.isEmpty()) return null
+
+            val totalW: Int
+            val totalH: Int
+            when {
+                cols == 1 -> {
+                    totalW = map.dim.getOrNull(0)?.takeIf { it > 0 } ?: valid.maxOf { it.width }
+                    totalH = map.dim.getOrNull(1)?.takeIf { it > 0 } ?: valid.sumOf { it.height }
+                }
+                rows == 1 -> {
+                    totalW = map.dim.getOrNull(0)?.takeIf { it > 0 } ?: valid.sumOf { it.width }
+                    totalH = map.dim.getOrNull(1)?.takeIf { it > 0 } ?: valid.maxOf { it.height }
+                }
+                else -> {
+                    totalW = map.dim.getOrNull(0)?.takeIf { it > 0 } ?: (valid.first().width * cols)
+                    totalH = map.dim.getOrNull(1)?.takeIf { it > 0 } ?: (valid.first().height * rows)
+                }
+            }
+
+            val totalParts = map.totalParts ?: 1
+            val splitPart = map.splitPart ?: 0
+            val partH = totalH / totalParts
+            val actualPartH = if (splitPart == totalParts - 1) totalH - partH * splitPart else partH
+
+            if (totalW <= 0 || actualPartH <= 0) return null
+
+            val result = try {
+                Bitmap.createBitmap(totalW, actualPartH, Bitmap.Config.ARGB_8888)
+            } catch (_: OutOfMemoryError) {
+                Bitmap.createBitmap(totalW, actualPartH, Bitmap.Config.RGB_565)
+            }
+            val canvas = Canvas(result)
+            canvas.translate(0f, -(splitPart * partH).toFloat())
+
+            when {
+                cols == 1 -> {
+                    var y = 0f
+                    bitmaps.forEach { bmp -> bmp?.let { canvas.drawBitmap(it, 0f, y, null); y += it.height; it.recycle() } }
+                }
+                rows == 1 -> {
+                    var x = 0f
+                    bitmaps.forEach { bmp -> bmp?.let { canvas.drawBitmap(it, x, 0f, null); x += it.width; it.recycle() } }
+                }
+                else -> {
+                    val tileW = valid.first().width
+                    val tileH = valid.first().height
+                    bitmaps.forEachIndexed { i, bmp ->
+                        bmp?.let {
+                            canvas.drawBitmap(it, (i % cols * tileW).toFloat(), (i / cols * tileH).toFloat(), null)
+                            it.recycle()
+                        }
+                    }
+                }
+            }
+
+            val out = ByteArrayOutputStream()
+            result.compress(Bitmap.CompressFormat.JPEG, 85, out)
+            result.recycle()
+            out.toByteArray()
+        } catch (_: Exception) { null }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Crypto & Decode
+    // ════════════════════════════════════════════════════════════════════════
+
+    private fun decryptMap(tokenStr: String, sessionKeyBase64: String): DeferredPageMap? {
+        return try {
+            val tokenData = json.decodeFromString<EncryptedToken>(String(Base64.decode(tokenStr, Base64.URL_SAFE or Base64.DEFAULT)))
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(Base64.decode(sessionKeyBase64, Base64.URL_SAFE), "AES"), GCMParameterSpec(128, Base64.decode(tokenData.iv, Base64.URL_SAFE)))
+            val decrypted = cipher.doFinal(Base64.decode(tokenData.data, Base64.URL_SAFE) + Base64.decode(tokenData.tag, Base64.URL_SAFE))
+            json.decodeFromString<DeferredPageMap>(String(decrypted))
+        } catch (_: Exception) { null }
+    }
+
+    private fun decodeAvif(bytes: ByteArray): Bitmap? {
+        if (bytes.isEmpty()) return null
+        val decoder = ImageDecoder.newInstance(bytes.inputStream())
+        return if (decoder != null) {
+            try { decoder.decode() } catch (_: Exception) { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) } finally { decoder.recycle() }
+        } else {
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        }
+    }
+
+    private fun parseMode(mode: String, pieceCount: Int): Pair<Int, Int> = when {
+        mode.startsWith("grid_") -> {
+            val clean = mode.removePrefix("grid_")
+            val p = if (clean.contains("x")) clean.split("x") else clean.split("_")
+            Pair(p.getOrNull(0)?.toIntOrNull() ?: 1, p.getOrNull(1)?.toIntOrNull() ?: 1)
+        }
+        mode.startsWith("vertical_") -> Pair(mode.removePrefix("vertical_").toIntOrNull() ?: pieceCount, 1)
+        mode.startsWith("horizontal_") -> Pair(1, mode.removePrefix("horizontal_").toIntOrNull() ?: pieceCount)
+        else -> Pair(1, pieceCount)
+    }
+
+    private fun String.toAbsoluteUrl(cdnBase: String): String = when {
+        startsWith("http") -> this
+        startsWith("eyJ2IjoxLCJpdiI6I") -> "$cdnBase/i/$this"
+        startsWith("/") -> "$cdnBase$this"
+        else -> "$cdnBase/$this"
+    }
+
+    private inline fun <reified T> Response.parseAs(): T = json.decodeFromStream(body.byteStream())
 }
 
-// --- الحفاظ على كافة كائنات نقل البيانات (DTOs) دون المساس بها أو حذف أي حقل ---
-@Serializable data class MangaListResponse(val data: List<MangaDto> = emptyList(), val total: Int = 0)
-@Serializable data class MangaDto(val id: Int, val title: String? = null, @SerialName("cover_image") val coverImage: String? = null, @SerialName("cover_image_app") val coverImageApp: CoverImageApp? = null)
-@Serializable data class CoverImageApp(val url: String? = null)
-@Serializable data class MangaDetailResponse(val data: MangaDetailDto)
-@Serializable data class MangaDetailDto(val id: Int, val title: String? = null, @SerialName("cover_image") val coverImage: String? = null, @SerialName("cover_image_app") val coverImageApp: CoverImageApp? = null, val author: String? = null, val artist: String? = null, val description: String? = null, val synopsis: String? = null, val status: String? = null)
+// ════════════════════════════════════════════════════════════════════════════
+// Constants & Data Classes
+// ════════════════════════════════════════════════════════════════════════════
+
+@Serializable data class JwtPayload(val split: Int = 20, val cid: Int = 0, val p: String = "")
+@Serializable data class SessionKeyResponse(val success: Boolean = false, val data: SessionKeyData? = null)
+@Serializable data class SessionKeyData(val key: String = "")
+@Serializable data class EncryptedToken(val v: Int = 3, val m: String = "", val cid: Int = 0, val iv: String = "", val tag: String = "", val data: String = "")
+@Serializable data class ScrambledMap(val dim: List<Int> = emptyList(), val mode: String = "", val pieces: List<String> = emptyList(), val order: List<Int> = emptyList(), val signedToken: String = "", val splitPart: Int? = null, val totalParts: Int? = null, val chapterId: String = "", val originalMapBase64: String = "")
+@Serializable data class LatestUpdatesResponse(val success: Boolean = false, val data: List<SeriesDto> = emptyList())
+@Serializable data class SeriesDto(@SerialName("mangaId") val id: Int = 0, @SerialName("mangaSlug") val slug: String = "", @SerialName("mangaTitle") val title: String = "", val coverImage: String? = null, val type: String = "manga", val coverImageApp: CoverImageApp? = null) {
+    fun toSManga() = SManga.create().apply { url = "$type/$id/$slug"; title = this@SeriesDto.title; thumbnail_url = coverImageApp?.card?.mobile ?: coverImageApp?.desktop ?: coverImage }
+}
+@Serializable data class CoverImageApp(val desktop: String? = null, val card: CardImages? = null)
+@Serializable data class CardImages(val mobile: String? = null, val desktop: String? = null)
+@Serializable data class SeriesDetailResponse(val id: Int = 0, val title: String? = null, val slug: String? = null, val coverImage: String? = null, val coverImageApp: CoverImageApp? = null, val author: String? = null, val artist: String? = null, val description: String? = null, val synopsis: String? = null, val status: String? = null)
 @Serializable data class ChaptersResponse(val data: List<ChapterDto> = emptyList(), val total: Int = 0)
 @Serializable data class ChapterDto(val id: Int = 0, @SerialName("chapter_number") val chapterNumber: String = "0", val title: String? = null, @SerialName("published_at") val publishedAt: String? = null, val lockedByCoins: Boolean? = null, @SerialName("cdn_path") val cdnPath: String? = null, val metadata: ChapterMetadataDto? = null)
 @Serializable data class ChapterMetadataDto(val images: List<String> = emptyList(), val maps: List<DeferredPageMap> = emptyList())
