@@ -390,7 +390,7 @@ class ProComic : HttpSource(), ConfigurableSource {
             .apply {
                 val cookie = getSessionCookie()
                 if (cookie.isNotBlank()) {
-                    set("Cookie", cookie)
+                    set("Cookie", cookie) // حقن الكوكيز ضروري
                 }
             }
             .build()
@@ -402,6 +402,7 @@ class ProComic : HttpSource(), ConfigurableSource {
         val mapsList = mutableListOf<DeferredPageMap>()
         var cachedSessionKey: String? = null
         var sessionKeyAttempted = false
+        var chapterNum = "1" // متغير لحفظ رقم الفصل
 
         val getSessionKey: () -> String? = {
             if (!sessionKeyAttempted) {
@@ -420,6 +421,7 @@ class ProComic : HttpSource(), ConfigurableSource {
                     cdnPath = ch.cdnPath ?: "cdn1"
                     metadataImages = ch.metadata?.images ?: emptyList()
                     ch.metadata?.maps?.let { mapsList.addAll(it) }
+                    chapterNum = ch.chapterNumber // نحفظ رقم الفصل هنا لنستخدمه لاحقاً
                     return true
                 }
             }
@@ -428,34 +430,44 @@ class ProComic : HttpSource(), ConfigurableSource {
 
         val currentData = try { response.parseAs<ChaptersResponse>() } catch (_: Exception) { ChaptersResponse() }
         val foundInInitial = extractChapterData(currentData)
+        val jwtTokens = mutableListOf<String>()
 
-        // الإصلاح المدمج: كشف فخ الـ 3 صفحات للمانهوا وتكرار الطلب بالكوكيز من الصفحة الأولى
+        // 🚨 الحل الأكيد: السيرفر أعطانا 3 صفحات فقط للمانهوا وأخفى الخرائط!
         if (!foundInInitial || (mapsList.isEmpty() && seriesType != "manga")) {
-            metadataImages = emptyList()
             mapsList.clear()
+            metadataImages = emptyList()
             
-            // حلقة الدوران تبدأ من 1 بدلاً من 2 لتغطية الصفحة الأولى بالـ Cookie الصحيح
-            for (pg in 1..10) {
-                try {
-                    val resp = innerClient.newCall(GET("$baseUrl/api/public/$seriesType/$seriesId/chapters?limit=600&page=$pg&order=desc", apiHeaders)).execute()
-                    if (!resp.isSuccessful) break
-                    val data = resp.parseAs<ChaptersResponse>()
-                    if (data.data.isEmpty()) break
-                    
-                    cdnPath = "cdn1"
-                    metadataImages = emptyList()
-                    mapsList.clear()
-                    
-                    if (extractChapterData(data)) {
-                        if (mapsList.isNotEmpty() || seriesType == "manga") break
+            // 1. الدخول بصمت لصفحة القراءة (HTML) واستخراج توكن الـ JWT المخفي!
+            try {
+                val htmlUrl = "$baseUrl/$seriesType/$seriesId/$chapterId/$chapterNum"
+                val htmlResp = innerClient.newCall(GET(htmlUrl, apiHeaders)).execute()
+                if (htmlResp.isSuccessful) {
+                    val html = htmlResp.body.string()
+                    // نبحث عن أي توكن JWT حقيقي يبدأ بـ eyJhbGci
+                    val jwtRegex = """(eyJhbGci[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)""".toRegex()
+                    val match = jwtRegex.find(html)
+                    if (match != null) {
+                        jwtTokens.add(match.groupValues[1])
                     }
-                } catch (_: Exception) { break }
+                }
+            } catch (_: Exception) {}
+
+            // 2. إذا فشل استخراج التوكن من الـ HTML، نطلب الـ API المخصص للفصل الواحد
+            if (jwtTokens.isEmpty() && mapsList.isEmpty()) {
+                try {
+                    val singleResp = innerClient.newCall(GET("$baseUrl/api/public/chapters/$chapterId", apiHeaders)).execute()
+                    if (singleResp.isSuccessful) {
+                        val singleData = singleResp.parseAs<ChapterDto>()
+                        singleData.metadata?.maps?.let { mapsList.addAll(it) }
+                        if (metadataImages.isEmpty()) metadataImages = singleData.metadata?.images ?: emptyList()
+                    }
+                } catch (_: Exception) {}
             }
         }
 
         val cdnBase = "https://$cdnPath.procomic.pro"
-        val jwtTokens = mutableListOf<String>()
 
+        // باقي كود التجميع والمعالجة يبقى كما هو لديك...
         metadataImages.forEach { imgPath ->
             val fullUrl = imgPath.toAbsoluteUrl(cdnBase)
             if (seenUrls.add(fullUrl)) pages.add(Page(pages.size, imageUrl = fullUrl))
@@ -482,6 +494,7 @@ class ProComic : HttpSource(), ConfigurableSource {
         }
         return pages
     }
+
 
     // الإصلاح المدمج: حقن الكوكيز منذ الطلب الأول لدالة pageListRequest
     override fun pageListRequest(chapter: SChapter): Request {
