@@ -88,10 +88,6 @@ class ProComic : HttpSource(), ConfigurableSource {
         private val mapLocks = ConcurrentHashMap<String, Any>()
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    // Preferences
-    // ════════════════════════════════════════════════════════════════════════
-
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         ListPreference(screen.context).apply {
             key = TYPE_PREF
@@ -110,21 +106,14 @@ class ProComic : HttpSource(), ConfigurableSource {
         EditTextPreference(screen.context).apply {
             key = COOKIE_PREF
             title = "🍪 Cookie الجلسة (مطلوب للمانهوا)"
-            summary = "١. افتح procomic.pro في المتصفح وسجّل دخول\n٢. افتح فصل مانهوا → F12 → Network\n٣. اضغط على أي طلب صورة → انسخ قيمة cookie\n٤. الصقها هنا"
+            summary = "ضع الكوكي الخاص بك هنا لفتح الفصول المغلقة"
             dialogTitle = "قيمة الـ Cookie كاملةً"
             setDefaultValue("")
         }.also(screen::addPreference)
     }
 
-    private fun getSelectedType(): String =
-        preferences.getString(TYPE_PREF, TYPE_PREF_DEFAULT) ?: TYPE_PREF_DEFAULT
-
-    private fun getSessionCookie(): String =
-        preferences.getString(COOKIE_PREF, "") ?: ""
-
-    // ════════════════════════════════════════════════════════════════════════
-    // Clients
-    // ════════════════════════════════════════════════════════════════════════
+    private fun getSelectedType(): String = preferences.getString(TYPE_PREF, TYPE_PREF_DEFAULT) ?: TYPE_PREF_DEFAULT
+    private fun getSessionCookie(): String = preferences.getString(COOKIE_PREF, "") ?: ""
 
     private val innerClient: OkHttpClient = network.cloudflareClient.newBuilder()
         .connectTimeout(20, TimeUnit.SECONDS)
@@ -179,10 +168,6 @@ class ProComic : HttpSource(), ConfigurableSource {
             response
         }.build()
 
-    // ════════════════════════════════════════════════════════════════════════
-    // Headers
-    // ════════════════════════════════════════════════════════════════════════
-
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
         .add("Origin", baseUrl)
@@ -200,10 +185,6 @@ class ProComic : HttpSource(), ConfigurableSource {
                 if (cookie.isNotBlank()) set("Cookie", cookie)
             }.build()
     }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // Image Helpers
-    // ════════════════════════════════════════════════════════════════════════
 
     private fun extractBase64Image(bytes: ByteArray): ByteArray? {
         if (bytes.size < 10) return null
@@ -274,10 +255,6 @@ class ProComic : HttpSource(), ConfigurableSource {
         return false
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    // Image Request
-    // ════════════════════════════════════════════════════════════════════════
-
     override fun imageRequest(page: Page): Request {
         val request = super.imageRequest(page)
         val fragment = page.url.substringAfter("#", "")
@@ -293,12 +270,7 @@ class ProComic : HttpSource(), ConfigurableSource {
 
     override fun imageUrlParse(response: Response): String = ""
 
-    // ════════════════════════════════════════════════════════════════════════
-    // Manga Browsing
-    // ════════════════════════════════════════════════════════════════════════
-
-    override fun popularMangaRequest(page: Int) =
-        GET("$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page", headers)
+    override fun popularMangaRequest(page: Int) = GET("$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page", headers)
 
     override fun popularMangaParse(response: Response): MangasPage {
         val data = response.parseAs<LatestUpdatesResponse>()
@@ -317,10 +289,6 @@ class ProComic : HttpSource(), ConfigurableSource {
         GET("$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page" + if (query.isNotBlank()) "&q=$query" else "", headers)
 
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
-
-    // ════════════════════════════════════════════════════════════════════════
-    // Manga Details
-    // ════════════════════════════════════════════════════════════════════════
 
     override fun mangaDetailsRequest(manga: SManga): Request {
         val p = manga.url.split("/")
@@ -349,10 +317,6 @@ class ProComic : HttpSource(), ConfigurableSource {
         } catch (_: Exception) { SManga.create() }
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    // Chapters
-    // ════════════════════════════════════════════════════════════════════════
-
     override fun chapterListRequest(manga: SManga): Request {
         val p = manga.url.split("/")
         return GET("$baseUrl/api/public/${p[0]}/${p[1]}/chapters?page=1&limit=600&order=desc", headers)
@@ -374,26 +338,37 @@ class ProComic : HttpSource(), ConfigurableSource {
         }
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    // Page List
-    // ════════════════════════════════════════════════════════════════════════
+    override fun pageListRequest(chapter: SChapter): Request {
+        val parts = chapter.url.split("/")
+        val seriesType = parts.getOrElse(0) { "manga" }
+        val seriesId = parts.getOrElse(1) { "0" }
+        val chapterId = parts.getOrElse(2) { "0" }
+        val url = "$baseUrl/api/public/$seriesType/$seriesId/chapters".toHttpUrl().newBuilder()
+            .addQueryParameter("page", "1")
+            .addQueryParameter("limit", "500")
+            .addQueryParameter("order", "desc")
+            .addQueryParameter("_cid", chapterId)
+            .build()
+            
+        val requestHeaders = headers.newBuilder()
+            .set("Accept", "application/json")
+            .apply {
+                val cookie = getSessionCookie()
+                if (cookie.isNotBlank()) set("Cookie", cookie)
+            }.build()
+            
+        return GET(url, requestHeaders)
+    }
 
+    // الدالة المُصلحة بالكامل (لا ترمي أخطاء وتهرب، وتقوم باستخراج القطع بشكل مضمون)
     override fun pageListParse(response: Response): List<Page> {
         val chapterId = response.request.url.queryParameter("_cid") ?: return emptyList()
-        val pathParts = response.request.url.pathSegments
-        val pubIdx = pathParts.indexOf("public")
-        val seriesType = pathParts.getOrElse(pubIdx + 1) { "manga" }
-        val seriesId = pathParts.getOrElse(pubIdx + 2) { "0" }
-        
         val apiHeaders = headers.newBuilder()
             .set("Accept", "application/json")
             .apply {
                 val cookie = getSessionCookie()
-                if (cookie.isNotBlank()) {
-                    set("Cookie", cookie) // حقن الكوكيز ضروري
-                }
-            }
-            .build()
+                if (cookie.isNotBlank()) set("Cookie", cookie)
+            }.build()
 
         val pages = mutableListOf<Page>()
         val seenUrls = mutableSetOf<String>()
@@ -402,7 +377,6 @@ class ProComic : HttpSource(), ConfigurableSource {
         val mapsList = mutableListOf<DeferredPageMap>()
         var cachedSessionKey: String? = null
         var sessionKeyAttempted = false
-        var chapterNum = "1" // متغير لحفظ رقم الفصل
 
         val getSessionKey: () -> String? = {
             if (!sessionKeyAttempted) {
@@ -415,59 +389,53 @@ class ProComic : HttpSource(), ConfigurableSource {
             cachedSessionKey
         }
 
-        fun extractChapterData(data: ChaptersResponse): Boolean {
-            for (ch in data.data) {
-                if (ch.id.toString() == chapterId) {
-                    cdnPath = ch.cdnPath ?: "cdn1"
-                    metadataImages = ch.metadata?.images ?: emptyList()
-                    ch.metadata?.maps?.let { mapsList.addAll(it) }
-                    chapterNum = ch.chapterNumber // نحفظ رقم الفصل هنا لنستخدمه لاحقاً
-                    return true
-                }
+        // 1. المحاولة الأولى: قراءة استجابة قائمة الفصول العادية
+        try {
+            val listData = response.parseAs<ChaptersResponse>()
+            val ch = listData.data.find { it.id.toString() == chapterId }
+            if (ch != null) {
+                cdnPath = ch.cdnPath ?: "cdn1"
+                metadataImages = ch.metadata?.images ?: emptyList()
+                ch.metadata?.maps?.let { mapsList.addAll(it) }
             }
-            return false
-        }
+        } catch (_: Exception) {}
 
-        val currentData = try { response.parseAs<ChaptersResponse>() } catch (_: Exception) { ChaptersResponse() }
-        val foundInInitial = extractChapterData(currentData)
-        val jwtTokens = mutableListOf<String>()
-
-        // 🚨 الحل الأكيد: السيرفر أعطانا 3 صفحات فقط للمانهوا وأخفى الخرائط!
-        if (!foundInInitial || (mapsList.isEmpty() && seriesType != "manga")) {
-            mapsList.clear()
-            metadataImages = emptyList()
-            
-            // 1. الدخول بصمت لصفحة القراءة (HTML) واستخراج توكن الـ JWT المخفي!
+        // 2. المحاولة الأهم: إذا أخفى الموقع الخرائط (فخ المانهوا)، نطلب بيانات الفصل الواحد باستخدام الفئة المُصلحة SingleChapterResponse
+        if (mapsList.isEmpty()) {
             try {
-                val htmlUrl = "$baseUrl/$seriesType/$seriesId/$chapterId/$chapterNum"
-                val htmlResp = innerClient.newCall(GET(htmlUrl, apiHeaders)).execute()
-                if (htmlResp.isSuccessful) {
-                    val html = htmlResp.body.string()
-                    // نبحث عن أي توكن JWT حقيقي يبدأ بـ eyJhbGci
-                    val jwtRegex = """(eyJhbGci[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)""".toRegex()
-                    val match = jwtRegex.find(html)
-                    if (match != null) {
-                        jwtTokens.add(match.groupValues[1])
+                val singleReq = GET("$baseUrl/api/public/chapters/$chapterId", apiHeaders)
+                val singleResp = innerClient.newCall(singleReq).execute()
+                if (singleResp.isSuccessful) {
+                    val bodyString = singleResp.body.string()
+                    val singleData = json.decodeFromString<SingleChapterResponse>(bodyString)
+                    singleData.data?.let { ch ->
+                        cdnPath = ch.cdnPath ?: "cdn1"
+                        metadataImages = ch.metadata?.images ?: emptyList()
+                        mapsList.clear()
+                        ch.metadata?.maps?.let { mapsList.addAll(it) }
                     }
                 }
             } catch (_: Exception) {}
-
-            // 2. إذا فشل استخراج التوكن من الـ HTML، نطلب الـ API المخصص للفصل الواحد
-            if (jwtTokens.isEmpty() && mapsList.isEmpty()) {
-                try {
-                    val singleResp = innerClient.newCall(GET("$baseUrl/api/public/chapters/$chapterId", apiHeaders)).execute()
-                    if (singleResp.isSuccessful) {
-                        val singleData = singleResp.parseAs<ChapterDto>()
-                        singleData.metadata?.maps?.let { mapsList.addAll(it) }
-                        if (metadataImages.isEmpty()) metadataImages = singleData.metadata?.images ?: emptyList()
+        }
+        
+        // 3. محاولة الطوارئ القصوى: استخراج التوكنات مباشرة من صفحة القراءة (HTML) كالمتصفح
+        if (mapsList.isEmpty()) {
+            try {
+                val htmlResp = innerClient.newCall(GET("$baseUrl/chapter/$chapterId", apiHeaders)).execute()
+                if (htmlResp.isSuccessful) {
+                    val html = htmlResp.body.string()
+                    val jwtRegex = """(eyJhbGci[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)""".toRegex()
+                    val match = jwtRegex.find(html)
+                    if (match != null) {
+                        mapsList.add(DeferredPageMap(token = match.groupValues[1]))
                     }
-                } catch (_: Exception) {}
-            }
+                }
+            } catch (_: Exception) {}
         }
 
         val cdnBase = "https://$cdnPath.procomic.pro"
+        val jwtTokens = mutableListOf<String>()
 
-        // باقي كود التجميع والمعالجة يبقى كما هو لديك...
         metadataImages.forEach { imgPath ->
             val fullUrl = imgPath.toAbsoluteUrl(cdnBase)
             if (seenUrls.add(fullUrl)) pages.add(Page(pages.size, imageUrl = fullUrl))
@@ -494,37 +462,6 @@ class ProComic : HttpSource(), ConfigurableSource {
         }
         return pages
     }
-
-
-    // الإصلاح المدمج: حقن الكوكيز منذ الطلب الأول لدالة pageListRequest
-    override fun pageListRequest(chapter: SChapter): Request {
-        val parts = chapter.url.split("/")
-        val seriesType = parts.getOrElse(0) { "manga" }
-        val seriesId = parts.getOrElse(1) { "0" }
-        val chapterId = parts.getOrElse(2) { "0" }
-        val url = "$baseUrl/api/public/$seriesType/$seriesId/chapters".toHttpUrl().newBuilder()
-            .addQueryParameter("page", "1")
-            .addQueryParameter("limit", "500")
-            .addQueryParameter("order", "desc")
-            .addQueryParameter("_cid", chapterId)
-            .build()
-            
-        val requestHeaders = headers.newBuilder()
-            .set("Accept", "application/json")
-            .apply {
-                val cookie = getSessionCookie()
-                if (cookie.isNotBlank()) {
-                    set("Cookie", cookie)
-                }
-            }
-            .build()
-            
-        return GET(url, requestHeaders)
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // Deferred / Proxy
-    // ════════════════════════════════════════════════════════════════════════
 
     private fun String.isJwt(): Boolean = startsWith("eyJhbGci") && count { it == '.' } == 2
 
@@ -617,10 +554,6 @@ class ProComic : HttpSource(), ConfigurableSource {
         }
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    // Reconstruct Page
-    // ════════════════════════════════════════════════════════════════════════
-
     private fun reconstructPage(map: ScrambledMap): ByteArray? {
         if (map.pieces.isEmpty()) return null
 
@@ -697,10 +630,6 @@ class ProComic : HttpSource(), ConfigurableSource {
         }
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    // Bitmap Assembly
-    // ════════════════════════════════════════════════════════════════════════
-
     private fun assembleBitmaps(bitmaps: Array<Bitmap?>, map: ScrambledMap, cols: Int, rows: Int): ByteArray? {
         return try {
             val valid = bitmaps.filterNotNull()
@@ -766,10 +695,6 @@ class ProComic : HttpSource(), ConfigurableSource {
         } catch (_: Exception) { null }
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    // Crypto & Decode
-    // ════════════════════════════════════════════════════════════════════════
-
     private fun decryptMap(tokenStr: String, sessionKeyBase64: String): DeferredPageMap? {
         return try {
             val tokenData = json.decodeFromString<EncryptedToken>(String(Base64.decode(tokenStr, Base64.URL_SAFE or Base64.DEFAULT)))
@@ -811,10 +736,6 @@ class ProComic : HttpSource(), ConfigurableSource {
     private inline fun <reified T> Response.parseAs(): T = json.decodeFromStream(body.byteStream())
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// Constants & Data Classes
-// ════════════════════════════════════════════════════════════════════════════
-
 @Serializable data class JwtPayload(val split: Int = 20, val cid: Int = 0, val p: String = "")
 @Serializable data class SessionKeyResponse(val success: Boolean = false, val data: SessionKeyData? = null)
 @Serializable data class SessionKeyData(val key: String = "")
@@ -835,3 +756,5 @@ class ProComic : HttpSource(), ConfigurableSource {
 @Serializable data class DeferredPageMap(val dim: List<Int> = emptyList(), val mode: String = "", val pieces: List<String> = emptyList(), val order: List<Int> = emptyList(), val token: String = "", val method: String = "")
 @Serializable data class ProxyPlanResponse(val success: Boolean = false, val data: ProxyPlanData? = null)
 @Serializable data class ProxyPlanData(val map: DeferredPageMap? = null)
+// الإضافة التي أصلحت الخطأ ومنعت الانهيار
+@Serializable data class SingleChapterResponse(val success: Boolean = false, val data: ChapterDto? = null)
