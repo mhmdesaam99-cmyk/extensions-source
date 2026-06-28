@@ -254,8 +254,6 @@ class ProComic : HttpSource(), ConfigurableSource {
 
     override fun imageUrlParse(response: Response): String = ""
 
-    // ======== التحديث الجديد لقائمة الأعمال (المحلل الذكي) ========
-
     override fun popularMangaRequest(page: Int): Request {
         return GET("$baseUrl/api/android/feed/all-series?page=$page", headers)
     }
@@ -302,8 +300,6 @@ class ProComic : HttpSource(), ConfigurableSource {
 
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
-
-    // ================================================================
 
     override fun mangaDetailsRequest(manga: SManga): Request {
         val p = manga.url.split("/")
@@ -611,14 +607,21 @@ class ProComic : HttpSource(), ConfigurableSource {
 
         val (cols, rows) = parseMode(map.mode, map.pieces.size)
         val bitmaps = arrayOfNulls<Bitmap>(map.pieces.size)
-        for (i in map.pieces.indices) {
-            val targetIdx = if (map.order.size == map.pieces.size) map.order[i] else i
-            val cacheKey = map.pieces.getOrNull(i) ?: continue
-            val bytes = pieceCache.get(cacheKey) ?: continue
-            
-            if (targetIdx in bitmaps.indices) {
-                bitmaps[targetIdx] = decodeAvif(bytes)
+
+        // ✅ الإصلاح الذكي والمرن للترتيب (يمنع التكرار ويتعامل مع الأخطاء بدون تجاهل الترتيب)
+        for (targetIdx in map.pieces.indices) {
+            val srcIdx = if (map.order.isNotEmpty() && targetIdx < map.order.size) {
+                map.order[targetIdx]
+            } else {
+                targetIdx
             }
+            
+            // التأكد من أن الرقم المطلوب موجود فعلياً داخل القطع لمنع الانهيار
+            val safeSrcIdx = if (srcIdx in map.pieces.indices) srcIdx else targetIdx
+            
+            val cacheKey = map.pieces.getOrNull(safeSrcIdx) ?: continue
+            val bytes = pieceCache.get(cacheKey) ?: continue
+            bitmaps[targetIdx] = decodeAvif(bytes)
         }
 
         return assembleBitmaps(bitmaps, map, cols, rows)
@@ -669,12 +672,27 @@ class ProComic : HttpSource(), ConfigurableSource {
             val canvas = Canvas(result)
             canvas.translate(0f, -(splitPart * partH).toFloat())
 
+            // ✅ إصلاح الرسم الديناميكي للشبكات (Grid) ليمنع التكرار لو اختلفت أحجام القطع
             when {
                 cols == 1 -> { var y = 0f; bitmaps.forEach { bmp -> bmp?.let { canvas.drawBitmap(it, 0f, y, null); y += it.height; it.recycle() } } }
                 rows == 1 -> { var x = 0f; bitmaps.forEach { bmp -> bmp?.let { canvas.drawBitmap(it, x, 0f, null); x += it.width; it.recycle() } } }
                 else -> {
-                    val tileW = valid.first().width; val tileH = valid.first().height
-                    bitmaps.forEachIndexed { i, bmp -> bmp?.let { canvas.drawBitmap(it, (i % cols * tileW).toFloat(), (i / cols * tileH).toFloat(), null); it.recycle() } }
+                    var currentY = 0f
+                    var currentX = 0f
+                    var rowMaxH = 0
+                    bitmaps.forEachIndexed { i, bmp -> 
+                        if (bmp != null) {
+                            canvas.drawBitmap(bmp, currentX, currentY, null)
+                            currentX += bmp.width
+                            rowMaxH = maxOf(rowMaxH, bmp.height)
+                            bmp.recycle()
+                        }
+                        if ((i + 1) % cols == 0) {
+                            currentX = 0f
+                            currentY += rowMaxH
+                            rowMaxH = 0
+                        }
+                    }
                 }
             }
 
@@ -702,15 +720,16 @@ class ProComic : HttpSource(), ConfigurableSource {
             try { decoder.decode() } catch (_: Exception) { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) } finally { decoder.recycle() }
         } else { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }
     }
-    
+
+    // إرجاع دالة parseMode كما كانت في النسخة الناجحة لديك
     private fun parseMode(mode: String, pieceCount: Int): Pair<Int, Int> = when {
         mode.startsWith("grid_") -> {
             val clean = mode.removePrefix("grid_")
             val p = if (clean.contains("x")) clean.split("x") else clean.split("_")
             Pair(p.getOrNull(0)?.toIntOrNull() ?: 1, p.getOrNull(1)?.toIntOrNull() ?: 1)
         }
-        mode.startsWith("vertical_") -> Pair(1, mode.removePrefix("vertical_").toIntOrNull() ?: pieceCount)
-        mode.startsWith("horizontal_") -> Pair(mode.removePrefix("horizontal_").toIntOrNull() ?: pieceCount, 1)
+        mode.startsWith("vertical_") -> Pair(mode.removePrefix("vertical_").toIntOrNull() ?: pieceCount, 1)
+        mode.startsWith("horizontal_") -> Pair(1, mode.removePrefix("horizontal_").toIntOrNull() ?: pieceCount)
         else -> Pair(1, pieceCount)
     }
 
