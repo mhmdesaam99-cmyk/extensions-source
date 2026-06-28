@@ -250,9 +250,7 @@ class ProComic : HttpSource(), ConfigurableSource {
     }
 
     override fun imageUrlParse(response: Response): String = ""
-    override fun popularMangaRequest(page: Int) =
-        GET("$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page", headers)
-
+    override fun popularMangaRequest(page: Int) = GET("$baseUrl/api/public/content/latest-updates?limit=500&category=comics&page=$page", headers)
     override fun popularMangaParse(response: Response): MangasPage {
         val data = response.parseAs<LatestUpdatesResponse>()
         val selectedType = getSelectedType()
@@ -262,14 +260,11 @@ class ProComic : HttpSource(), ConfigurableSource {
             .map { it.toSManga() }
         return MangasPage(mangas, data.data.size >= 30)
     }
-
     override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
-
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList) =
-        GET("$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page" + if (query.isNotBlank()) "&q=$query" else "", headers)
-
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList) = GET("$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page" + if (query.isNotBlank()) "&q=$query" else "", headers)
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
+
     override fun mangaDetailsRequest(manga: SManga): Request {
         val p = manga.url.split("/")
         return GET("$baseUrl/api/public/${p[0]}/${p[1]}", headers)
@@ -295,6 +290,11 @@ class ProComic : HttpSource(), ConfigurableSource {
                 }
             }
         } catch (_: Exception) { SManga.create() }
+    }
+
+    override fun chapterListRequest(manga: SManga): Request {
+        val p = manga.url.split("/")
+        return GET("$baseUrl/api/public/${p[0]}/${p[1]}/chapters?page=1&limit=600&order=desc", headers)
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
