@@ -611,8 +611,6 @@ class ProComic : HttpSource(), ConfigurableSource {
 
         val (cols, rows) = parseMode(map.mode, map.pieces.size)
         val bitmaps = arrayOfNulls<Bitmap>(map.pieces.size)
-
-        // ✅ التعديل الحاسم: تم إصلاح ترتيب القطع هنا
         for (i in map.pieces.indices) {
             val targetIdx = if (map.order.size == map.pieces.size) map.order[i] else i
             val cacheKey = map.pieces.getOrNull(i) ?: continue
@@ -704,8 +702,7 @@ class ProComic : HttpSource(), ConfigurableSource {
             try { decoder.decode() } catch (_: Exception) { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) } finally { decoder.recycle() }
         } else { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }
     }
-
-    // ✅ التعديل الحاسم: تم إصلاح قراءة النمط لتعكس الصفوف والأعمدة بشكل صحيح
+    
     private fun parseMode(mode: String, pieceCount: Int): Pair<Int, Int> = when {
         mode.startsWith("grid_") -> {
             val clean = mode.removePrefix("grid_")
