@@ -7,7 +7,6 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.util.Base64
 import android.util.LruCache
-import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
@@ -30,7 +29,11 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.decodeFromStream
+import kotlinx.serialization.json.jsonArray
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
@@ -250,20 +253,61 @@ class ProComic : HttpSource(), ConfigurableSource {
     }
 
     override fun imageUrlParse(response: Response): String = ""
-    override fun popularMangaRequest(page: Int) = GET("$baseUrl/api/public/content/latest-updates?limit=500&category=comics&page=$page", headers)
-    override fun popularMangaParse(response: Response): MangasPage {
-        val data = response.parseAs<LatestUpdatesResponse>()
-        val selectedType = getSelectedType()
-        val mangas = data.data
-            .filter { it.type != "novel" }
-            .filter { selectedType == "all" || it.type.equals(selectedType, ignoreCase = true) }
-            .map { it.toSManga() }
-        return MangasPage(mangas, data.data.size >= 30)
+
+    // ======== التحديث الجديد لقائمة الأعمال (المحلل الذكي) ========
+
+    override fun popularMangaRequest(page: Int): Request {
+        // نستخدم رابط التطبيق السري لاستخراج جميع الأعمال هنا
+        return GET("$baseUrl/api/android/feed/all-series?page=$page", headers)
     }
-    override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
+
+    override fun latestUpdatesRequest(page: Int): Request {
+        // نستخدم رابط آخر التحديثات لقسم (Latest) لكي تبقى مرتبة حسب الأحدث
+        return GET("$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page", headers)
+    }
+
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+        val url = "$baseUrl/api/android/feed/all-series?page=$page" + if (query.isNotBlank()) "&q=$query" else ""
+        return GET(url, headers)
+    }
+
+    override fun popularMangaParse(response: Response): MangasPage {
+        val body = response.body?.string() ?: return MangasPage(emptyList(), false)
+        val element = json.parseToJsonElement(body)
+        
+        // التقاط المصفوفة بغض النظر عن الاسم الذي يستخدمه السيرفر (data, items, library, أو مصفوفة مباشرة)
+        val dataArray = when (element) {
+            is JsonObject -> {
+                element["data"]?.jsonArray
+                    ?: element["items"]?.jsonArray
+                    ?: element["library"]?.jsonArray
+                    ?: JsonArray(emptyList())
+            }
+            is JsonArray -> element
+            else -> JsonArray(emptyList())
+        }
+
+        val selectedType = getSelectedType()
+        
+        val mangas = dataArray.mapNotNull { 
+            try {
+                val dto = json.decodeFromJsonElement<SeriesDto>(it)
+                if (dto.type == "novel") return@mapNotNull null
+                if (selectedType != "all" && !dto.type.equals(selectedType, ignoreCase = true)) return@mapNotNull null
+                dto.toSManga()
+            } catch (e: Exception) {
+                null
+            }
+        }
+
+        // نفترض أن الصفحة ممتلئة إذا كان عدد العناصر المسترجعة 15 فما فوق
+        return MangasPage(mangas, mangas.size >= 15)
+    }
+
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList) = GET("$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page" + if (query.isNotBlank()) "&q=$query" else "", headers)
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
+
+    // ================================================================
 
     override fun mangaDetailsRequest(manga: SManga): Request {
         val p = manga.url.split("/")
@@ -378,7 +422,7 @@ class ProComic : HttpSource(), ConfigurableSource {
                 val singleReq = GET("$baseUrl/api/public/chapters/$chapterId", apiHeaders)
                 val singleResp = innerClient.newCall(singleReq).execute()
                 if (singleResp.isSuccessful) {
-                    val singleData = json.decodeFromString<SingleChapterResponse>(singleResp.body.string())
+                    val singleData = json.decodeFromString<SingleChapterResponse>(singleResp.body!!.string())
                     singleData.data?.let { ch ->
                         cdnPath = ch.cdnPath ?: "cdn1"
                         metadataImages = ch.metadata?.images ?: emptyList()
@@ -393,7 +437,7 @@ class ProComic : HttpSource(), ConfigurableSource {
             try {
                 val htmlResp = innerClient.newCall(GET("$baseUrl/chapter/$chapterId", apiHeaders)).execute()
                 if (htmlResp.isSuccessful) {
-                    val html = htmlResp.body.string()
+                    val html = htmlResp.body!!.string()
                     val jwtRegex = """(eyJhbGci[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)""".toRegex()
                     val match = jwtRegex.find(html)
                     if (match != null) {
@@ -411,7 +455,6 @@ class ProComic : HttpSource(), ConfigurableSource {
             if (seenUrls.add(fullUrl)) pages.add(Page(pages.size, imageUrl = fullUrl))
         }
 
-        // الإصلاح الجذري: حقن الـ cdnPath والـ pageIndex في كل خريطة لنضمن صحة الـ Payload
         mapsList.forEachIndexed { index, map ->
             val updatedMap = map.copy(cdnPath = map.cdnPath ?: cdnPath, pageIndex = map.pageIndex ?: index)
             
@@ -464,7 +507,6 @@ class ProComic : HttpSource(), ConfigurableSource {
         for (splitData in splitResponses) {
             val absolutePieceUrls = mutableSetOf<String>()
             
-            // نفس الإصلاح هنا أيضاً للبيانات المؤجلة
             splitData.maps.forEachIndexed { index, map ->
                 val updatedMap = map.copy(cdnPath = map.cdnPath ?: cdnPath, pageIndex = map.pageIndex ?: index)
                 
@@ -494,7 +536,6 @@ class ProComic : HttpSource(), ConfigurableSource {
         if (dec != null && !dec.pieces.isNullOrEmpty()) return dec
 
         try {
-            // الآن الـ Payload سيكون متطابقاً 100% مع ما ينتظره السيرفر!
             val reqPayload = ProxyPlanRequest(
                 cdnPath = map.cdnPath ?: "cdn1",
                 method = map.method ?: "browser_session",
@@ -546,7 +587,6 @@ class ProComic : HttpSource(), ConfigurableSource {
                     val mapJson = String(Base64.decode(map.originalMapBase64, Base64.URL_SAFE))
                     val decodedMap = json.decodeFromString<DeferredPageMap>(mapJson)
                     
-                    // هنا أيضاً نرسل الـ Payload الصحيح في حالة محاولة التحميل الاحتياطية
                     val reqPayload = ProxyPlanRequest(
                         cdnPath = decodedMap.cdnPath ?: "cdn1",
                         method = decodedMap.method ?: "browser_session",
@@ -683,7 +723,7 @@ class ProComic : HttpSource(), ConfigurableSource {
         else -> "$cdnBase/$this"
     }
 
-    private inline fun <reified T> Response.parseAs(): T = json.decodeFromStream(body.byteStream())
+    private inline fun <reified T> Response.parseAs(): T = json.decodeFromStream(body!!.byteStream())
 }
 
 @Serializable data class JwtPayload(val split: Int = 20, val cid: Int = 0, val p: String = "")
@@ -692,9 +732,28 @@ class ProComic : HttpSource(), ConfigurableSource {
 @Serializable data class EncryptedToken(val v: Int = 3, val m: String = "", val cid: Int = 0, val iv: String = "", val tag: String = "", val data: String = "")
 @Serializable data class ScrambledMap(val dim: List<Int> = emptyList(), val mode: String = "", val pieces: List<String> = emptyList(), val order: List<Int> = emptyList(), val signedToken: String = "", val splitPart: Int? = null, val totalParts: Int? = null, val chapterId: String = "", val originalMapBase64: String = "")
 @Serializable data class LatestUpdatesResponse(val success: Boolean = false, val data: List<SeriesDto> = emptyList())
-@Serializable data class SeriesDto(@SerialName("mangaId") val id: Int = 0, @SerialName("mangaSlug") val slug: String = "", @SerialName("mangaTitle") val title: String = "", val coverImage: String? = null, val type: String = "manga", val coverImageApp: CoverImageApp? = null) {
-    fun toSManga() = SManga.create().apply { url = "$type/$id/$slug"; title = this@SeriesDto.title; thumbnail_url = coverImageApp?.card?.mobile ?: coverImageApp?.desktop ?: coverImage }
+
+// Data Class المُحدث ليقبل جميع أشكال البيانات سواء من التطبيق أو الموقع
+@Serializable data class SeriesDto(
+    val id: Int? = null,
+    @SerialName("mangaId") val mangaId: Int? = null,
+    val slug: String? = null,
+    @SerialName("mangaSlug") val mangaSlug: String? = null,
+    val title: String? = null,
+    @SerialName("mangaTitle") val mangaTitle: String? = null,
+    val coverImage: String? = null, 
+    val type: String = "manga", 
+    val coverImageApp: CoverImageApp? = null
+) {
+    fun toSManga() = SManga.create().apply { 
+        val finalId = id ?: mangaId ?: 0
+        val finalSlug = slug ?: mangaSlug ?: ""
+        url = "$type/$finalId/$finalSlug"
+        title = this@SeriesDto.title ?: mangaTitle ?: ""
+        thumbnail_url = coverImageApp?.card?.mobile ?: coverImageApp?.desktop ?: coverImage 
+    }
 }
+
 @Serializable data class CoverImageApp(val desktop: String? = null, val card: CardImages? = null)
 @Serializable data class CardImages(val mobile: String? = null, val desktop: String? = null)
 @Serializable data class SeriesDetailResponse(val id: Int = 0, val title: String? = null, val slug: String? = null, val coverImage: String? = null, val coverImageApp: CoverImageApp? = null, val author: String? = null, val artist: String? = null, val description: String? = null, val synopsis: String? = null, val status: String? = null)
