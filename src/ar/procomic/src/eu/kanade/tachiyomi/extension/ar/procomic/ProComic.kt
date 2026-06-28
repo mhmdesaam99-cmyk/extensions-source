@@ -257,12 +257,10 @@ class ProComic : HttpSource(), ConfigurableSource {
     // ======== التحديث الجديد لقائمة الأعمال (المحلل الذكي) ========
 
     override fun popularMangaRequest(page: Int): Request {
-        // نستخدم رابط التطبيق السري لاستخراج جميع الأعمال هنا
         return GET("$baseUrl/api/android/feed/all-series?page=$page", headers)
     }
 
     override fun latestUpdatesRequest(page: Int): Request {
-        // نستخدم رابط آخر التحديثات لقسم (Latest) لكي تبقى مرتبة حسب الأحدث
         return GET("$baseUrl/api/public/content/latest-updates?limit=30&category=comics&page=$page", headers)
     }
 
@@ -275,7 +273,6 @@ class ProComic : HttpSource(), ConfigurableSource {
         val body = response.body?.string() ?: return MangasPage(emptyList(), false)
         val element = json.parseToJsonElement(body)
         
-        // التقاط المصفوفة بغض النظر عن الاسم الذي يستخدمه السيرفر (data, items, library, أو مصفوفة مباشرة)
         val dataArray = when (element) {
             is JsonObject -> {
                 element["data"]?.jsonArray
@@ -300,7 +297,6 @@ class ProComic : HttpSource(), ConfigurableSource {
             }
         }
 
-        // نفترض أن الصفحة ممتلئة إذا كان عدد العناصر المسترجعة 15 فما فوق
         return MangasPage(mangas, mangas.size >= 15)
     }
 
@@ -616,11 +612,15 @@ class ProComic : HttpSource(), ConfigurableSource {
         val (cols, rows) = parseMode(map.mode, map.pieces.size)
         val bitmaps = arrayOfNulls<Bitmap>(map.pieces.size)
 
-        for (targetIdx in map.pieces.indices) {
-            val srcIdx = if (map.order.size == map.pieces.size) map.order[targetIdx] else targetIdx
-            val cacheKey = map.pieces.getOrNull(srcIdx) ?: continue
+        // ✅ التعديل الحاسم: تم إصلاح ترتيب القطع هنا
+        for (i in map.pieces.indices) {
+            val targetIdx = if (map.order.size == map.pieces.size) map.order[i] else i
+            val cacheKey = map.pieces.getOrNull(i) ?: continue
             val bytes = pieceCache.get(cacheKey) ?: continue
-            bitmaps[targetIdx] = decodeAvif(bytes)
+            
+            if (targetIdx in bitmaps.indices) {
+                bitmaps[targetIdx] = decodeAvif(bytes)
+            }
         }
 
         return assembleBitmaps(bitmaps, map, cols, rows)
@@ -705,14 +705,15 @@ class ProComic : HttpSource(), ConfigurableSource {
         } else { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }
     }
 
+    // ✅ التعديل الحاسم: تم إصلاح قراءة النمط لتعكس الصفوف والأعمدة بشكل صحيح
     private fun parseMode(mode: String, pieceCount: Int): Pair<Int, Int> = when {
         mode.startsWith("grid_") -> {
             val clean = mode.removePrefix("grid_")
             val p = if (clean.contains("x")) clean.split("x") else clean.split("_")
             Pair(p.getOrNull(0)?.toIntOrNull() ?: 1, p.getOrNull(1)?.toIntOrNull() ?: 1)
         }
-        mode.startsWith("vertical_") -> Pair(mode.removePrefix("vertical_").toIntOrNull() ?: pieceCount, 1)
-        mode.startsWith("horizontal_") -> Pair(1, mode.removePrefix("horizontal_").toIntOrNull() ?: pieceCount)
+        mode.startsWith("vertical_") -> Pair(1, mode.removePrefix("vertical_").toIntOrNull() ?: pieceCount)
+        mode.startsWith("horizontal_") -> Pair(mode.removePrefix("horizontal_").toIntOrNull() ?: pieceCount, 1)
         else -> Pair(1, pieceCount)
     }
 
@@ -732,8 +733,6 @@ class ProComic : HttpSource(), ConfigurableSource {
 @Serializable data class EncryptedToken(val v: Int = 3, val m: String = "", val cid: Int = 0, val iv: String = "", val tag: String = "", val data: String = "")
 @Serializable data class ScrambledMap(val dim: List<Int> = emptyList(), val mode: String = "", val pieces: List<String> = emptyList(), val order: List<Int> = emptyList(), val signedToken: String = "", val splitPart: Int? = null, val totalParts: Int? = null, val chapterId: String = "", val originalMapBase64: String = "")
 @Serializable data class LatestUpdatesResponse(val success: Boolean = false, val data: List<SeriesDto> = emptyList())
-
-// Data Class المُحدث ليقبل جميع أشكال البيانات سواء من التطبيق أو الموقع
 @Serializable data class SeriesDto(
     val id: Int? = null,
     @SerialName("mangaId") val mangaId: Int? = null,
@@ -753,7 +752,6 @@ class ProComic : HttpSource(), ConfigurableSource {
         thumbnail_url = coverImageApp?.card?.mobile ?: coverImageApp?.desktop ?: coverImage 
     }
 }
-
 @Serializable data class CoverImageApp(val desktop: String? = null, val card: CardImages? = null)
 @Serializable data class CardImages(val mobile: String? = null, val desktop: String? = null)
 @Serializable data class SeriesDetailResponse(val id: Int = 0, val title: String? = null, val slug: String? = null, val coverImage: String? = null, val coverImageApp: CoverImageApp? = null, val author: String? = null, val artist: String? = null, val description: String? = null, val synopsis: String? = null, val status: String? = null)
