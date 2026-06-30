@@ -255,7 +255,7 @@ class ProComic : HttpSource(), ConfigurableSource {
     override fun imageUrlParse(response: Response): String = ""
 
     override fun popularMangaRequest(page: Int): Request {
-        return GET("$baseUrl/api/public/series/search?status=approved&limit=30&page=$page&sort=latest", headers)
+        return GET("$baseUrl/api/public/series/search?status=approved&limit=18&page=$page&sort=latest", headers)
     }
 
     override fun latestUpdatesRequest(page: Int): Request {
