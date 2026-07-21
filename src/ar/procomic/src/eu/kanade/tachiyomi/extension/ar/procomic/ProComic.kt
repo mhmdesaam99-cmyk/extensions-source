@@ -103,8 +103,8 @@ class ProComic : HttpSource(), ConfigurableSource {
 
         EditTextPreference(screen.context).apply {
             key = COOKIE_PREF
-            title = "🍪 Cookie الجلسة (مطلوب للمانهوا)"
-            summary = "ضع الكوكي الخاص بك هنا لفتح الفصول المغلقة"
+            title = "🍪 Cookie الجلسة"
+            summary = "ضع الكوكي الخاص بك هنا إذا تطلب الأمر"
             dialogTitle = "قيمة الـ Cookie كاملةً"
             setDefaultValue("")
         }.also(screen::addPreference)
@@ -182,7 +182,7 @@ class ProComic : HttpSource(), ConfigurableSource {
                 val cookies = mutableListOf<String>()
                 val sessionCookie = getSessionCookie()
                 if (sessionCookie.isNotBlank()) cookies.add(sessionCookie)
-                if (!viewerToken.isNullOrBlank()) cookies.add("pcv=$viewerToken") // إضافة التوكن ككوكي
+                if (!viewerToken.isNullOrBlank()) cookies.add("pcv=$viewerToken")
                 if (cookies.isNotEmpty()) {
                     set("Cookie", cookies.joinToString("; "))
                 }
@@ -220,7 +220,6 @@ class ProComic : HttpSource(), ConfigurableSource {
 
     private fun downloadAndCachePiece(pieceUrl: String, token: String, viewerToken: String?, cacheKey: String): Boolean {
         val urlsToTry = buildList {
-            // الحفاظ على إضافة token الأصلي كمعامل في الرابط
             if (token.isNotBlank() && !pieceUrl.contains("/i/eyJ")) {
                 add(if (pieceUrl.contains("?")) "$pieceUrl&token=$token" else "$pieceUrl?token=$token")
             }
@@ -358,31 +357,16 @@ class ProComic : HttpSource(), ConfigurableSource {
     }
 
     override fun pageListRequest(chapter: SChapter): Request {
-        val parts = chapter.url.split("/")
-        val seriesType = parts.getOrElse(0) { "manga" }
-        val seriesId = parts.getOrElse(1) { "0" }
-        val chapterId = parts.getOrElse(2) { "0" }
-        val url = "$baseUrl/api/public/$seriesType/$seriesId/chapters".toHttpUrl().newBuilder()
-            .addQueryParameter("page", "1")
-            .addQueryParameter("limit", "500")
-            .addQueryParameter("order", "desc")
-            .addQueryParameter("_cid", chapterId)
-            .build()
-            
-        val requestHeaders = headers.newBuilder()
-            .set("Accept", "application/json")
-            .apply {
-                val cookie = getSessionCookie()
-                if (cookie.isNotBlank()) set("Cookie", cookie)
-            }.build()
-            
-        return GET(url, requestHeaders)
+        // نطلب الصفحة الحقيقية للفصل بدلاً من الـ API القديم لضمان جلب الـ HTML الأحدث
+        return GET("$baseUrl/${chapter.url}", headers)
     }
 
     override fun pageListParse(response: Response): List<Page> {
-        val chapterId = response.request.url.queryParameter("_cid") ?: return emptyList()
+        val parts = response.request.url.pathSegments
+        val chapterId = parts.getOrNull(parts.size - 2) ?: return emptyList()
+        
         val apiHeaders = headers.newBuilder()
-            .set("Accept", "application/json")
+            .set("Accept", "application/json, text/plain, */*")
             .apply {
                 val cookie = getSessionCookie()
                 if (cookie.isNotBlank()) set("Cookie", cookie)
@@ -417,16 +401,15 @@ class ProComic : HttpSource(), ConfigurableSource {
             cachedViewerToken
         }
 
-        try {
-            val listData = response.parseAs<ChaptersResponse>()
-            val ch = listData.data.find { it.id.toString() == chapterId }
-            if (ch != null) {
-                cdnPath = ch.cdnPath ?: "cdn1"
-                metadataImages = ch.metadata?.images ?: emptyList()
-                ch.metadata?.maps?.let { mapsList.addAll(it) }
-            }
-        } catch (_: Exception) {}
+        // 1. محاولة استخراج JWT من محتوى صفحة الفصل الأساسية (HTML)
+        val html = response.body?.string() ?: ""
+        val jwtRegex = """(eyJhbGci[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)""".toRegex()
+        val match = jwtRegex.find(html)
+        if (match != null) {
+            mapsList.add(DeferredPageMap(token = match.groupValues[1]))
+        }
 
+        // 2. محاولة جلب معلومات الـ API إذا لم ينجح الـ HTML
         if (mapsList.isEmpty()) {
             try {
                 val singleReq = GET("$baseUrl/api/public/chapters/$chapterId", apiHeaders)
@@ -438,20 +421,6 @@ class ProComic : HttpSource(), ConfigurableSource {
                         metadataImages = ch.metadata?.images ?: emptyList()
                         mapsList.clear()
                         ch.metadata?.maps?.let { mapsList.addAll(it) }
-                    }
-                }
-            } catch (_: Exception) {}
-        }
-        
-        if (mapsList.isEmpty()) {
-            try {
-                val htmlResp = innerClient.newCall(GET("$baseUrl/chapter/$chapterId", apiHeaders)).execute()
-                if (htmlResp.isSuccessful) {
-                    val html = htmlResp.body!!.string()
-                    val jwtRegex = """(eyJhbGci[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)""".toRegex()
-                    val match = jwtRegex.find(html)
-                    if (match != null) {
-                        mapsList.add(DeferredPageMap(token = match.groupValues[1]))
                     }
                 }
             } catch (_: Exception) {}
@@ -485,6 +454,7 @@ class ProComic : HttpSource(), ConfigurableSource {
             }
         }
 
+        // جلب الصور المشفرة/المؤجلة عبر التوكن المكتشف
         for (jwtToken in jwtTokens) {
             try { pages.addAll(fetchDeferredPages(chapterId, jwtToken, apiHeaders, seenUrls, cdnBase, cdnPath, getSessionKey, getViewerToken)) } catch (_: Exception) {}
         }
