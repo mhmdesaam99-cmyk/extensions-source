@@ -241,6 +241,9 @@ class ProComic : HttpSource(), ConfigurableSource {
 
     override fun imageRequest(page: Page): Request {
         val request = super.imageRequest(page)
+            .newBuilder()
+            .headers(pieceRequestHeaders())
+            .build()
         val fragment = page.url.substringAfter("#", "")
         if (fragment.isNotBlank()) {
             try {
