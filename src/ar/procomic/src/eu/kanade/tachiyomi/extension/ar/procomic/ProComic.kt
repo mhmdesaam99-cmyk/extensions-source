@@ -240,9 +240,10 @@ class ProComic : HttpSource(), ConfigurableSource {
     }
 
     override fun imageRequest(page: Page): Request {
+        val referer = if (page.url.startsWith("http")) page.url else "$baseUrl/"
         val request = super.imageRequest(page)
             .newBuilder()
-            .headers(pieceRequestHeaders())
+            .headers(pieceRequestHeaders().newBuilder().set("Referer", referer).build())
             .build()
         val fragment = page.url.substringAfter("#", "")
         if (fragment.isNotBlank()) {
@@ -390,10 +391,11 @@ class ProComic : HttpSource(), ConfigurableSource {
         val cdnBase = "https://$cdnPath.procomic.pro"
 
         // الصور المباشرة (غير المقطّعة) التي يعرضها الموقع فورًا لتسريع فتح الفصل
+        val chapterPageUrl = response.request.url.toString()
         Regex(""""images"\s*:\s*\[(.*?)]""").find(html)?.groupValues?.get(1)?.let { imagesRaw ->
             Regex(""""(https?://[^"]+)"""").findAll(imagesRaw).forEach { m ->
                 val url = m.groupValues[1]
-                if (seenUrls.add(url)) pages.add(Page(pages.size, imageUrl = url))
+                if (seenUrls.add(url)) pages.add(Page(pages.size, url = chapterPageUrl, imageUrl = url))
             }
         }
 
