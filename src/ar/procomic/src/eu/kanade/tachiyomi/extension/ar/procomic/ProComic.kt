@@ -389,14 +389,13 @@ class ProComic : HttpSource(), ConfigurableSource {
 
         val cdnPath = Regex(""""cdnPath"\s*:\s*"([a-zA-Z0-9_]+)"""").find(html)?.groupValues?.get(1) ?: "cdn1"
         val cdnBase = "https://$cdnPath.procomic.pro"
-
-        // الصور المباشرة (غير المقطّعة) التي يعرضها الموقع فورًا لتسريع فتح الفصل
         val chapterPageUrl = response.request.url.toString()
-        Regex(""""images"\s*:\s*\[(.*?)]""").find(html)?.groupValues?.get(1)?.let { imagesRaw ->
-            Regex(""""(https?://[^"]+)"""").findAll(imagesRaw).forEach { m ->
-                val url = m.groupValues[1]
-                if (seenUrls.add(url)) pages.add(Page(pages.size, url = chapterPageUrl, imageUrl = url))
-            }
+
+        // الصور المباشرة (غير المقطّعة): نستخدم روابط appImages[].desktop الفعلية
+        // (وليست images[] الخام من cdn3 والتي لا تعمل مباشرة وتعطي 403)
+        Regex(""""desktop"\s*:\s*"(https?://[^"]+)"""").findAll(html).forEach { m ->
+            val url = m.groupValues[1]
+            if (seenUrls.add(url)) pages.add(Page(pages.size, url = chapterPageUrl, imageUrl = url))
         }
 
         var cachedSessionKey: String? = null
