@@ -335,7 +335,7 @@ class ProComic : HttpSource(), ConfigurableSource {
     override fun chapterListRequest(manga: SManga): Request {
         val p = manga.url.split("/")
         val slug = p.getOrElse(2) { "" }
-        return GET("$baseUrl/api/public/${p[0]}/${p[1]}/chapters?page=1&limit=600&order=desc&_slug=$slug", headers)
+        return GET("$baseUrl/api/public/${p[0]}/${p[1]}/chapters?page=1&limit=600&order=desc&language=AR&_slug=$slug", headers)
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
@@ -344,7 +344,12 @@ class ProComic : HttpSource(), ConfigurableSource {
         val seriesType = parts.getOrElse(idx + 1) { "manga" }
         val seriesId = parts.getOrElse(idx + 2) { "0" }
         val seriesSlug = response.request.url.queryParameter("_slug") ?: ""
-        return response.parseAs<ChaptersResponse>().data.map { ch ->
+        return response.parseAs<ChaptersResponse>().data
+            .filter { ch ->
+                val chLang = ch.language ?: ch.lang ?: ch.locale
+                chLang == null || chLang.equals("ar", ignoreCase = true)
+            }
+            .map { ch ->
             SChapter.create().apply {
                 url = "$seriesType/$seriesId/$seriesSlug/${ch.id}/${ch.chapterNumber}"
                 name = "الفصل ${ch.chapterNumber}" + if (!ch.title.isNullOrBlank()) " - ${ch.title}" else ""
@@ -365,7 +370,12 @@ class ProComic : HttpSource(), ConfigurableSource {
         val chapterId = parts.getOrElse(3) { "0" }
         val chapterSlug = parts.getOrElse(4) { chapterId }
         val url = "$baseUrl/ar/series/$seriesType/$seriesId/$seriesSlug/$chapterId/$chapterSlug"
-        return GET(url, headers)
+        val pageHeaders = headers.newBuilder()
+            .apply {
+                val cookie = getSessionCookie()
+                if (cookie.isNotBlank()) set("Cookie", cookie)
+            }.build()
+        return GET(url, pageHeaders)
     }
 
     override fun pageListParse(response: Response): List<Page> {
@@ -415,6 +425,14 @@ class ProComic : HttpSource(), ConfigurableSource {
         val deferredToken = Regex(""""deferredMedia"\s*:\s*\{\s*"token"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
         if (deferredToken != null && deferredToken.isJwt()) {
             try { pages.addAll(fetchDeferredPages(chapterId, deferredToken, apiHeaders, seenUrls, cdnBase, cdnPath, getSessionKey)) } catch (_: Exception) {}
+        }
+
+        if (pages.isEmpty()) {
+            val isLocked = html.contains("\"lockedByCoins\":true") || html.contains("\"isLocked\":true") ||
+                html.contains("requireTurnstile\":true") || html.contains("purchase") || html.contains("unlock")
+            if (isLocked) {
+                throw Exception("هذا الفصل مدفوع 🔒 — تأكد من إدخال كوكي حساب مسجّل الدخول ومالك للفصل في إعدادات الإضافة")
+            }
         }
 
         return pages
@@ -721,7 +739,7 @@ class ProComic : HttpSource(), ConfigurableSource {
 @Serializable data class CardImages(val mobile: String? = null, val desktop: String? = null)
 @Serializable data class SeriesDetailResponse(val id: Int = 0, val title: String? = null, val slug: String? = null, val coverImage: String? = null, val coverImageApp: CoverImageApp? = null, val author: String? = null, val artist: String? = null, val description: String? = null, val synopsis: String? = null, val status: String? = null)
 @Serializable data class ChaptersResponse(val data: List<ChapterDto> = emptyList(), val total: Int = 0)
-@Serializable data class ChapterDto(val id: Int = 0, @SerialName("chapter_number") val chapterNumber: String = "0", val title: String? = null, @SerialName("published_at") val publishedAt: String? = null, val lockedByCoins: Boolean? = null, @SerialName("cdn_path") val cdnPath: String? = null, val metadata: ChapterMetadataDto? = null)
+@Serializable data class ChapterDto(val id: Int = 0, @SerialName("chapter_number") val chapterNumber: String = "0", val title: String? = null, @SerialName("published_at") val publishedAt: String? = null, val lockedByCoins: Boolean? = null, @SerialName("cdn_path") val cdnPath: String? = null, val metadata: ChapterMetadataDto? = null, val language: String? = null, val lang: String? = null, val locale: String? = null)
 @Serializable data class ChapterMetadataDto(val images: List<String> = emptyList(), val maps: List<DeferredPageMap> = emptyList())
 @Serializable data class ChapterDeferredResponse(val success: Boolean = false, val data: ChapterDeferredData? = null)
 @Serializable data class ChapterDeferredData(val chapterId: Int = 0, val splitIndex: Int = 0, val images: List<String> = emptyList(), val maps: List<DeferredPageMap> = emptyList())
