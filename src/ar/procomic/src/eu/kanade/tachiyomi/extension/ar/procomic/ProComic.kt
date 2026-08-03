@@ -7,6 +7,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.util.Base64
 import android.util.LruCache
+import android.webkit.CookieManager
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
@@ -107,11 +108,35 @@ class ProComic : HttpSource(), ConfigurableSource {
             summary = "ضع الكوكي الخاص بك هنا لفتح الفصول المغلقة"
             dialogTitle = "قيمة الـ Cookie كاملةً"
             setDefaultValue("")
+            setOnPreferenceChangeListener { _, newValue ->
+                syncCookieToWebView(newValue as? String ?: "")
+                true
+            }
         }.also(screen::addPreference)
     }
 
     private fun getSelectedType(): String = preferences.getString(TYPE_PREF, TYPE_PREF_DEFAULT) ?: TYPE_PREF_DEFAULT
     private fun getSessionCookie(): String = preferences.getString(COOKIE_PREF, "") ?: ""
+
+    private fun syncCookieToWebView(cookieString: String) {
+        if (cookieString.isBlank()) return
+        try {
+            val cookieManager = CookieManager.getInstance()
+            cookieManager.setAcceptCookie(true)
+            cookieString.split(";").forEach { pair ->
+                val trimmed = pair.trim()
+                if (trimmed.isNotEmpty()) {
+                    cookieManager.setCookie(baseUrl, trimmed)
+                    cookieManager.setCookie(baseUrl.replace("procomic.pro", "procomic.net"), trimmed)
+                }
+            }
+            cookieManager.flush()
+        } catch (_: Exception) {}
+    }
+
+    init {
+        syncCookieToWebView(getSessionCookie())
+    }
 
     private val innerClient: OkHttpClient = network.cloudflareClient.newBuilder()
         .connectTimeout(20, TimeUnit.SECONDS)
