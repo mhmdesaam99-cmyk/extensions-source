@@ -434,15 +434,16 @@ class ProComic : HttpSource(), ConfigurableSource {
     private fun fetchDeferredPages(chapterId: String, jwtToken: String, apiHeaders: Headers, seenUrls: MutableSet<String>, cdnBase: String, cdnPath: String, getSessionKey: () -> String?): List<Page> {
         val pages = mutableListOf<Page>()
         val splitResponses = mutableListOf<ChapterDeferredData>()
-        val maxSplit = jwtSplitValue(jwtToken)
-        for (s in 0..maxSplit) {
-            try {
-                val resp = innerClient.newCall(GET("$baseUrl/chapter-deferred-media/$chapterId?token=$jwtToken&split=$s", apiHeaders)).execute()
-                if (!resp.isSuccessful) break 
+        // الموقع يتجاهل قيمة split في الرابط ويعتمد فقط على القيمة المضمّنة داخل التوكن نفسه،
+        // لذا استدعاء واحد فقط كافٍ (تكرار الاستدعاء بقيم split مختلفة يرجع نفس المحتوى مكرراً).
+        val split = jwtSplitValue(jwtToken)
+        try {
+            val resp = innerClient.newCall(GET("$baseUrl/chapter-deferred-media/$chapterId?token=$jwtToken&split=$split", apiHeaders)).execute()
+            if (resp.isSuccessful) {
                 val parsed = resp.parseAs<ChapterDeferredResponse>()
                 if (parsed.success && parsed.data != null) splitResponses.add(parsed.data)
-            } catch (_: Exception) { break }
-        }
+            }
+        } catch (_: Exception) {}
 
         for (splitData in splitResponses) {
             val absolutePieceUrls = mutableSetOf<String>()
